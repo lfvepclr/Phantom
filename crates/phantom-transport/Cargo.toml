@@ -1,0 +1,13 @@
+[package]
+name = "phantom-transport"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+phantom-core = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+quinn = { workspace = true }
+bytes = { workspace = true }
+rcgen = { workspace = true }

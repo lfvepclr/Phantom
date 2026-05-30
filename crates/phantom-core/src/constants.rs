@@ -1,0 +1,9 @@
+pub const PROTOCOL_VERSION: u8 = 2;
+pub const CIPHER_NEGOTIATION_VERSION: u8 = 2;
+pub const MAX_FRAME_PAYLOAD: usize = 16384;
+pub const FRAME_HEADER_SIZE: usize = 8;
+pub const NOISE_TAG_LEN: usize = 16;
+pub const HANDSHAKE_TIMEOUT_SECS: u64 = 10;
+pub const DEFAULT_BIND: &str = "127.0.0.1:1080";
+pub const DEFAULT_SERVER_PORT: u16 = 443;
+pub const NOISE_MAX_MSG_LEN: usize = MAX_FRAME_PAYLOAD + FRAME_HEADER_SIZE + NOISE_TAG_LEN + 2;
