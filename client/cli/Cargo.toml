@@ -1,0 +1,19 @@
+[package]
+name = "phantom-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "phantom"
+path = "src/main.rs"
+
+[dependencies]
+phantom-core = { workspace = true }
+phantom-crypto = { workspace = true }
+phantom-client = { workspace = true }
+phantom-server = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }

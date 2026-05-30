@@ -1,0 +1,78 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/phantom-core",
+    "crates/phantom-crypto",
+    "crates/phantom-transport",
+    "crates/phantom-protocol",
+    "server",
+    "client",
+    "client/cli",
+    "phantom-bench",
+    "phantom-e2e",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Bytes
+bytes = "1"
+
+# Crypto
+snow = { version = "0.9", features = ["risky-raw-split"] }
+ring = "0.17"
+base64 = "0.22"
+aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
+ascon-aead = "0.5"
+aead = "0.5"
+hkdf = "0.12"
+sha2 = "0.10"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+cfg-if = "1"
+zeroize = { version = "1.8", features = ["derive"] }
+
+# QUIC
+quinn = { version = "0.11", features = ["rustls-ring"] }
+rcgen = "0.13"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Async traits
+async-trait = "0.1"
+
+# Bitflags
+bitflags = "2"
+
+# Lock-free structures
+crossbeam-queue = "0.3"
+
+# Benchmark
+divan = "0.1"
+
+# Internal crates
+phantom-core = { path = "crates/phantom-core" }
+phantom-crypto = { path = "crates/phantom-crypto" }
+phantom-transport = { path = "crates/phantom-transport" }
+phantom-protocol = { path = "crates/phantom-protocol" }
+phantom-client = { path = "client" }
+phantom-server = { path = "server" }

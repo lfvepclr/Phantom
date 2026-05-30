@@ -1,0 +1,17 @@
+bind = "0.0.0.0:443"
+private_key = "/etc/phantom/keys/server_private"
+clients = "/etc/phantom/keys/clients_allowed"
+
+[quic]
+max_streams = 100
+keep_alive_interval = 45
+
+[tls]
+# cert = "/etc/phantom/acme/cert.pem"
+# key = "/etc/phantom/acme/key.pem"
+disguise = false
+
+[performance]
+io_uring = false
+zero_copy = false
+workers = 0

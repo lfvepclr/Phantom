@@ -1,0 +1,20 @@
+[[servers]]
+name = "primary"
+address = "your-domain.com:443"
+public_key = "REPLACE_WITH_SERVER_PUBLIC_KEY"
+
+[[servers]]
+name = "backup"
+address = "backup-ip:443"
+public_key = "REPLACE_WITH_BACKUP_PUBLIC_KEY"
+
+[client]
+listen = "127.0.0.1:1080"
+dns = "tls://8.8.8.8:853"
+mode = "smart"
+
+[failover]
+health_check_interval = 30
+health_check_timeout = 5
+failover_threshold = 3
+graceful_migration = true
