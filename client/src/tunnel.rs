@@ -1,5 +1,5 @@
 use phantom_core::{ClientConfig, PhantomError, Result};
-use phantom_crypto::KeyPair;
+use phantom_core::crypto::KeyPair;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing;
@@ -35,14 +35,14 @@ impl PhantomClient {
 
         loop {
             let (stream, peer) = listener.accept().await.map_err(PhantomError::Io)?;
-            tracing::debug!("SOCKS5 connection from {}", peer);
+            tracing::info!("SOCKS5 connection from {}", peer);
 
             let config = self.config.clone();
             let failover = Arc::clone(&self.failover);
             let local_secret = self.local_secret;
             tokio::spawn(async move {
                 if let Err(e) = handle_socks5_connection(stream, &config, &failover, local_secret).await {
-                    tracing::debug!("Connection error from {}: {}", peer, e);
+                    tracing::info!("Connection error from {}: {}", peer, e);
                 }
             });
         }

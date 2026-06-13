@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)",
+      "Bash(cd /Users/spencer/workspace/qoder/phantom && git log --oneline -5)",
+      "Bash(git mv:*)",
+      "Bash(git rm:*)",
+      "Bash(rmdir crates/ 2>/dev/null; ls -d crates/ 2>/dev/null || echo \"crates/ directory removed\")",
+      "Bash(cargo check --workspace 2>&1)",
+      "Bash(mv /Users/spencer/workspace/qoder/phantom/tests/phantom-e2e/* /Users/spencer/workspace/qoder/phantom/tests/ && rmdir /Users/spencer/workspace/qoder/phantom/tests/phantom-e2e/)",
+      "Bash(mv:*)"
+    ]
+  }
+}

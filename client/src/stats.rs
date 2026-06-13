@@ -62,3 +62,33 @@ impl TrafficStats {
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn render_prometheus_format() {
+        let stats = TrafficStats::new();
+        stats.record_tcp_connect();
+        stats.record_tcp_up(100);
+        stats.record_tcp_down(200);
+        stats.record_udp_up(50);
+        let output = stats.render_prometheus();
+        assert!(output.contains("phantom_tcp_connections 1"));
+        assert!(output.contains("phantom_tcp_bytes_up 100"));
+        assert!(output.contains("phantom_tcp_bytes_down 200"));
+        assert!(output.contains("phantom_udp_bytes_up 50"));
+        assert!(output.contains("# TYPE phantom_tcp_bytes_up counter"));
+    }
+
+    #[test]
+    fn counters_only_increment() {
+        let stats = TrafficStats::new();
+        stats.record_tcp_connect();
+        stats.record_tcp_connect();
+        stats.record_tcp_connect();
+        let output = stats.render_prometheus();
+        assert!(output.contains("phantom_tcp_connections 3"));
+    }
+}

@@ -9,7 +9,6 @@ path = "src/main.rs"
 
 [dependencies]
 phantom-core = { workspace = true }
-phantom-crypto = { workspace = true }
 phantom-client = { workspace = true }
 phantom-server = { workspace = true }
 tokio = { workspace = true }

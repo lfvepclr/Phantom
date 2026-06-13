@@ -1,17 +1,28 @@
+# Phantom server 配置模板（load 模式）
+#
+# 用法：
+#   sudo cp config/server.toml /etc/phantom/server.toml
+#   sudo cp /var/lib/phantom/server.key /etc/phantom/server_private
+#   sudo chmod 600 /etc/phantom/server_private
+#   sudo systemctl edit phantom   # ExecStart 改为 `/usr/local/bin/phantom-server /etc/phantom/server.toml`
+#   sudo systemctl restart phantom
+#
+# 详细说明见 deploy/README.md §2。
+
 bind = "0.0.0.0:443"
-private_key = "/etc/phantom/keys/server_private"
-clients = "/etc/phantom/keys/clients_allowed"
+private_key = "/etc/phantom/server_private"
+clients = "/var/lib/phantom/clients"   # 留空或文件不存在 = 开放模式；与 auto 模式共享
+cipher = "auto"                        # auto / aes-256-gcm / aes-128-gcm / ascon-128 / chacha20-poly1305
 
 [quic]
 max_streams = 100
 keep_alive_interval = 45
+congestion = "cubic"          # cubic / bbr / new-reno
 
 [tls]
-# cert = "/etc/phantom/acme/cert.pem"
-# key = "/etc/phantom/acme/key.pem"
-disguise = false
+disguise = false              # stub，未实现
 
 [performance]
-io_uring = false
+io_uring = false              # Linux 5.1+
 zero_copy = false
-workers = 0
+workers = 0                   # 0 = CPU 核心数

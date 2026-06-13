@@ -4,14 +4,65 @@
 //! SwiftUI calls into Rust via a thin C FFI layer to start/stop the tunnel.
 //! Rust fully owns the TUN device lifecycle — no Network Extension needed.
 
-use phantom_core::ClientConfig;
+use phantom_core::{ClientConfig, ClientSettings, FailoverConfig, ProxyMode, parse_phantom_uri};
 use std::os::unix::io::RawFd;
 use std::sync::Mutex;
 use tokio::runtime::Runtime;
 
 static RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
 
-/// Start the tunnel: create utun, launch SOCKS5 proxy + tun2socks.
+/// Default SOCKS5 listen address used by the macOS native client.
+/// Single source of truth — Swift queries the port via FFI.
+const DEFAULT_SOCKS5_ADDR: &str = "127.0.0.1:11080";
+
+/// Start the tunnel using a `phantom://` URI + mode string.
+///
+/// The `input` parameter is `"phantom://key@host:port|mode"` where `mode`
+/// is one of: proxy, smart, direct.
+///
+/// # Safety
+/// `input` must point to a valid UTF-8 string of length `input_len`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn phantom_macos_start_with_uri(input: *const u8, input_len: usize) -> i32 {
+    let input_bytes = unsafe { std::slice::from_raw_parts(input, input_len) };
+    let input_str = match std::str::from_utf8(input_bytes) {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+
+    // Split URI and mode: "phantom://key@host:port|mode"
+    let (uri_part, mode_str) = input_str.split_once('|').unwrap_or((input_str, "smart"));
+
+    let server_entry = match parse_phantom_uri(uri_part) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!("URI parse error: {}", e);
+            return -2;
+        }
+    };
+
+    let mode = match mode_str {
+        "proxy" => ProxyMode::Proxy,
+        "direct" => ProxyMode::Direct,
+        _ => ProxyMode::Smart,
+    };
+
+    let config = ClientConfig {
+        servers: vec![server_entry],
+        client: ClientSettings {
+            listen: DEFAULT_SOCKS5_ADDR.to_string(),
+            dns: "tls://8.8.8.8:853".to_string(),
+            mode,
+            cipher: Default::default(),
+        },
+        failover: FailoverConfig::default(),
+        rules: Default::default(),
+    };
+
+    start_with_config(config)
+}
+
+/// Legacy entry: start the tunnel with a TOML config string.
 ///
 /// # Safety
 /// `config_toml` must point to a valid UTF-8 string of length `config_len`.
@@ -31,6 +82,11 @@ pub unsafe extern "C" fn phantom_macos_start(config_toml: *const u8, config_len:
         }
     };
 
+    start_with_config(config)
+}
+
+/// Common tunnel start logic shared by both URI and TOML entry points.
+fn start_with_config(config: ClientConfig) -> i32 {
     let rt = match Runtime::new() {
         Ok(r) => r,
         Err(_) => return -3,
@@ -45,7 +101,7 @@ pub unsafe extern "C" fn phantom_macos_start(config_toml: *const u8, config_len:
     let rt = rt.as_ref().unwrap();
 
     rt.spawn(async move {
-        let local_secret = match phantom_crypto::KeyPair::generate() {
+        let local_secret = match phantom_core::crypto::KeyPair::generate() {
             Ok(kp) => kp.secret,
             Err(e) => {
                 tracing::error!("Key generation failed: {}", e);
@@ -177,4 +233,16 @@ fn parse_dns_addr(dns: &str) -> Option<std::net::SocketAddr> {
 #[unsafe(no_mangle)]
 pub extern "C" fn phantom_macos_get_tun_fd() -> RawFd {
     -1
+}
+
+/// Return the local SOCKS5 listen port.
+///
+/// Swift calls this before configuring the system proxy so the proxy
+/// port always matches the port Rust is actually listening on.
+#[unsafe(no_mangle)]
+pub extern "C" fn phantom_macos_get_socks5_port() -> u16 {
+    match DEFAULT_SOCKS5_ADDR.parse::<std::net::SocketAddr>() {
+        Ok(addr) => addr.port(),
+        Err(_) => 0,
+    }
 }

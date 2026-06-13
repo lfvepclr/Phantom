@@ -1,15 +1,12 @@
 [workspace]
 resolver = "3"
 members = [
-    "crates/phantom-core",
-    "crates/phantom-crypto",
-    "crates/phantom-transport",
-    "crates/phantom-protocol",
+    "core",
     "server",
     "client",
     "client/cli",
-    "phantom-bench",
-    "phantom-e2e",
+    "tests",
+    "tests/bench",
 ]
 
 [workspace.package]
@@ -23,6 +20,7 @@ tokio = { version = "1", features = ["full"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 toml = "0.8"
 
 # Error handling
@@ -54,6 +52,9 @@ rcgen = "0.13"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# Terminal QR code rendering (used by server bootstrap)
+qr2term = "0.3"
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 
@@ -70,9 +71,6 @@ crossbeam-queue = "0.3"
 divan = "0.1"
 
 # Internal crates
-phantom-core = { path = "crates/phantom-core" }
-phantom-crypto = { path = "crates/phantom-crypto" }
-phantom-transport = { path = "crates/phantom-transport" }
-phantom-protocol = { path = "crates/phantom-protocol" }
+phantom-core = { path = "core" }
 phantom-client = { path = "client" }
 phantom-server = { path = "server" }

@@ -1,0 +1,44 @@
+[package]
+name = "phantom-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# Original phantom-core deps
+serde = { workspace = true }
+toml = { workspace = true }
+thiserror = { workspace = true }
+base64 = "0.22"
+tracing = { workspace = true }
+crossbeam-queue = { workspace = true }
+
+# Merged from phantom-crypto
+snow = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+aes-gcm = { workspace = true }
+chacha20poly1305 = { workspace = true }
+ascon-aead = { workspace = true }
+aead = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+x25519-dalek = { workspace = true }
+cfg-if = { workspace = true }
+rand_core = "0.6"
+zeroize = { workspace = true }
+
+# Merged from phantom-protocol
+bitflags = { workspace = true }
+
+# Merged from phantom-transport
+async-trait = { workspace = true }
+quinn = { workspace = true }
+rcgen = { workspace = true }
+
+[features]
+default = []
+geoip = ["maxminddb"]
+
+[dependencies.maxminddb]
+version = "0.24"
+optional = true

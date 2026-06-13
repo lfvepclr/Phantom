@@ -14,44 +14,61 @@ SwiftUI (Menu Bar)  <->  C FFI  <->  Rust cdylib (phantom-client)
 
 ## Build
 
-### 1. Build Rust cdylib
+使用根目录的自动化构建脚本（推荐）：
 
 ```bash
-cd ../../
-cargo build --release -p phantom-client --lib
-# outputs target/release/libphantom_client.dylib
+cd <repo-root>
+scripts/build-mac.sh              # 默认 release (Apple Silicon)
+scripts/build-mac.sh --debug      # debug 构建
 ```
 
-### 2. Create Xcode project
+脚本会依次执行：
 
-Open Xcode and create a new **macOS App**:
-- **Interface**: SwiftUI
-- **Language**: Swift
-- **Minimum Deployments**: macOS 13.0 (for MenuBarExtra)
+1. `cargo build -p phantom-client --lib` — 产出 Rust cdylib
+2. 复制 dylib 到 `client/mac/PhantomLibs/`
+3. `swift build -c release` — SPM 编译 Swift 代码 + 链接 dylib
+4. `swift run PhantomMacBuilder` — 把产物打成 `client/mac/Phantom.app`
 
-### 3. Link Rust library
+### 前置条件
 
-1. Drag `target/release/libphantom_client.dylib` into the Xcode project.
-2. In **Build Phases** > **Link Binary With Libraries**, add `libphantom_client.dylib`.
-3. In **Build Settings** > **Runpath Search Paths**, add:
-   ```
-   @executable_path/../Frameworks
-   @loader_path
-   ```
+- Rust toolchain (>= 1.85, edition 2024)
+- macOS 13.0+（MenuBarExtra 要求）
+- Xcode Command Line Tools（`xcode-select --install`），含 `swift` + `codesign` + `plutil`
 
-### 4. Add Swift source files
+不需要 Xcode 工程文件：整个构建流程走 Swift Package Manager。
 
-Add the following files to the Xcode project:
-- `PhantomMacApp.swift`
-- `Bridge.swift`
-- `PhantomTunnel.swift`
+## Launch
 
-### 5. Run
+```bash
+# TUN 设备创建需要 root：
+sudo open client/mac/Phantom.app
+# 不加 sudo 也可启动，但 TUN 部分会失败，只剩 SOCKS5 代理可用
+```
 
-Press **Run** in Xcode. The app appears as a lightning-bolt icon in the menu bar.
+菜单栏出现闪电图标；点击 → 输入 `phantom://` URI → 选 Global / Auto / Direct → Start。
+
+## 项目结构
+
+```
+client/mac/
+├── Package.swift                  # SPM manifest
+├── Sources/
+│   ├── PhantomMac/                # 主程序（4 个 swift 文件）
+│   │   ├── PhantomMacApp.swift
+│   │   ├── PhantomTunnel.swift
+│   │   ├── Bridge.swift
+│   │   └── SystemProxy.swift
+│   └── PhantomMacBuilder/         # 打包工具（仿 mytime DMGBuilderExec）
+│       └── main.swift
+├── PhantomLibs/                   # Rust dylib 暂存（gitignored，build 脚本填充）
+├── Info.plist                     # 拷贝进 .app/Contents/
+├── .build/                        # SPM 产物（gitignored）
+└── Phantom.app                    # 最终产物（gitignored）
+```
 
 ## Notes
 
-- The Rust cdylib must be rebuilt manually after each Rust code change.
-- `LSUIElement = true` hides the app from Dock; only the menu bar icon is shown.
-- TUN device creation requires root or the `com.apple.vm.networking` entitlement.
+- 改完 Rust 代码后必须重跑 `scripts/build-mac.sh`（dylib 会重新生成 + 复制）。
+- `LSUIElement = true` 已在 `Info.plist` 中声明，菜单栏 app 不在 Dock 显示。
+- TUN 设备创建需要 root 或 `com.apple.vm.networking` entitlement。
+- 构建流程参考 `qoder/mytime` 项目的 `Package.swift` + `DMGBuilderExec` 模式。

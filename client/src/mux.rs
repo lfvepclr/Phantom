@@ -7,11 +7,11 @@
 
 use async_trait::async_trait;
 use phantom_core::{CipherPreference, PhantomError, Result};
-use phantom_crypto::cipher::CipherSuite;
-use phantom_crypto::session::CipherOffer;
-use phantom_crypto::{split_after_handshake, split_for_stream, NoiseInitiator};
-use phantom_transport::quic::{create_client_endpoint, QuicStream};
-use phantom_transport::Transport;
+use phantom_core::crypto::cipher::CipherSuite;
+use phantom_core::crypto::session::CipherOffer;
+use phantom_core::crypto::{split_after_handshake, split_for_stream, NoiseInitiator};
+use phantom_core::transport::quic::{create_client_endpoint, QuicStream};
+use phantom_core::transport::Transport;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -36,8 +36,8 @@ enum MuxState {
 }
 
 /// Aliases for the encrypted stream halves returned by `MuxSession::open_stream`.
-pub type EncryptedReader = phantom_crypto::SessionReader<tokio::io::ReadHalf<QuicStream>>;
-pub type EncryptedWriter = phantom_crypto::SessionWriter<tokio::io::WriteHalf<QuicStream>>;
+pub type EncryptedReader = phantom_core::crypto::SessionReader<tokio::io::ReadHalf<QuicStream>>;
+pub type EncryptedWriter = phantom_core::crypto::SessionWriter<tokio::io::WriteHalf<QuicStream>>;
 
 impl MuxSession {
     /// Establish a new QUIC connection and prepare for Noise authentication.
@@ -127,7 +127,7 @@ impl MuxSession {
 }
 
 fn resolve_offer(cipher_preference: CipherPreference) -> CipherOffer {
-    use phantom_crypto::cipher::CipherSuite;
+    use phantom_core::crypto::cipher::CipherSuite;
     match cipher_preference {
         CipherPreference::Auto => CipherOffer::default_offer(),
         CipherPreference::Aes256Gcm => CipherOffer::new(vec![CipherSuite::Aes256Gcm]),

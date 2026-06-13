@@ -5,7 +5,17 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/phantom-server /etc/phantom/server.toml
+# Auto-bootstrap mode: phantom-server writes ./server.key and ./server.toml
+# on first start. WorkingDirectory MUST point to a writable directory owned
+# by the service user; the server reads/writes server.key and server.toml
+# relative to this directory. The phantom:// URI quick-link lives as a comment
+# at the top of server.toml; the inline `[[allowed_clients]]` array below it
+# stores the whitelist (empty = open mode).
+#
+# To use a TOML config instead, replace ExecStart with:
+#   /usr/local/bin/phantom-server /etc/phantom/server.toml
+ExecStart=/usr/local/bin/phantom-server
+WorkingDirectory=/var/lib/phantom
 Restart=always
 RestartSec=5
 LimitNOFILE=65535
@@ -14,7 +24,7 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/etc/phantom
+ReadWritePaths=/var/lib/phantom
 
 [Install]
 WantedBy=multi-user.target
