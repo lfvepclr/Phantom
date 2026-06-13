@@ -1,0 +1,18 @@
+# SPM build output
+.build/
+Package.resolved
+
+# Cargo output copied here by scripts/build-mac.sh
+PhantomLibs/*.dylib
+
+# Final .app bundle
+Phantom.app
+
+# DMG distributable + dist staging
+dist/
+
+# Xcode artifacts (in case anyone uses Xcode later)
+*.xcodeproj
+
+# macOS metadata
+.DS_Store

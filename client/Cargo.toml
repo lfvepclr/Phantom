@@ -3,11 +3,12 @@ name = "phantom-client"
 version.workspace = true
 edition.workspace = true
 
+[lib]
+name = "phantom_client"
+crate-type = ["rlib", "cdylib"]
+
 [dependencies]
 phantom-core = { workspace = true }
-phantom-crypto = { workspace = true }
-phantom-transport = { workspace = true }
-phantom-protocol = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
@@ -19,8 +20,10 @@ tun = { version = "0.7", features = ["async"] }
 etherparse = "0.14"
 toml = { workspace = true }
 ipnet = "2.9"
-regex = { version = "1.10", default-features = false, features = ["std", "unicode-perl"] }
+regex = { version = "1.10", default-features = false, features = ["std", "unicode-perl", "perf"] }
 maxminddb = { version = "0.24", optional = true }
+daachorse = "1"
+iptrie = "0.8"
 
 [features]
 default = []

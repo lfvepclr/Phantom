@@ -1,0 +1,24 @@
+[package]
+name = "phantom-e2e"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+phantom-core = { workspace = true }
+phantom-client = { workspace = true }
+phantom-server = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+bytes = { workspace = true }
+anyhow = { workspace = true }
+rand = "0.8"
+axum = "0.7"
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+ipnet = "2.9"
+regex = "1"
+
+[dev-dependencies]
+regex = { version = "1.10", default-features = false, features = ["std", "unicode-perl", "perf"] }
+ipnet = "2.9"

@@ -4,11 +4,11 @@ use bytes::{Bytes, BytesMut};
 use phantom_core::constants::{HANDSHAKE_TIMEOUT_SECS, MAX_FRAME_PAYLOAD};
 use phantom_core::CipherPreference;
 use phantom_core::{PhantomError, Result};
-use phantom_crypto::cipher::CipherSuite;
-use phantom_crypto::{split_after_handshake, split_for_stream, NoiseResponder};
-use phantom_protocol::codec::{FrameReader, FrameWriter};
-use phantom_protocol::frame::FrameFlags;
-use phantom_protocol::{Frame, TargetAddr};
+use phantom_core::crypto::cipher::CipherSuite;
+use phantom_core::crypto::{split_after_handshake, split_for_stream, NoiseResponder};
+use phantom_core::protocol::codec::{FrameReader, FrameWriter};
+use phantom_core::protocol::frame::FrameFlags;
+use phantom_core::protocol::{Frame, TargetAddr};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
@@ -34,8 +34,11 @@ pub async fn handle_connection<S>(
     };
 
     if !allowed_clients.is_empty() && !allowed_clients.contains(&result.remote_static_key) {
+        tracing::info!("Rejected unauthorized client");
         return;
     }
+
+    tracing::info!("Client connected (cipher={:?})", result.chosen_cipher);
 
     let (session_reader, session_writer) = split_after_handshake(
         result.stream,
@@ -60,7 +63,7 @@ pub async fn handle_quic_connection(
     allowed_clients: &[[u8; 32]],
     cipher_preference: CipherPreference,
 ) {
-    use phantom_transport::quic::QuicStream;
+    use phantom_core::transport::quic::QuicStream;
 
     let supported = resolve_supported_ciphers(cipher_preference);
     let mut handshake_done = false;
@@ -157,6 +160,8 @@ where
         }
     };
 
+    tracing::info!("SYN → {} (stream={})", target, syn_frame.stream_id);
+
     let target_addr = match target.to_socket_addr().await {
         Ok(a) => a,
         Err(_) => {
@@ -168,7 +173,8 @@ where
 
     let target_stream = match TcpStream::connect(target_addr).await {
         Ok(s) => s,
-        Err(_) => {
+        Err(e) => {
+            tracing::info!("Connect failed → {}: {}", target, e);
             let _ = frame_writer.write_frame(&Frame::rst(syn_frame.stream_id)).await;
             let _ = frame_writer.flush().await;
             return Ok(());
@@ -184,7 +190,7 @@ where
     }
     let _ = frame_writer.flush().await;
 
-    relay(target_stream, frame_reader, frame_writer, syn_frame.stream_id).await
+    relay(target_stream, frame_reader, frame_writer, syn_frame.stream_id, &target).await
 }
 
 /// UDP relay: SYN payload contains the first datagram target address + data.
@@ -286,7 +292,7 @@ fn decode_udp_syn(payload: &[u8]) -> Option<(TargetAddr, &[u8])> {
         return None;
     }
     let atyp = payload[0];
-    let (addr_len, target_end) = match atyp {
+    let (_addr_len, target_end) = match atyp {
         0x01 => (4 + 2, 1 + 4 + 2),  // IPv4: 4 bytes + 2 port
         0x04 => (16 + 2, 1 + 16 + 2), // IPv6: 16 bytes + 2 port
         0x03 => {
@@ -320,6 +326,7 @@ async fn relay<R, W>(
     mut frame_reader: FrameReader<R>,
     mut frame_writer: FrameWriter<W>,
     stream_id: u32,
+    target_addr: &TargetAddr,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin,
@@ -327,14 +334,17 @@ where
 {
     let (mut target_read, mut target_write) = tokio::io::split(target);
 
+    let target_clone = target_addr.clone();
     let to_tunnel = async {
         let mut buf = BytesMut::with_capacity(MAX_FRAME_PAYLOAD);
+        let mut total_down: u64 = 0;
         loop {
             buf.clear();
             let n = target_read.read_buf(&mut buf).await.map_err(PhantomError::Io)?;
             if n == 0 {
                 break;
             }
+            total_down += n as u64;
             let data = buf.split().freeze();
             frame_writer
                 .write_frame(&Frame::data(stream_id, data))
@@ -342,13 +352,17 @@ where
         }
         let _ = frame_writer.write_frame(&Frame::fin(stream_id)).await;
         let _ = frame_writer.flush().await;
+        tracing::info!("Relay done ↓ {} ({} bytes down)", target_clone, total_down);
         Ok::<_, PhantomError>(())
     };
 
+    let target_clone = target_addr.clone();
     let from_tunnel = async {
+        let mut total_up: u64 = 0;
         loop {
             let frame = frame_reader.read_frame().await?;
             if frame.flags.contains(FrameFlags::DATA) {
+                total_up += frame.payload.len() as u64;
                 target_write.write_all(&frame.payload).await.map_err(PhantomError::Io)?;
             } else if frame.flags.contains(FrameFlags::FIN) || frame.flags.contains(FrameFlags::RST) {
                 break;
@@ -357,9 +371,65 @@ where
         // Shutdown the write half to send TCP FIN to the target,
         // so the target knows no more data is coming and can close.
         let _ = target_write.shutdown().await;
+        tracing::info!("Relay done ↑ {} ({} bytes up)", target_clone, total_up);
         Ok::<_, PhantomError>(())
     };
 
     tokio::try_join!(to_tunnel, from_tunnel)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decode_udp_syn_empty() {
+        assert!(decode_udp_syn(&[]).is_none());
+    }
+
+    #[test]
+    fn decode_udp_syn_ipv4_with_datagram() {
+        // atyp=1 (IPv4), 4 bytes IP, 2 bytes port, then datagram
+        let mut payload = vec![0x01]; // IPv4
+        payload.extend_from_slice(&[192, 168, 1, 1]); // IP
+        payload.extend_from_slice(&[0x00, 0x35]); // port 53
+        payload.extend_from_slice(b"hello");
+        let (target, datagram) = decode_udp_syn(&payload).unwrap();
+        assert!(matches!(target, TargetAddr::IPv4(_, 53)));
+        assert_eq!(datagram, b"hello");
+    }
+
+    #[test]
+    fn decode_udp_syn_ipv4_empty_datagram() {
+        let mut payload = vec![0x01]; // IPv4
+        payload.extend_from_slice(&[8, 8, 8, 8]); // IP
+        payload.extend_from_slice(&[0x00, 0x35]); // port 53
+        let (target, datagram) = decode_udp_syn(&payload).unwrap();
+        assert!(matches!(target, TargetAddr::IPv4(_, 53)));
+        assert_eq!(datagram, b"");
+    }
+
+    #[test]
+    fn decode_udp_syn_truncated_ipv4() {
+        let payload = vec![0x01, 192, 168]; // only 2 bytes of IP
+        assert!(decode_udp_syn(&payload).is_none());
+    }
+
+    #[test]
+    fn decode_udp_syn_unsupported_atyp() {
+        let payload = vec![0x05]; // unsupported
+        assert!(decode_udp_syn(&payload).is_none());
+    }
+
+    #[test]
+    fn decode_udp_syn_domain_with_data() {
+        let mut payload = vec![0x03, 0x0B]; // domain, length 11
+        payload.extend_from_slice(b"example.com");
+        payload.extend_from_slice(&[0x01, 0xBB]); // port 443
+        payload.extend_from_slice(b"data");
+        let (target, datagram) = decode_udp_syn(&payload).unwrap();
+        assert!(matches!(target, TargetAddr::Domain(_, 443)));
+        assert_eq!(datagram, b"data");
+    }
 }

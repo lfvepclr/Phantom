@@ -26,8 +26,18 @@ class MainActivity : ComponentActivity() {
 fun PhantomApp(activity: Activity) {
     var isRunning by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("Idle") }
+    var serverURI by remember { mutableStateOf("") }
+    var proxyMode by remember { mutableStateOf("smart") }
 
     fun startTunnel() {
+        if (serverURI.isBlank()) {
+            status = "Error: server URI required"
+            return
+        }
+        // Pass URI and mode to the VpnService before starting.
+        PhantomVpnService.serverURI = serverURI.trim()
+        PhantomVpnService.proxyMode = proxyMode
+
         val intent = VpnService.prepare(activity)
         if (intent != null) {
             activity.startActivityForResult(intent, 0)
@@ -60,6 +70,35 @@ fun PhantomApp(activity: Activity) {
                 text = "Phantom",
                 style = MaterialTheme.typography.headlineLarge
             )
+
+            Spacer(modifier = Modifier.height(16.dp))
+
+            OutlinedTextField(
+                value = serverURI,
+                onValueChange = { serverURI = it },
+                label = { Text("Server URI") },
+                placeholder = { Text("phantom://key@host:port") },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !isRunning
+            )
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            // Proxy mode selector
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceEvenly
+            ) {
+                listOf("smart", "proxy", "direct").forEach { mode ->
+                    FilterChip(
+                        selected = proxyMode == mode,
+                        onClick = { proxyMode = mode },
+                        label = { Text(mode.replaceFirstChar { it.uppercase() }) },
+                        enabled = !isRunning
+                    )
+                }
+            }
 
             Spacer(modifier = Modifier.height(24.dp))
 

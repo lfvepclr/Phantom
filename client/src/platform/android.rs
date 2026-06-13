@@ -8,14 +8,70 @@
 //! After the one-shot hand-off, all packet I/O, encryption, and transport
 //! run entirely inside Rust.  No per-packet JNI.
 
-use phantom_core::ClientConfig;
+use phantom_core::{ClientConfig, ClientSettings, FailoverConfig, ProxyMode, parse_phantom_uri};
 use std::os::unix::io::RawFd;
 use std::sync::Mutex;
 use tokio::runtime::Runtime;
 
 static RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
 
-/// Initialize the Phantom tunnel with a TUN fd provided by Android VpnService.
+/// Start the tunnel using a `phantom://` URI string and mode.
+///
+/// # Safety
+/// `fd` must be a valid, open TUN file descriptor obtained from
+/// `ParcelFileDescriptor.detachFd()`.
+/// `uri` must point to a valid UTF-8 string of length `uri_len`.
+/// `mode` must point to a valid UTF-8 string of length `mode_len`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn phantom_android_start_with_uri(
+    fd: RawFd,
+    uri: *const u8,
+    uri_len: usize,
+    mode: *const u8,
+    mode_len: usize,
+) -> i32 {
+    let uri_bytes = unsafe { std::slice::from_raw_parts(uri, uri_len) };
+    let uri_str = match std::str::from_utf8(uri_bytes) {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+
+    let mode_bytes = unsafe { std::slice::from_raw_parts(mode, mode_len) };
+    let mode_str = match std::str::from_utf8(mode_bytes) {
+        Ok(s) => s,
+        Err(_) => return -1,
+    };
+
+    let server_entry = match parse_phantom_uri(uri_str) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::error!("URI parse error: {}", e);
+            return -2;
+        }
+    };
+
+    let proxy_mode = match mode_str {
+        "proxy" => ProxyMode::Proxy,
+        "direct" => ProxyMode::Direct,
+        _ => ProxyMode::Smart,
+    };
+
+    let config = ClientConfig {
+        servers: vec![server_entry],
+        client: ClientSettings {
+            listen: "127.0.0.1:11080".to_string(),
+            dns: "tls://8.8.8.8:853".to_string(),
+            mode: proxy_mode,
+            cipher: Default::default(),
+        },
+        failover: FailoverConfig::default(),
+        rules: Default::default(),
+    };
+
+    start_with_config(fd, config)
+}
+
+/// Legacy entry: Initialize the Phantom tunnel with a TUN fd and TOML config.
 ///
 /// # Safety
 /// `fd` must be a valid, open TUN file descriptor obtained from
@@ -41,6 +97,11 @@ pub unsafe extern "C" fn phantom_android_start(
         }
     };
 
+    start_with_config(fd, config)
+}
+
+/// Common tunnel start logic shared by both URI and TOML entry points.
+fn start_with_config(fd: RawFd, config: ClientConfig) -> i32 {
     let rt = match Runtime::new() {
         Ok(r) => r,
         Err(_) => return -3,
@@ -110,7 +171,7 @@ pub unsafe extern "C" fn phantom_android_start(
                 let cfg = config_clone.clone();
                 let fo = std::sync::Arc::clone(&failover_socks5);
                 tokio::spawn(async move {
-                    let local_secret = match phantom_crypto::KeyPair::generate() {
+                    let local_secret = match phantom_core::crypto::KeyPair::generate() {
                         Ok(kp) => kp.secret,
                         Err(_) => return,
                     };
@@ -123,7 +184,7 @@ pub unsafe extern "C" fn phantom_android_start(
 
         // 3. Start TUN transparent proxy.
         let tun_task = tokio::spawn(async move {
-            let tun_secret = match phantom_crypto::KeyPair::generate() {
+            let tun_secret = match phantom_core::crypto::KeyPair::generate() {
                 Ok(kp) => kp.secret,
                 Err(e) => {
                     tracing::error!("TUN key generation failed: {}", e);

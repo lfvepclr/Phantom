@@ -7,10 +7,18 @@
 //! - GEOIP: country code lookup (optional feature `geoip`)
 //!
 //! Design goals: O(1) or O(domain-depth) query, no per-packet allocation.
+//!
+//! Hot-path data structures:
+//! - `DomainKeyword`  : [`daachorse::DoubleArrayAhoCorasick`] (single-pass AC scan).
+//! - `IpCidr`         : [`iptrie::LCTrieMap`] (level-compressed patricia trie, O(prefix-bits) lookup).
+//! - `DomainSuffix`   : in-house radix-style trie keyed by reversed labels.
+//! - `DomainFull`/`Port` : `HashMap` for O(1) exact match.
 
+use daachorse::{DoubleArrayAhoCorasick, DoubleArrayAhoCorasickBuilder};
 use ipnet::{Ipv4Net, Ipv6Net};
+use iptrie::{Ipv4Prefix, Ipv6Prefix, LCTrieMap, RTrieMap};
 use phantom_core::{PhantomError, Result, RuleAction, RulePattern, RulesConfig};
-use regex::Regex;
+use regex::RegexSet;
 use std::collections::HashMap;
 use std::net::IpAddr;
 
@@ -18,10 +26,22 @@ use std::net::IpAddr;
 pub struct RuleEngine {
     domain_full: HashMap<String, RuleAction>,
     domain_suffix: DomainSuffixTrie,
-    domain_keyword: Vec<(String, RuleAction)>,
-    domain_regex: Vec<(Regex, RuleAction)>,
-    ip_cidr_v4: Vec<(Ipv4Net, RuleAction)>,
-    ip_cidr_v6: Vec<(Ipv6Net, RuleAction)>,
+    /// `None` when the rule set contains no `DomainKeyword` rules — the AC
+    /// automaton is built only when we actually have patterns to match.
+    domain_keyword: Option<DoubleArrayAhoCorasick<RuleAction>>,
+    domain_regex: Option<RegexSet>,
+    /// Per-pattern action, indexed by position in the `RegexSet`. Length
+    /// equals the number of `DomainRegex` rules (0 when `domain_regex` is
+    /// `None`).
+    regex_actions: Vec<RuleAction>,
+    /// LC-trie for IPv4 longest-prefix match. The trie stores
+    /// `Option<RuleAction>` so the root can mean "no match" (i.e. fall through
+    /// to port/geoip/final) and only the user-configured prefixes return a
+    /// concrete action. The trie itself is `None` when there are no CIDR
+    /// rules, so the hot path can skip the lookup entirely.
+    ip_cidr_v4: Option<LCTrieMap<Ipv4Prefix, Option<RuleAction>>>,
+    /// LC-trie for IPv6 longest-prefix match. See `ip_cidr_v4` for semantics.
+    ip_cidr_v6: Option<LCTrieMap<Ipv6Prefix, Option<RuleAction>>>,
     ports: HashMap<u16, RuleAction>,
     geoip_rules: HashMap<String, RuleAction>,
     #[cfg(feature = "geoip")]
@@ -34,12 +54,12 @@ impl RuleEngine {
     pub fn from_config(cfg: &RulesConfig) -> Result<Self> {
         let mut domain_full = HashMap::new();
         let mut domain_suffix = DomainSuffixTrie::new();
-        let mut domain_keyword = Vec::new();
-        let mut domain_regex = Vec::new();
-        let mut ip_cidr_v4 = Vec::new();
-        let mut ip_cidr_v6 = Vec::new();
+        let mut domain_keyword_pairs: Vec<(String, RuleAction)> = Vec::new();
+        let mut regex_pairs: Vec<(String, RuleAction)> = Vec::new();
+        let mut ip_cidr_v4_pairs: Vec<(Ipv4Prefix, RuleAction)> = Vec::new();
+        let mut ip_cidr_v6_pairs: Vec<(Ipv6Prefix, RuleAction)> = Vec::new();
         let mut ports = HashMap::new();
-        let mut geoip_rules = HashMap::new();
+        let geoip_rules = HashMap::new();
 
         for rule in &cfg.rules {
             match &rule.pattern {
@@ -50,18 +70,20 @@ impl RuleEngine {
                     domain_suffix.insert(value, rule.action);
                 }
                 RulePattern::DomainKeyword { value } => {
-                    domain_keyword.push((value.to_lowercase(), rule.action));
+                    domain_keyword_pairs.push((value.to_lowercase(), rule.action));
                 }
                 RulePattern::DomainRegex { value } => {
-                    let re = Regex::new(value)
-                        .map_err(|e| PhantomError::Config(format!("Invalid domain regex: {}", e)))?;
-                    domain_regex.push((re, rule.action));
+                    regex_pairs.push((value.clone(), rule.action));
                 }
                 RulePattern::IpCidr { value } => {
                     if let Ok(net) = value.parse::<Ipv4Net>() {
-                        ip_cidr_v4.push((net, rule.action));
+                        let prefix = Ipv4Prefix::new(net.network(), net.prefix_len())
+                            .map_err(|e| PhantomError::Config(format!("Invalid IPv4 prefix: {}", e)))?;
+                        ip_cidr_v4_pairs.push((prefix, rule.action));
                     } else if let Ok(net) = value.parse::<Ipv6Net>() {
-                        ip_cidr_v6.push((net, rule.action));
+                        let prefix = Ipv6Prefix::new(net.network(), net.prefix_len())
+                            .map_err(|e| PhantomError::Config(format!("Invalid IPv6 prefix: {}", e)))?;
+                        ip_cidr_v6_pairs.push((prefix, rule.action));
                     } else {
                         return Err(PhantomError::Config(format!(
                             "Invalid IP-CIDR: {}",
@@ -82,9 +104,73 @@ impl RuleEngine {
             }
         }
 
-        // Sort CIDR lists so longest prefix (most specific) is checked first.
-        ip_cidr_v4.sort_by_key(|(net, _)| std::cmp::Reverse(net.prefix_len()));
-        ip_cidr_v6.sort_by_key(|(net, _)| std::cmp::Reverse(net.prefix_len()));
+        // Build a `RegexSet` from all domain-regex patterns. The set is queried
+        // in a single pass and reports matching pattern indices in ascending
+        // order — `iter().next()` therefore returns the lowest-indexed match,
+        // preserving the "first match wins" config-order priority of the
+        // previous `Vec<Regex>` implementation.
+        let (domain_regex, regex_actions) = if regex_pairs.is_empty() {
+            (None, Vec::new())
+        } else {
+            let pat_strs: Vec<&str> = regex_pairs.iter().map(|(p, _)| p.as_str()).collect();
+            // The default 10 MB per-regex size limit is too tight for very
+            // large rule sets (e.g. 10k+ patterns with DFA caching); lift it
+            // to 256 MB and bump the DFA cache proportionally. The defaults
+            // are still applied to individual patterns, so pathological
+            // patterns will still be rejected.
+            let set = regex::RegexSetBuilder::new(&pat_strs)
+                .size_limit(256 * 1024 * 1024)
+                .dfa_size_limit(64 * 1024 * 1024)
+                .build()
+                .map_err(|e| PhantomError::Config(format!("Invalid domain regex: {}", e)))?;
+            let actions: Vec<RuleAction> = regex_pairs.iter().map(|(_, a)| *a).collect();
+            (Some(set), actions)
+        };
+
+        // Build AC automaton for keyword rules. We track insertion order via
+        // `LeftmostFirst` so that when several patterns match at the same
+        // position the earliest-registered (== config-order) one wins,
+        // matching the previous Vec-iteration semantics.
+        let domain_keyword = if domain_keyword_pairs.is_empty() {
+            None
+        } else {
+            // `build_with_values` accepts any `Copy` value type (unlike
+            // `build`, which insists on `TryFrom<usize>`); perfect for our enum.
+            let automaton = DoubleArrayAhoCorasickBuilder::new()
+                .match_kind(daachorse::MatchKind::LeftmostFirst)
+                .build_with_values(
+                    domain_keyword_pairs
+                        .iter()
+                        .map(|(p, a)| (p.clone(), *a)),
+                )
+                .map_err(|e| PhantomError::Config(format!("Failed to build keyword automaton: {}", e)))?;
+            Some(automaton)
+        };
+
+        // Build level-compressed patricia tries for IP-CIDR. The root stores
+        // `None` ("no user rule matched"); only the explicitly-inserted
+        // prefixes store `Some(action)`. This preserves the old
+        // "fall-through-to-port" semantics when the IP doesn't match any
+        // configured prefix.
+        let mut rtrie_v4 = RTrieMap::with_root(None);
+        for (prefix, action) in &ip_cidr_v4_pairs {
+            rtrie_v4.insert(*prefix, Some(*action));
+        }
+        let ip_cidr_v4 = if ip_cidr_v4_pairs.is_empty() {
+            None
+        } else {
+            Some(rtrie_v4.compress())
+        };
+
+        let mut rtrie_v6 = RTrieMap::with_root(None);
+        for (prefix, action) in &ip_cidr_v6_pairs {
+            rtrie_v6.insert(*prefix, Some(*action));
+        }
+        let ip_cidr_v6 = if ip_cidr_v6_pairs.is_empty() {
+            None
+        } else {
+            Some(rtrie_v6.compress())
+        };
 
         #[cfg(feature = "geoip")]
         let geoip = None;
@@ -94,6 +180,7 @@ impl RuleEngine {
             domain_suffix,
             domain_keyword,
             domain_regex,
+            regex_actions,
             ip_cidr_v4,
             ip_cidr_v6,
             ports,
@@ -132,31 +219,47 @@ impl RuleEngine {
             if let Some(action) = self.domain_suffix.query(&d) {
                 return action;
             }
-            for (kw, action) in &self.domain_keyword {
-                if d.contains(kw) {
-                    return *action;
+            if let Some(ac) = &self.domain_keyword {
+                // `leftmost_find_iter` yields non-overlapping leftmost
+                // matches; with `MatchKind::LeftmostFirst` the first hit at
+                // each position is the earliest-registered pattern. Take the
+                // very first occurrence, which is the earliest pattern in
+                // the global match order — equivalent to scanning a Vec in
+                // order.
+                if let Some(m) = ac.leftmost_find_iter(&d).next() {
+                    return m.value();
                 }
             }
-            for (re, action) in &self.domain_regex {
-                if re.is_match(&d) {
-                    return *action;
+            if let Some(re_set) = &self.domain_regex {
+                // `matches().iter()` yields matching pattern indices in
+                // ascending order (== config order). The first one is the
+                // earliest-registered pattern, matching the previous
+                // `Vec<Regex>` greedy semantics.
+                if let Some(idx) = re_set.matches(&d).iter().next() {
+                    return self.regex_actions[idx];
                 }
             }
         }
 
-        // 2. IP-CIDR rules.
+        // 2. IP-CIDR rules (longest prefix match). Only return when the IP
+        // actually matches a user-configured prefix; on no match we fall
+        // through to port / geoip / final just like the legacy engine did.
         if let Some(addr) = ip {
             match addr {
                 IpAddr::V4(v4) => {
-                    for (net, action) in &self.ip_cidr_v4 {
-                        if net.contains(&v4) {
+                    if let Some(trie) = &self.ip_cidr_v4 {
+                        let key = Ipv4Prefix::new(v4, 32).expect("/32 always valid");
+                        let (_, opt_action) = trie.lookup(&key);
+                        if let Some(action) = opt_action {
                             return *action;
                         }
                     }
                 }
                 IpAddr::V6(v6) => {
-                    for (net, action) in &self.ip_cidr_v6 {
-                        if net.contains(&v6) {
+                    if let Some(trie) = &self.ip_cidr_v6 {
+                        let key = Ipv6Prefix::new(v6, 128).expect("/128 always valid");
+                        let (_, opt_action) = trie.lookup(&key);
+                        if let Some(action) = opt_action {
                             return *action;
                         }
                     }
@@ -248,6 +351,8 @@ impl DomainSuffixTrie {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use phantom_core::ClientRule;
+    use std::net::Ipv4Addr;
 
     fn make_cfg(rules: Vec<(RulePattern, RuleAction)>) -> RulesConfig {
         RulesConfig {
@@ -257,6 +362,10 @@ mod tests {
                 .collect(),
             final_action: RuleAction::Proxy,
         }
+    }
+
+    fn make_config(rules: Vec<ClientRule>, final_action: RuleAction) -> RulesConfig {
+        RulesConfig { rules, final_action }
     }
 
     #[test]
@@ -395,5 +504,73 @@ mod tests {
             ),
             RuleAction::Direct
         );
+    }
+
+    #[test]
+    fn empty_rules_final_proxy() {
+        let cfg = make_config(vec![], RuleAction::Proxy);
+        let engine = RuleEngine::from_config(&cfg).unwrap();
+        assert_eq!(engine.query(None, None, None), RuleAction::Proxy);
+    }
+
+    #[test]
+    fn empty_rules_final_direct() {
+        let cfg = make_config(vec![], RuleAction::Direct);
+        let engine = RuleEngine::from_config(&cfg).unwrap();
+        assert_eq!(engine.query(None, None, None), RuleAction::Direct);
+    }
+
+    #[test]
+    fn domain_full_case_insensitive() {
+        let cfg = make_config(vec![
+            ClientRule { pattern: RulePattern::DomainFull { value: "Google.COM".to_string() }, action: RuleAction::Proxy }
+        ], RuleAction::Direct);
+        let engine = RuleEngine::from_config(&cfg).unwrap();
+        assert_eq!(engine.query(Some("google.com"), None, None), RuleAction::Proxy);
+        assert_eq!(engine.query(Some("GOOGLE.COM"), None, None), RuleAction::Proxy);
+    }
+
+    #[test]
+    fn ip_cidr_longest_prefix() {
+        let cfg = make_config(vec![
+            ClientRule { pattern: RulePattern::IpCidr { value: "10.0.0.0/8".to_string() }, action: RuleAction::Direct },
+            ClientRule { pattern: RulePattern::IpCidr { value: "10.0.1.0/24".to_string() }, action: RuleAction::Proxy },
+        ], RuleAction::Direct);
+        let engine = RuleEngine::from_config(&cfg).unwrap();
+        // 10.0.1.5 matches both /8 and /24, /24 is more specific
+        assert_eq!(engine.query(None, Some("10.0.1.5".parse().unwrap()), None), RuleAction::Proxy);
+        // 10.1.2.3 matches only /8
+        assert_eq!(engine.query(None, Some("10.1.2.3".parse().unwrap()), None), RuleAction::Direct);
+    }
+
+    #[test]
+    fn domain_keyword_proxy_on_match() {
+        let cfg = make_config(vec![
+            ClientRule { pattern: RulePattern::DomainKeyword { value: "google".to_string() }, action: RuleAction::Proxy }
+        ], RuleAction::Direct);
+        let engine = RuleEngine::from_config(&cfg).unwrap();
+        assert_eq!(engine.query(Some("mail.google.com"), None, None), RuleAction::Proxy);
+        assert_eq!(engine.query(Some("example.com"), None, None), RuleAction::Direct);
+    }
+
+    #[test]
+    fn port_proxy_on_match() {
+        let cfg = make_config(vec![
+            ClientRule { pattern: RulePattern::Port { value: 443 }, action: RuleAction::Proxy }
+        ], RuleAction::Direct);
+        let engine = RuleEngine::from_config(&cfg).unwrap();
+        assert_eq!(engine.query(None, None, Some(443)), RuleAction::Proxy);
+        assert_eq!(engine.query(None, None, Some(80)), RuleAction::Direct);
+    }
+
+    #[test]
+    fn domain_priority_over_ip() {
+        let cfg = make_config(vec![
+            ClientRule { pattern: RulePattern::DomainFull { value: "example.com".to_string() }, action: RuleAction::Proxy },
+            ClientRule { pattern: RulePattern::IpCidr { value: "1.2.3.0/24".to_string() }, action: RuleAction::Direct },
+        ], RuleAction::Direct);
+        let engine = RuleEngine::from_config(&cfg).unwrap();
+        // Domain match takes priority
+        assert_eq!(engine.query(Some("example.com"), Some("1.2.3.4".parse().unwrap()), None), RuleAction::Proxy);
     }
 }

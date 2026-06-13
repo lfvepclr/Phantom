@@ -3,15 +3,15 @@ use bytes::BytesMut;
 use phantom_core::constants::MAX_FRAME_PAYLOAD;
 use phantom_core::CipherPreference;
 use phantom_core::{ClientConfig, PhantomError, Result, ServerEntry};
-use phantom_crypto::cipher::CipherSuite;
-use phantom_crypto::session::CipherOffer;
-use phantom_crypto::{split_after_handshake, NoiseInitiator};
-use phantom_protocol::codec::{FrameReader, FrameWriter};
-use phantom_protocol::frame::FrameFlags;
-use phantom_protocol::{Frame, TargetAddr};
+use phantom_core::crypto::cipher::CipherSuite;
+use phantom_core::crypto::session::CipherOffer;
+use phantom_core::crypto::{split_after_handshake, NoiseInitiator};
+use phantom_core::protocol::codec::{FrameReader, FrameWriter};
+use phantom_core::protocol::frame::FrameFlags;
+use phantom_core::protocol::{Frame, TargetAddr};
 use phantom_core::TransportProtocol;
-use phantom_transport::tcp::TcpTransport;
-use phantom_transport::Transport;
+use phantom_core::transport::tcp::TcpTransport;
+use phantom_core::transport::Transport;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -28,20 +28,24 @@ pub async fn handle_socks5_connection(
 
     // 2. SOCKS5 request
     let target = read_request(&mut socks5).await?;
+    tracing::info!("SOCKS5 target: {}", target);
 
     // 3. Select server via failover manager
     let server = failover.select_server()?;
 
     // 4. Establish encrypted tunnel via selected transport protocol
+    tracing::info!("Connecting to server {} ({})", server.name, server.address);
     match server.protocol {
         TransportProtocol::Tcp => {
             let transport = TcpTransport::new(std::time::Duration::from_secs(10));
             match establish_tunnel(&transport, server, &local_secret, &target, config.client.cipher).await {
                 Ok((frame_reader, frame_writer, stream_id)) => {
+                    tracing::info!("Tunnel established → {} (cipher={:?})", target, config.client.cipher);
                     send_reply(&mut socks5, 0x00).await?;
-                    relay_socks5_tunnel(socks5, frame_reader, frame_writer, stream_id).await
+                    relay_socks5_tunnel(socks5, frame_reader, frame_writer, stream_id, &target).await
                 }
                 Err(e) => {
+                    tracing::info!("Tunnel failed → {}: {}", target, e);
                     let _ = send_reply(&mut socks5, 0x05).await;
                     Err(e)
                 }
@@ -49,16 +53,18 @@ pub async fn handle_socks5_connection(
         }
         TransportProtocol::Quic => {
             let server_name = server.address.split(':').next().unwrap_or("").to_string();
-            let transport = phantom_transport::quic::QuicTransport::new(
+            let transport = phantom_core::transport::quic::QuicTransport::new(
                 std::time::Duration::from_secs(10),
                 &server_name,
             );
             match establish_tunnel(&transport, server, &local_secret, &target, config.client.cipher).await {
                 Ok((frame_reader, frame_writer, stream_id)) => {
+                    tracing::info!("Tunnel established → {} (cipher={:?})", target, config.client.cipher);
                     send_reply(&mut socks5, 0x00).await?;
-                    relay_socks5_tunnel(socks5, frame_reader, frame_writer, stream_id).await
+                    relay_socks5_tunnel(socks5, frame_reader, frame_writer, stream_id, &target).await
                 }
                 Err(e) => {
+                    tracing::info!("Tunnel failed → {}: {}", target, e);
                     let _ = send_reply(&mut socks5, 0x05).await;
                     Err(e)
                 }
@@ -263,6 +269,7 @@ pub async fn relay_socks5_tunnel<R, W>(
     mut frame_reader: FrameReader<R>,
     mut frame_writer: FrameWriter<W>,
     stream_id: u32,
+    target: &TargetAddr,
 ) -> Result<()>
 where
     R: tokio::io::AsyncRead + Unpin,
@@ -270,14 +277,17 @@ where
 {
     let (mut s5_read, mut s5_write) = tokio::io::split(socks5);
 
+    let target_clone = target.clone();
     let to_tunnel = async {
         let mut buf = BytesMut::with_capacity(MAX_FRAME_PAYLOAD);
+        let mut total_up: u64 = 0;
         loop {
             buf.clear();
             let n = s5_read.read_buf(&mut buf).await.map_err(PhantomError::Io)?;
             if n == 0 {
                 break;
             }
+            total_up += n as u64;
             let data = buf.split().freeze();
             frame_writer
                 .write_frame(&Frame::data(stream_id, data))
@@ -285,13 +295,17 @@ where
         }
         let _ = frame_writer.write_frame(&Frame::fin(stream_id)).await;
         let _ = frame_writer.flush().await;
+        tracing::info!("Relay done ↑ {} ({} bytes up)", target_clone, total_up);
         Ok::<_, PhantomError>(())
     };
 
+    let target_clone = target.clone();
     let from_tunnel = async {
+        let mut total_down: u64 = 0;
         loop {
             let frame = frame_reader.read_frame().await?;
             if frame.flags.contains(FrameFlags::DATA) {
+                total_down += frame.payload.len() as u64;
                 s5_write
                     .write_all(&frame.payload)
                     .await
@@ -303,6 +317,7 @@ where
             }
         }
         let _ = s5_write.shutdown().await;
+        tracing::info!("Relay done ↓ {} ({} bytes down)", target_clone, total_down);
         Ok::<_, PhantomError>(())
     };
 

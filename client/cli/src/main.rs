@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use phantom_core::{ClientConfig, parse_phantom_uri};
-use phantom_crypto::KeyPair;
+use phantom_core::{parse_phantom_uri, ClientConfig, CipherPreference, TransportProtocol};
+use phantom_server::bootstrap::{run_auto, run_interactive, AutoOptions};
 
 #[derive(Parser)]
 #[command(name = "phantom", version, about = "Phantom proxy tool (幽灵)")]
@@ -12,24 +12,39 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Run as client (SOCKS5 proxy)
+    /// Run as client (SOCKS5 proxy). Use `--server <URI>` for the quick link
+    /// flow (no TOML required); use `-c <file>` to load full client.toml.
     Client {
-        #[arg(short, long, default_value = "client.toml")]
-        config: String,
+        /// Optional client.toml path. If omitted, the URI from `--server` is
+        /// used standalone (default settings).
+        #[arg(short, long)]
+        config: Option<String>,
         /// Server URI (phantom://<base64_key>@host:port?cipher=auto&proto=quic#name)
         #[arg(short, long)]
         server: Option<String>,
     },
-    /// Run as server
+    /// Run as server (auto / load / interactive)
     Server {
-        #[arg(short, long, default_value = "server.toml")]
-        config: String,
-    },
-    /// Generate X25519 key pair
-    Keygen {
-        /// Output directory for key files
-        #[arg(short, long, default_value = ".")]
-        output: String,
+        /// Load configuration from this TOML file (load mode).
+        /// Mutually exclusive with `-i` / `--interactive`.
+        #[arg(short, long)]
+        config: Option<String>,
+        /// Run an interactive setup wizard before starting (interactive mode).
+        /// Mutually exclusive with `-c`.
+        #[arg(short, long)]
+        interactive: bool,
+        /// Override the public host written into `./server.toml` (auto / interactive).
+        #[arg(long)]
+        public_host: Option<String>,
+        /// Override the starting port (auto / interactive). Default: 443.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Cipher override: auto / aes-256-gcm / aes-128-gcm / ascon-128 / chacha20-poly1305
+        #[arg(long)]
+        cipher: Option<String>,
+        /// Protocol override: tcp / quic
+        #[arg(long)]
+        proto: Option<String>,
     },
 }
 
@@ -39,7 +54,10 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Commands::Client { config, server } => {
-            let mut config = ClientConfig::load(&config)?;
+            let mut config = match config.as_deref() {
+                Some(path) => ClientConfig::load(path)?,
+                None => ClientConfig::default(),
+            };
             if let Some(uri) = server {
                 let entry = parse_phantom_uri(&uri)
                     .map_err(|e| anyhow::anyhow!("Failed to parse server URI: {}", e))?;
@@ -52,23 +70,62 @@ async fn main() -> Result<()> {
             let client = phantom_client::PhantomClient::new(config)?;
             client.run().await?;
         }
-        Commands::Server { config } => {
-            phantom_server::run(&config).await?;
-        }
-        Commands::Keygen { output } => {
-            let kp = KeyPair::generate()?;
-            let pub_path = format!("{}/phantom.pub", output);
-            let sec_path = format!("{}/server_private", output);
-            kp.save_secret_to_file(&sec_path)?;
-            kp.save_public_to_file(&pub_path)?;
+        Commands::Server {
+            config,
+            interactive,
+            public_host,
+            port,
+            cipher,
+            proto,
+        } => {
+            init_tracing("info");
 
-            println!("Generated X25519 key pair:");
-            println!("  Public key (add to client.toml [[servers]].public_key):");
-            println!("  {}", kp.public_key_base64());
-            println!("  Public key file: {}", pub_path);
-            println!("  Secret key file: {} (chmod 600)", sec_path);
-            println!();
-            println!("To allow this client, append the public key to the server's clients file.");
+            // Mutual exclusion: -c and -i cannot both be set.
+            if config.is_some() && interactive {
+                return Err(anyhow::anyhow!(
+                    "`-c <file>` and `-i` / `--interactive` are mutually exclusive"
+                ));
+            }
+
+            if let Some(path) = config {
+                // Load mode: original TOML behavior, unchanged.
+                phantom_server::run(&path).await?;
+            } else {
+                // Auto or interactive mode. Build AutoOptions.
+                let opts = AutoOptions {
+                    public_host,
+                    start_port: port,
+                    cipher: match cipher.as_deref() {
+                        None | Some("") => None,
+                        Some("auto") => Some(CipherPreference::Auto),
+                        Some("aes-256-gcm") => Some(CipherPreference::Aes256Gcm),
+                        Some("aes-128-gcm") => Some(CipherPreference::Aes128Gcm),
+                        Some("ascon-128") => Some(CipherPreference::Ascon128),
+                        Some("chacha20-poly1305") => Some(CipherPreference::ChaCha20Poly1305),
+                        Some(other) => {
+                            return Err(anyhow::anyhow!(
+                                "Unknown cipher: {other} (valid: auto, aes-256-gcm, aes-128-gcm, ascon-128, chacha20-poly1305)"
+                            ));
+                        }
+                    },
+                    protocol: match proto.as_deref() {
+                        None | Some("") => None,
+                        Some("tcp") => Some(TransportProtocol::Tcp),
+                        Some("quic") => Some(TransportProtocol::Quic),
+                        Some(other) => {
+                            return Err(anyhow::anyhow!(
+                                "Unknown protocol: {other} (valid: tcp, quic)"
+                            ));
+                        }
+                    },
+                    max_port_tries: None,
+                };
+                if interactive {
+                    run_interactive(opts).await?;
+                } else {
+                    run_auto(opts).await?;
+                }
+            }
         }
     }
 
@@ -76,7 +133,7 @@ async fn main() -> Result<()> {
 }
 
 fn init_tracing(level: &str) {
-    tracing_subscriber::fmt()
+    let _ = tracing_subscriber::fmt()
         .with_env_filter(level)
-        .init();
+        .try_init();
 }

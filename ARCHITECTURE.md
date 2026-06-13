@@ -2,11 +2,12 @@
 
 ## 1. 项目概述
 
-Phantom 是一个高性能加密代理隧道，基于 Rust 构建，采用 `crates/` + `server/` + `client/` 三级 workspace 结构。核心设计目标：
+Phantom 是一个高性能加密代理隧道，基于 Rust 构建，采用 `core/` + `server/` + `client/` 三级 workspace 结构。核心设计目标：
 - **数据面 100% Rust**：macOS/Android 原生客户端通过 FFI 一次性传递 TUN fd，之后零跨语言开销
 - **控制面-数据面契约**：配置声明的每一项必须在数据面有对应实现
 - **零拷贝传输**：基于 `BytesMut` 复用的帧协议，消除每帧堆分配
 - **QUIC 多路复用**：Noise IK 握手一次，后续 stream 通过 HKDF 派生子密钥
+- **智能分流**：DNS 劫持 + 规则引擎 + 热重载，配置即行为
 
 ---
 
@@ -14,31 +15,44 @@ Phantom 是一个高性能加密代理隧道，基于 Rust 构建，采用 `crat
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                                客户端 (Client)                                │
-│  ┌─────────────┐   SOCKS5   ┌──────────────────┐   TCP/QUIC   ┌──────────┐  │
-│  │  应用程序    │ ──────────▶│  Phantom Client  │ ────────────▶│  Server  │  │
-│  │ (浏览器等)   │            │  (SOCKS5 + TUN)  │  Noise+AEAD  │          │  │
-│  └─────────────┘            └──────────────────┘              └──────────┘  │
-│         │                            │                                      │
-│         │       TUN (透明代理)         │                                      │
-│         └────────────────────────────┘                                      │
-│                                                                               │
-│  平台层:                                                                      │
-│    macOS: utun7 + SwiftUI 菜单栏 (FFI: phantom_macos_start/stop)             │
-│    Android: VpnService fd + Jetpack Compose (JNI: phantom_android_start)     │
-│    CLI: phantom-cli (tokio main, SOCKS5 only)                                │
+│                                客户端 (Client)                              │
+│                                                                             │
+│  ┌─────────────┐   SOCKS5   ┌──────────────────┐   TCP/QUIC   ┌──────────┐ │
+│  │  应用程序    │ ──────────▶│  Phantom Client  │ ────────────▶│  Server  │ │
+│  │ (浏览器等)   │            │  (SOCKS5 + TUN)  │  Noise+AEAD  │          │ │
+│  └─────────────┘            └──────────────────┘              └──────────┘ │
+│         │                            │                                     │
+│         │       TUN (透明代理)         │                                     │
+│         └────────────────────────────┘                                     │
+│                                        │                                   │
+│  ┌─────────────────────────────────────┴──────────────────────────────┐    │
+│  │  TUN 数据面                                                        │    │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌───────────────────┐  │    │
+│  │  │ HotReload│  │RuleEngine│  │ DnsProxy │  │  SystemProxy      │  │    │
+│  │  │ (Arc<Mux>)│  │ (rules)  │  │ (UDP:53) │  │  (networksetup)  │  │    │
+│  │  └──────────┘  └──────────┘  └──────────┘  └───────────────────┘  │    │
+│  │  ┌──────────┐  ┌──────────┐  ┌──────────────────────────────┐    │    │
+│  │  │TrafficSt │  │UdpProxy  │  │  Metrics HTTP :9150         │    │    │
+│  │  │  ats     │  │ FlowTable│  │  (Prometheus /metrics)      │    │    │
+│  │  └──────────┘  └──────────┘  └──────────────────────────────┘    │    │
+│  └────────────────────────────────────────────────────────────────────┘    │
+│                                                                             │
+│  平台层:                                                                    │
+│    macOS: utun7 + SwiftUI 菜单栏 (FFI: phantom_macos_start/stop)           │
+│    Android: VpnService fd + Jetpack Compose (JNI: phantom_android_start)   │
+│    CLI: phantom-cli (tokio main, SOCKS5 only)                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 
                                     ↓ TCP/QUIC
 
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                                服务端 (Server)                                │
-│  ┌──────────────────┐     TCP relay / UDP relay (future)    ┌──────────┐   │
-│  │  Phantom Server  │ ─────────────────────────────────────▶ │ 目标站点  │   │
-│  │  (Noise responder)│                                        │          │   │
-│  └──────────────────┘                                        └──────────┘   │
-│         │                                                                     │
-│    Linux io_uring (optional)                                                 │
+│                                服务端 (Server)                              │
+│  ┌──────────────────┐     TCP relay / UDP relay      ┌──────────┐         │
+│  │  Phantom Server  │ ──────────────────────────────▶│ 目标站点  │         │
+│  │  (Noise responder)│                               │          │         │
+│  └──────────────────┘                               └──────────┘         │
+│         │                                                                   │
+│    Linux io_uring (optional)                                               │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -48,15 +62,12 @@ Phantom 是一个高性能加密代理隧道，基于 Rust 构建，采用 `crat
 
 | Crate | 路径 | 职责 | 依赖 |
 |-------|------|------|------|
-| `phantom-core` | `crates/phantom-core` | 共享类型、配置(TOML)、错误、常量、BufferPool | `serde`, `toml`, `crossbeam-queue` |
-| `phantom-crypto` | `crates/phantom-crypto` | 密码套件、AEAD 状态、Noise IK 握手、密钥管理、会话派生 | `snow`, `x25519-dalek`, `aes-gcm`, `chacha20poly1305`, `ascon-aead` |
-| `phantom-protocol` | `crates/phantom-protocol` | 线路帧格式、地址编码、编解码器(`FrameReader`/`FrameWriter`) | `bytes`, `phantom-core` |
-| `phantom-transport` | `crates/phantom-transport` | TCP/QUIC 传输抽象、`Transport` trait | `tokio`, `quinn` |
-| `phantom-client` | `client/` | SOCKS5 代理、TUN 透明代理、故障转移、规则引擎、DNS 劫持 | `phantom-*`, `tun`, `etherparse`, `ipnet`, `regex` |
-| `phantom-cli` | `client/cli` | 命令行入口 (`phantom client` / `phantom server` / `phantom keygen`) | `phantom-client`, `phantom-server` |
-| `phantom-server` | `server/` | 服务端连接处理、双向中继、io_uring (Linux) | `phantom-*`, `quinn`, `tokio-uring`(opt) |
-| `phantom-e2e` | `phantom-e2e/` | 端到端集成测试、echo server、fixture | `phantom-client`, `phantom-server` |
-| `phantom-bench` | `phantom-bench/` | Criterion 性能基准测试 | `phantom-*`, `criterion` |
+| `phantom-core` | `core/` | 共享类型、配置、密码套件、帧协议、传输抽象、URI 解析、错误、常量、BufferPool | `serde`, `toml`, `snow`, `quinn` |
+| `phantom-client` | `client/` | SOCKS5 代理、TUN 透明代理、规则引擎、DNS 劫持、UDP relay、流量统计、热重载 | `phantom-*`, `tun`, `etherparse`, `ipnet`, `regex` |
+| `phantom-cli` | `client/cli` | CLI 入口 (`phantom client` / `server`)，`server` 支持 auto（自举）/ interactive（向导）/ load（`-c` TOML）三种模式，支持 `--server` URI | `phantom-client`, `phantom-server`, `phantom-core` |
+| `phantom-server` | `server/` | 服务端连接处理、TCP relay、UDP relay、io_uring、`bootstrap` 模块（自举 / 交互 / URI 反向解析） | `phantom-*`, `quinn`, `tokio-uring`(opt) |
+| `phantom-e2e` | `tests/` | E2E 测试、HTTP/TCP/UDP echo、Mock 百度、网络模拟 | `phantom-*`, `axum` |
+| `phantom-bench` | `tests/bench/` | 性能基准测试 | `phantom-*`, `divan` |
 
 ---
 
@@ -69,7 +80,7 @@ Phantom 是一个高性能加密代理隧道，基于 Rust 构建，采用 `crat
                               │
                               ▼
                     ┌──────────────────┐
-                    │ NoiseInitiator   │ ──► TCP connect to server
+                    │ NoiseInitiator   │ ──► TCP/QUIC connect
                     │ IK handshake     │ ◄── Cipher negotiation
                     │ split_after_     │
                     │ handshake()      │
@@ -100,15 +111,32 @@ Phantom 是一个高性能加密代理隧道，基于 Rust 构建，采用 `crat
   TCP SYN    UDP:53      其他 UDP
     │           │           │
     ▼           ▼           ▼
- RuleEngine  DnsProxy    RuleEngine
- (Direct/    (upstream   (Direct →
-  Proxy/     DNS)         local UDP socket
-  Reject)              Proxy → drop)
-    │
-    ▼
-Direct ──► tcp_direct_relay_task (直连目标)
-Proxy  ──► tcp_relay_task ──► SOCKS5 ──► Noise tunnel ──► Server
-Reject ──► send_tcp_rst()
+ HotReload   DnsProxy    HotReload
+ (proxy_mode) (upstream   (proxy_mode)
+    │         DNS)         │
+    ▼         │            ▼
+ RuleEngine  │         RuleEngine
+ (Smart)     │         (Smart → Direct/Proxy/Reject)
+    │         │            │
+    ▼         ▼            ▼
+Direct → direct TCP    Direct → local UdpSocket
+Proxy  → SOCKS5 → Noise tunnel → Server
+Reject → RST packet   Proxy  → Noise tunnel (UDP SYN frame) → Server
+```
+
+### 4.3 UDP Relay 帧协议
+
+```
+客户端                                     服务端
+  │                                          │
+  │──── SYN|UDP|DATA ─────────────────────▶  │  payload = [TargetAddr][datagram]
+  │◀─── ACK ──────────────────────────────  │
+  │                                          │  UdpSocket::send_to(datagram, target)
+  │                                          │◀─ recv_from() ── 目标
+  │◀─── UDP|DATA ──────────────────────────  │  payload = response datagram
+  │──── UDP|DATA ────────────────────────▶  │  send_to(datagram, target)
+  │──── UDP|DATA ────────────────────────▶  │  ...
+  │──── FIN ──────────────────────────────▶  │  关闭 UdpSocket
 ```
 
 ---
@@ -119,17 +147,21 @@ Reject ──► send_tcp_rst()
 
 | 配置字段 | 控制面 | 数据面实现 | 状态 |
 |----------|--------|-----------|------|
-| `client.mode = "smart"` | `ProxyMode` 枚举 | `tun.rs` SYN 时查 `RuleEngine` | **已实现** |
-| `client.dns` | `String` | `dns.rs` `DnsProxy` 拦截 UDP:53 | **已实现** |
-| `rules.*` | `RulesConfig` | `rules.rs` `RuleEngine` | **已实现** |
-| `failover.health_check_interval` | `u64` | `failover.rs` `run_health_check_loop()` | **已实现** |
-| `failover.graceful_migration` | `bool` | 切服时直接断开，**未实现迁移** | 部分实现 |
-| `performance.workers` | `u32` | `server/src/bin.rs` 自定义 `tokio::runtime` | **已实现** |
-| `performance.io_uring` | `bool` | `linux_ext.rs` `tokio_uring` 真实现 | **已实现** |
-| `performance.zero_copy` | `bool` | `linux_ext.rs` 占位，注册 buffer pool 未接入 relay | 占位 |
-| `tls.disguise` | `bool` | 服务端仍使用自签名证书，无 TLS 伪装 | 占位 |
-| `quic.enable` | `bool` | `server/src/lib.rs` QUIC endpoint | **已实现** |
-| `quic.congestion` | `CongestionAlgorithm` | `quinn` 传输配置 | **已实现** |
+| `client.mode` | `ProxyMode` 枚举 (proxy/direct/smart/auto) | `tun.rs` HotReloadState.proxy_mode | **已实现** |
+| `client.dns` | `String` | `dns.rs` DnsProxy 拦截 UDP:53 | **已实现** |
+| `client.cipher` | `CipherPreference` | Noise 握手 CipherOffer | **已实现** |
+| `servers[].cipher` | `CipherPreference` | 服务器级密码覆盖 | **已实现** |
+| `servers[].protocol` | `TransportProtocol` | socks5.rs 选择 TCP/QUIC 传输 | **已实现** |
+| `rules.*` | `RulesConfig` | `rules.rs` RuleEngine (7种规则+GeoIP) | **已实现** |
+| `rules.geoip` | `HashMap<String, RuleAction>` | maxminddb 查询 + 国家码匹配 | **已实现** |
+| `failover.health_check_interval` | `u64` | `failover.rs` run_health_check_loop() | **已实现** |
+| `failover.failover_threshold` | `u32` | 连续失败 N 次后切换服务器 | **已实现** |
+| `failover.graceful_migration` | `bool` | 切服时不断已有连接 | 部分实现 |
+| `performance.workers` | `u32` | server/bin.rs 自定义 tokio runtime | **已实现** |
+| `performance.io_uring` | `bool` | linux_ext.rs tokio_uring | **已实现** |
+| `performance.zero_copy` | `bool` | 占位 | 占位 |
+| `tls.disguise` | `bool` | 配置 stub，未实现 TLS 伪装 | 占位 |
+| `quic.congestion` | `CongestionAlgorithm` | quinn 传输配置 | **已实现** |
 
 ---
 
@@ -147,9 +179,27 @@ Reject ──► send_tcp_rst()
 
 - Pattern: `Noise_IK_25519_ChaCha20Poly1305_SHA256`
 - 密码套件协商嵌入握手载荷，**零额外 RTT**
-- 服务端提取客户端静态公钥进行白名单校验
+- 服务端提取客户端静态公钥进行白名单校验（空白名单=开放）
 
-### 6.2 密钥派生管线
+### 6.2 帧协议
+
+```
+Wire format: [ver:1][stream_id:4 BE][flags:1][payload_len:2 BE][payload]
+
+Flags:
+  SYN  = 0x01  SYN + DATA = TCP/UDP 连接打开
+  FIN  = 0x02  优雅关闭
+  RST  = 0x04  中断
+  ACK  = 0x08  确认
+  DATA = 0x10  数据帧
+  PING = 0x20  保活探测
+  PONG = 0x40  保活响应
+  UDP  = 0x80  UDP 模式（与 SYN/DATA 组合）
+
+UDP SYN payload: [TargetAddr encoded][datagram bytes]
+```
+
+### 6.3 密钥派生管线
 
 ```
 Noise IK 握手完成
@@ -168,10 +218,7 @@ dangerously_get_raw_split() → (k1, k2)
 SessionWriter (加密)      SessionReader (解密)
 ```
 
-- 每个方向独立 `AeadState`，无 `Arc<Mutex>` 共享
-- Nonce 构造：`[4字节前缀][0填充][8字节计数器]`
-
-### 6.3 QUIC Stream 子密钥派生（P2）
+### 6.4 QUIC Stream 子密钥派生
 
 ```
 Connection Noise 握手完成 → conn_keys (k1, k2)
@@ -187,55 +234,96 @@ info: "phantom-v3-stream-{stream_id}-{cipher}"
 per-stream SessionReader / SessionWriter
 ```
 
-- 第一个 bi-stream：完整 Noise IK 握手
-- 后续 bi-stream：隐式 stream counter（1, 2, 3…），双方按 `accept_bi()` / `open_bi()` 顺序计数
-
 ---
 
 ## 7. 平台抽象层
 
-| 平台 | TUN 创建 | TUN 读写 | FFI 入口 | 打包方式 |
+| 平台 | TUN 创建 | FFI 入口 | 系统代理 | 打包方式 |
 |------|---------|---------|---------|---------|
-| macOS | `tun::create_as_async("utun7")` | `AsyncRead`/`AsyncWrite` | `phantom_macos_start(config_toml, len)` | `cdylib` + SwiftUI |
-| Android | `VpnService.Builder.establish()` → `detachFd()` → `AsyncFd` | `libc::read/write` + `AsyncFd` | `phantom_android_start(fd, config_json, len)` | `cdylib` + Kotlin VpnService |
-| Linux CLI | N/A (SOCKS5 only) | N/A | `phantom-cli` main | 统一二进制 |
+| macOS | `tun::create_as_async("utun7")` | `phantom_macos_start/stop` | networksetup SOCKS5 自动设置/恢复 | cdylib + SwiftUI |
+| Android | VpnService fd → AsyncFd | `phantom_android_start/stop` | VpnService 路由规则 | cdylib + Kotlin |
+| CLI | N/A (SOCKS5 only) | `phantom-cli` main | 无 | 统一二进制 |
+
+### 7.1 macOS 系统代理
+
+启动隧道后自动执行：
+```bash
+networksetup -setsocksfirewallproxy "Wi-Fi" 127.0.0.1 11080
+networksetup -setsocksfirewallproxystate "Wi-Fi" on
+```
+
+停止时恢复之前的代理设置（保存/恢复机制）。
+
+### 7.2 macOS 代理模式切换
+
+菜单栏分段选择器：
+- **Global** → `client.mode = "proxy"`（所有流量走隧道）
+- **Auto** → `client.mode = "smart"`（规则引擎分流）
+- **Direct** → `client.mode = "direct"`（全局直连）
+
+### 7.3 phantom:// URI 格式
+
+```
+phantom://<base64_public_key>@<host>:<port>[?<query>][#<name>]
+```
+
+Query 参数：`cipher=`, `proto=`, `congestion=`
+
+CLI 支持 `--server` URI 与 `--config` TOML 组合使用。
 
 ---
 
-## 8. 路由规则引擎（Smart 模式）
+## 8. 热重载机制
 
-### 8.1 规则类型与匹配优先级
+TunProxy 持有 `Arc<Mutex<HotReloadState>>` 共享状态：
 
-| 优先级 | 类型 | 数据结构 | 查询复杂度 |
-|--------|------|---------|-----------|
-| 1 | Domain full | `HashMap<String, Action>` | O(1) |
-| 2 | Domain suffix | `DomainSuffixTrie` | O(域名深度) |
-| 3 | Domain keyword | `Vec<(String, Action)>` | O(N) |
-| 4 | Domain regex | `Vec<(Regex, Action)>` | O(N) |
-| 5 | IP-CIDR | 分层 `Vec<(Net, Action)>` 按 prefix len 降序 | O(层数) |
-| 6 | Port | `HashMap<u16, Action>` | O(1) |
-| 7 | GEOIP | `maxminddb::Reader` (optional feature) | O(1) |
-| 8 | Final | 常量 | O(1) |
+```rust
+struct HotReloadState {
+    proxy_mode: ProxyMode,
+    rule_engine: Option<Arc<RuleEngine>>,
+}
+```
 
-### 8.2 DNS 缓存与域名关联
-
-TUN 模式只有 IP 地址，没有域名。Smart 模式通过以下方式关联域名：
-1. DNS 劫持模块拦截 UDP:53 查询，提取域名
-2. DNS 响应解析 A 记录，建立 `IP → domain` 缓存
-3. TCP SYN 时查缓存获取域名，再查规则引擎
+后台任务每 5 秒轮询配置文件 mtime，变更时重新加载 `proxy_mode` 和 `rule_engine`。
+`handle_tcp` / `handle_udp` 每次查询时克隆 `Arc` 快照，不持有锁跨 await。
 
 ---
 
-## 9. 已知限制与 TODO
+## 9. 流量统计
+
+`TrafficStats` 使用 `AtomicU64` 计数器，零锁开销：
+
+| 计数器 | 说明 |
+|--------|------|
+| `tcp_bytes_up/down` | TCP 上下行字节数 |
+| `udp_bytes_up/down` | UDP 上下行字节数 |
+| `tcp_connections` | TCP 连接总数 |
+| `udp_datagrams_up/down` | UDP 数据报总数 |
+
+暴露为 `127.0.0.1:9150/metrics` Prometheus 端点。
+
+---
+
+## 10. 已知限制与 TODO
 
 | 模块 | 限制 | 优先级 |
 |------|------|--------|
-| TUN UDP | Proxy 模式 UDP 丢弃，未走 Phantom 隧道 | P0 |
-| SOCKS5 UDP | UDP ASSOCIATE 未实现（服务端也不支持 UDP relay） | P0 |
-| IPv6 | TUN 层多处硬编码 IPv4，IPv6 包被丢弃 | P1 |
-| GEOIP | `maxminddb` 已集成但规则未预索引，实际未生效 | P2 |
-| TLS 伪装 | `tls.disguise` 配置 stub，未实现 HTTPS 握手伪装 | P2 |
-| 配置热重载 | 启动后配置不可变 | P3 |
-| 流量统计 | 仅 `tracing::debug!`，无结构化 metrics | P3 |
+| SOCKS5 UDP | UDP ASSOCIATE 未实现（TUN UDP proxy 已覆盖主场景） | Deferred |
+| TLS 伪装 | `tls.disguise` 配置 stub，未实现 HTTPS 握手伪装 | Deferred |
+| 配置热重载 | 仅 rules + mode，DNS/服务器列表不支持热更新 | P2 |
 | 多用户/限速 | 无 | P3 |
 | ACME | 无自动证书申请 | P3 |
+
+---
+
+## 11. 测试覆盖
+
+| 层级 | 测试数 | 覆盖范围 |
+|------|--------|---------|
+| L0 单元测试 | ~80 | 帧协议边界、URI 构建/解析、规则引擎查询、DNS 解析、stats、decode_udp_syn、bootstrap (密钥/白名单/端口探测) |
+| L1 配置生效 | 9 | 白名单开放/限制、密码协商矩阵 |
+| L1 模块交互 | 15 | DNS→规则、规则→路由、stats→Prometheus |
+| L1 全链路 | 7 | TCP echo/大数据/并发、UDP relay、HTTP 隧道 |
+| L1 真实场景 | 4 | Mock 百度、真百度（ignored） |
+| L1 性能 | 17 | 吞吐量、延迟、并发（10 ignored） |
+| L2 系统 | 5 | CLI 自举（auto 生成 key/URI）、端口递增 fallback、keygen 子命令已删除、version、复用已有 key |
