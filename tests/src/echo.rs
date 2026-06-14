@@ -64,16 +64,27 @@ pub async fn start_echo_server_on(bind: &str, mode: EchoMode) -> EchoServer {
             }
         }
     });
-    EchoServer { addr, mode, shutdown: Some(tx) }
+    EchoServer {
+        addr,
+        mode,
+        shutdown: Some(tx),
+    }
 }
 
-async fn handle_echo_client(mut stream: tokio::net::TcpStream, mode: EchoMode) -> std::io::Result<()> {
+async fn handle_echo_client(
+    mut stream: tokio::net::TcpStream,
+    mode: EchoMode,
+) -> std::io::Result<()> {
     let mut buf = vec![0u8; 8192];
     loop {
         let n = stream.read(&mut buf).await?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         match mode {
-            EchoMode::Echo => { stream.write_all(&buf[..n]).await?; }
+            EchoMode::Echo => {
+                stream.write_all(&buf[..n]).await?;
+            }
             EchoMode::Sink => {}
         }
     }
@@ -85,9 +96,9 @@ async fn handle_echo_client(mut stream: tokio::net::TcpStream, mode: EchoMode) -
 // ---------------------------------------------------------------------------
 
 use axum::{
+    Router,
     extract::Path,
     routing::{get, post},
-    Router,
 };
 
 pub struct HttpEchoServer {

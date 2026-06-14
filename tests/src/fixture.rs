@@ -1,11 +1,11 @@
-use std::net::SocketAddr;
+use crate::echo::{EchoMode, EchoServer, start_echo_server};
 use phantom_core::CipherPreference;
 use phantom_core::crypto::KeyPair;
-use phantom_server::handler::handle_connection;
-use phantom_core::transport::tcp::TcpListener;
 use phantom_core::transport::TransportListener;
+use phantom_core::transport::tcp::TcpListener;
+use phantom_server::handler::handle_connection;
+use std::net::SocketAddr;
 use tokio::sync::oneshot;
-use crate::echo::{EchoMode, EchoServer, start_echo_server};
 
 pub struct TestFixture {
     pub target_addr: SocketAddr,
@@ -23,7 +23,11 @@ impl TestFixture {
         TestFixtureBuilder::new().cipher(cipher).build().await
     }
     pub async fn new_with_mode(cipher: CipherPreference, mode: EchoMode) -> Self {
-        TestFixtureBuilder::new().cipher(cipher).echo_mode(mode).build().await
+        TestFixtureBuilder::new()
+            .cipher(cipher)
+            .echo_mode(mode)
+            .build()
+            .await
     }
 }
 
@@ -44,20 +48,40 @@ pub struct TestFixtureBuilder {
 
 impl TestFixtureBuilder {
     pub fn new() -> Self {
-        Self { cipher: CipherPreference::Auto, echo_mode: EchoMode::Echo, allowed_clients: Vec::new(), client_key: None }
+        Self {
+            cipher: CipherPreference::Auto,
+            echo_mode: EchoMode::Echo,
+            allowed_clients: Vec::new(),
+            client_key: None,
+        }
     }
-    pub fn cipher(mut self, cipher: CipherPreference) -> Self { self.cipher = cipher; self }
-    pub fn echo_mode(mut self, mode: EchoMode) -> Self { self.echo_mode = mode; self }
-    pub fn allowed_client(mut self, key: [u8; 32]) -> Self { self.allowed_clients.push(key); self }
-    pub fn client_key(mut self, key: KeyPair) -> Self { self.client_key = Some(key); self }
+    pub fn cipher(mut self, cipher: CipherPreference) -> Self {
+        self.cipher = cipher;
+        self
+    }
+    pub fn echo_mode(mut self, mode: EchoMode) -> Self {
+        self.echo_mode = mode;
+        self
+    }
+    pub fn allowed_client(mut self, key: [u8; 32]) -> Self {
+        self.allowed_clients.push(key);
+        self
+    }
+    pub fn client_key(mut self, key: KeyPair) -> Self {
+        self.client_key = Some(key);
+        self
+    }
 
     pub async fn build(self) -> TestFixture {
         let server_key = KeyPair::generate().expect("Failed to generate server key");
-        let client_key = self.client_key.unwrap_or_else(|| KeyPair::generate().expect("Failed to generate client key"));
+        let client_key = self
+            .client_key
+            .unwrap_or_else(|| KeyPair::generate().expect("Failed to generate client key"));
         let echo_server = start_echo_server(self.echo_mode).await;
         let target_addr = echo_server.addr;
         let server_listener = TcpListener::bind(&"127.0.0.1:0".parse().unwrap())
-            .await.expect("Failed to bind phantom server");
+            .await
+            .expect("Failed to bind phantom server");
         let server_addr = server_listener.local_addr().unwrap();
         let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel::<()>();
         let server_secret = server_key.secret;
@@ -74,7 +98,7 @@ impl TestFixtureBuilder {
                                 let allowed_clone = allowed.clone();
                                 let cp = cipher_pref;
                                 tokio::spawn(async move {
-                                    handle_connection(stream, sk, &allowed_clone, cp).await;
+                                    handle_connection(stream, sk, &allowed_clone, cp, None).await;
                                 });
                             }
                             Err(e) => { tracing::error!("Server accept error: {}", e); }
@@ -85,7 +109,10 @@ impl TestFixtureBuilder {
             }
         });
         TestFixture {
-            target_addr, server_addr, client_key, server_key,
+            target_addr,
+            server_addr,
+            client_key,
+            server_key,
             cipher_preference: self.cipher,
             allowed_clients: self.allowed_clients,
             echo_server,

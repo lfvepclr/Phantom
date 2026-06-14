@@ -1,14 +1,14 @@
 use bytes::Bytes;
 use phantom_core::CipherPreference;
-use phantom_e2e::udp_echo::UdpEchoServer;
-use phantom_core::protocol::TargetAddr;
-use phantom_core::protocol::Frame;
-use phantom_core::protocol::frame::FrameFlags;
 use phantom_core::crypto::KeyPair;
-use phantom_server::handler::handle_connection;
-use phantom_core::transport::tcp::TcpListener;
-use phantom_core::transport::TransportListener;
+use phantom_core::protocol::Frame;
+use phantom_core::protocol::TargetAddr;
+use phantom_core::protocol::frame::FrameFlags;
 use phantom_core::transport::Transport;
+use phantom_core::transport::TransportListener;
+use phantom_core::transport::tcp::TcpListener;
+use phantom_e2e::udp_echo::UdpEchoServer;
+use phantom_server::handler::handle_connection;
 
 struct UdpTestFixture {
     pub udp_echo_addr: std::net::SocketAddr,
@@ -45,7 +45,7 @@ impl UdpTestFixture {
                                 let sk = server_secret;
                                 let cp = cipher;
                                 tokio::spawn(async move {
-                                    handle_connection(stream, sk, &[], cp).await;
+                                    handle_connection(stream, sk, &[], cp, None).await;
                                 });
                             }
                             Err(e) => { tracing::error!("Server accept error: {}", e); }
@@ -79,12 +79,13 @@ async fn handshake_only(
     phantom_core::protocol::FrameReader<tokio::io::ReadHalf<tokio::net::TcpStream>>,
     phantom_core::protocol::FrameWriter<tokio::io::WriteHalf<tokio::net::TcpStream>>,
 )> {
-    use phantom_core::crypto::{NoiseInitiator, split_after_handshake};
-    use phantom_core::crypto::session::CipherOffer;
     use phantom_core::crypto::cipher::CipherSuite;
+    use phantom_core::crypto::session::CipherOffer;
+    use phantom_core::crypto::{NoiseInitiator, split_after_handshake};
     use phantom_core::protocol::codec::{FrameReader, FrameWriter};
 
-    let transport = phantom_core::transport::tcp::TcpTransport::new(std::time::Duration::from_secs(10));
+    let transport =
+        phantom_core::transport::tcp::TcpTransport::new(std::time::Duration::from_secs(10));
     let stream = transport.connect(&server_addr).await?;
     let offer = match cipher_preference {
         CipherPreference::Auto => CipherOffer::default_offer(),
@@ -96,9 +97,15 @@ async fn handshake_only(
     let initiator = NoiseInitiator::new(client_secret, server_public_key);
     let result = initiator.handshake(stream, &offer).await?;
     let (session_reader, session_writer) = split_after_handshake(
-        result.stream, result.split_keys, result.chosen_cipher, result.is_initiator,
+        result.stream,
+        result.split_keys,
+        result.chosen_cipher,
+        result.is_initiator,
     );
-    Ok((FrameReader::new(session_reader), FrameWriter::new(session_writer)))
+    Ok((
+        FrameReader::new(session_reader),
+        FrameWriter::new(session_writer),
+    ))
 }
 
 /// Use handshake to establish a session, then send a UDP SYN frame to the

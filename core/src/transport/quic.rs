@@ -1,6 +1,6 @@
-use async_trait::async_trait;
 use crate::CongestionAlgorithm;
 use crate::{PhantomError, Result};
+use async_trait::async_trait;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -38,15 +38,22 @@ impl Transport for QuicTransport {
     async fn connect(&self, addr: &SocketAddr) -> Result<Self::Stream> {
         let endpoint = create_client_endpoint(self.congestion)?;
 
-        let connecting = endpoint.connect(*addr, &self.server_name)
+        let connecting = endpoint
+            .connect(*addr, &self.server_name)
             .map_err(|e| PhantomError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
         let conn = tokio::time::timeout(self.connect_timeout, connecting)
             .await
             .map_err(|_| PhantomError::Timeout)?
-            .map_err(|e| PhantomError::Io(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e)))?;
+            .map_err(|e| {
+                PhantomError::Io(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    e,
+                ))
+            })?;
 
-        let (send, recv) = conn.open_bi()
+        let (send, recv) = conn
+            .open_bi()
             .await
             .map_err(|e| PhantomError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
 
@@ -87,9 +94,7 @@ pub async fn try_bind_quic_with_fallback(
         let addr = SocketAddr::new(ip, port);
         match QuicListener::bind(&addr, congestion).await {
             Ok(listener) => return Ok((listener, addr)),
-            Err(PhantomError::Io(io_err))
-                if io_err.kind() == std::io::ErrorKind::AddrInUse =>
-            {
+            Err(PhantomError::Io(io_err)) if io_err.kind() == std::io::ErrorKind::AddrInUse => {
                 last_err = Some(io_err);
             }
             Err(e) => return Err(e),
@@ -110,12 +115,20 @@ impl TransportListener for QuicListener {
     type Stream = QuicStream;
 
     async fn accept(&self) -> Result<(Self::Stream, SocketAddr)> {
-        let incoming = self.endpoint.accept().await
-            .ok_or(PhantomError::Io(std::io::Error::new(std::io::ErrorKind::Other, "No incoming connection")))?;
-        let conn = incoming.await
+        let incoming =
+            self.endpoint
+                .accept()
+                .await
+                .ok_or(PhantomError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    "No incoming connection",
+                )))?;
+        let conn = incoming
+            .await
             .map_err(|e| PhantomError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         let remote = conn.remote_address();
-        let (send, recv) = conn.accept_bi()
+        let (send, recv) = conn
+            .accept_bi()
             .await
             .map_err(|e| PhantomError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         Ok((QuicStream::new(send, recv), remote))
@@ -198,18 +211,12 @@ impl AsyncWrite for QuicStream {
         AsyncWrite::poll_write(Pin::new(send_stream), cx, buf)
     }
 
-    fn poll_flush(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         // quinn's poll_flush is a no-op
         Poll::Ready(Ok(()))
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-    ) -> Poll<std::io::Result<()>> {
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         let send = self.send.clone();
         let mut guard = match send.try_lock() {
             Ok(g) => g,
@@ -231,14 +238,12 @@ pub fn build_transport_config(congestion: CongestionAlgorithm) -> Arc<quinn::Tra
     let mut transport = quinn::TransportConfig::default();
     match congestion {
         CongestionAlgorithm::Bbr => {
-            transport.congestion_controller_factory(Arc::new(
-                quinn::congestion::BbrConfig::default(),
-            ));
+            transport
+                .congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
         }
         CongestionAlgorithm::Cubic => {
-            transport.congestion_controller_factory(Arc::new(
-                quinn::congestion::CubicConfig::default(),
-            ));
+            transport
+                .congestion_controller_factory(Arc::new(quinn::congestion::CubicConfig::default()));
         }
         CongestionAlgorithm::NewReno => {
             transport.congestion_controller_factory(Arc::new(
@@ -280,13 +285,19 @@ pub fn create_server_config(congestion: CongestionAlgorithm) -> Result<quinn::Se
     Ok(server_config)
 }
 
-fn generate_self_signed_cert() -> (quinn::rustls::pki_types::CertificateDer<'static>, quinn::rustls::pki_types::PrivateKeyDer<'static>) {
+fn generate_self_signed_cert() -> (
+    quinn::rustls::pki_types::CertificateDer<'static>,
+    quinn::rustls::pki_types::PrivateKeyDer<'static>,
+) {
     let params = rcgen::CertificateParams::default();
     let key_pair = rcgen::KeyPair::generate().unwrap();
     let cert = params.self_signed(&key_pair).unwrap();
     let cert_der = quinn::rustls::pki_types::CertificateDer::from(cert);
     let key_der = quinn::rustls::pki_types::PrivatePkcs8KeyDer::from(key_pair.serialize_der());
-    (cert_der, quinn::rustls::pki_types::PrivateKeyDer::from(key_der))
+    (
+        cert_der,
+        quinn::rustls::pki_types::PrivateKeyDer::from(key_der),
+    )
 }
 
 #[derive(Debug)]
@@ -300,7 +311,8 @@ impl quinn::rustls::client::danger::ServerCertVerifier for NoVerifier {
         _server_name: &quinn::rustls::pki_types::ServerName<'_>,
         _ocsp_response: &[u8],
         _now: quinn::rustls::pki_types::UnixTime,
-    ) -> std::result::Result<quinn::rustls::client::danger::ServerCertVerified, quinn::rustls::Error> {
+    ) -> std::result::Result<quinn::rustls::client::danger::ServerCertVerified, quinn::rustls::Error>
+    {
         Ok(quinn::rustls::client::danger::ServerCertVerified::assertion())
     }
 
@@ -309,7 +321,10 @@ impl quinn::rustls::client::danger::ServerCertVerifier for NoVerifier {
         _message: &[u8],
         _cert: &quinn::rustls::pki_types::CertificateDer<'_>,
         _dss: &quinn::rustls::DigitallySignedStruct,
-    ) -> std::result::Result<quinn::rustls::client::danger::HandshakeSignatureValid, quinn::rustls::Error> {
+    ) -> std::result::Result<
+        quinn::rustls::client::danger::HandshakeSignatureValid,
+        quinn::rustls::Error,
+    > {
         Ok(quinn::rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 
@@ -318,7 +333,10 @@ impl quinn::rustls::client::danger::ServerCertVerifier for NoVerifier {
         _message: &[u8],
         _cert: &quinn::rustls::pki_types::CertificateDer<'_>,
         _dss: &quinn::rustls::DigitallySignedStruct,
-    ) -> std::result::Result<quinn::rustls::client::danger::HandshakeSignatureValid, quinn::rustls::Error> {
+    ) -> std::result::Result<
+        quinn::rustls::client::danger::HandshakeSignatureValid,
+        quinn::rustls::Error,
+    > {
         Ok(quinn::rustls::client::danger::HandshakeSignatureValid::assertion())
     }
 

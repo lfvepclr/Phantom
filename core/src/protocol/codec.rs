@@ -1,6 +1,6 @@
-use bytes::Bytes;
 use crate::Result;
 use crate::crypto::{SessionReader, SessionWriter};
+use bytes::Bytes;
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::protocol::frame::Frame;

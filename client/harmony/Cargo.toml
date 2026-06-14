@@ -1,0 +1,22 @@
+[package]
+name = "phantom-harmony"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "phantom_harmony"
+path = "rust/src/lib.rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+phantom-client = { workspace = true }
+phantom-core = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+napi-ohos = "1"
+napi-derive-ohos = "1"
+
+[build-dependencies]
+napi-build-ohos = "1"

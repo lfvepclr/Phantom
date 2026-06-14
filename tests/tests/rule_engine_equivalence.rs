@@ -84,8 +84,7 @@ impl RefEngine {
         for rule in &cfg.rules {
             match &rule.pattern {
                 RulePattern::DomainFull { value } => {
-                    out.domain_full
-                        .insert(value.to_lowercase(), rule.action);
+                    out.domain_full.insert(value.to_lowercase(), rule.action);
                 }
                 RulePattern::DomainSuffix { value } => {
                     out.domain_suffix
@@ -94,8 +93,7 @@ impl RefEngine {
                         .insert(value, rule.action);
                 }
                 RulePattern::DomainKeyword { value } => {
-                    out.domain_keyword
-                        .push((value.to_lowercase(), rule.action));
+                    out.domain_keyword.push((value.to_lowercase(), rule.action));
                 }
                 RulePattern::DomainRegex { value } => {
                     if let Ok(re) = Regex::new(value) {
@@ -168,19 +166,70 @@ impl RefEngine {
 
 const DOMAIN_TLDS: &[&str] = &["com", "net", "org", "io", "cn", "app", "dev"];
 const DOMAIN_NAMES: &[&str] = &[
-    "google", "baidu", "facebook", "twitter", "github", "apple", "amazon", "microsoft",
-    "youtube", "tiktok", "wechat", "taobao", "jd", "bilibili", "zhihu", "douyin", "tencent",
-    "alibaba", "bytedance", "meituan", "didi", "ctrip", "example", "wikipedia", "reddit",
+    "google",
+    "baidu",
+    "facebook",
+    "twitter",
+    "github",
+    "apple",
+    "amazon",
+    "microsoft",
+    "youtube",
+    "tiktok",
+    "wechat",
+    "taobao",
+    "jd",
+    "bilibili",
+    "zhihu",
+    "douyin",
+    "tencent",
+    "alibaba",
+    "bytedance",
+    "meituan",
+    "didi",
+    "ctrip",
+    "example",
+    "wikipedia",
+    "reddit",
 ];
 const KEYWORD_STEMS: &[&str] = &[
-    "ad", "ads", "tracker", "tracking", "metric", "telemetry", "crash", "analytics",
-    "doubleclick", "scorecard", "googlesyndication", "adnxs", "facebook", "google",
-    "baidu", "qq", "wechat", "alipay", "meituan", "tiktok", "bytedance",
+    "ad",
+    "ads",
+    "tracker",
+    "tracking",
+    "metric",
+    "telemetry",
+    "crash",
+    "analytics",
+    "doubleclick",
+    "scorecard",
+    "googlesyndication",
+    "adnxs",
+    "facebook",
+    "google",
+    "baidu",
+    "qq",
+    "wechat",
+    "alipay",
+    "meituan",
+    "tiktok",
+    "bytedance",
 ];
 const IPV4_RANGES: &[&str] = &[
-    "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "8.8.8.0/24", "1.1.1.0/24",
-    "9.9.9.0/24", "114.114.114.0/24", "223.5.5.0/24", "119.29.29.0/24", "202.96.0.0/12",
-    "203.208.0.0/12", "180.76.76.0/24", "100.64.0.0/10", "127.0.0.0/8",
+    "10.0.0.0/8",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "8.8.8.0/24",
+    "1.1.1.0/24",
+    "9.9.9.0/24",
+    "114.114.114.0/24",
+    "223.5.5.0/24",
+    "119.29.29.0/24",
+    "202.96.0.0/12",
+    "203.208.0.0/12",
+    "180.76.76.0/24",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
 ];
 const REGEX_TEMPLATES: &[&str] = &[
     r".*\.cn$",
@@ -244,7 +293,10 @@ fn gen_ruleset(rng: &mut StdRng) -> RulesConfig {
         1 => RuleAction::Proxy,
         _ => RuleAction::Reject,
     };
-    RulesConfig { rules, final_action }
+    RulesConfig {
+        rules,
+        final_action,
+    }
 }
 
 fn gen_query_domain(rng: &mut StdRng) -> String {

@@ -1,10 +1,11 @@
-use phantom_core::{ClientConfig, PhantomError, Result};
 use phantom_core::crypto::KeyPair;
+use phantom_core::{ClientConfig, PhantomError, Result};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing;
 
 use crate::failover::FailoverManager;
+use crate::hello::verify_server_connection;
 use crate::socks5::handle_socks5_connection;
 
 pub struct PhantomClient {
@@ -25,6 +26,27 @@ impl PhantomClient {
     }
 
     pub async fn run(&self) -> Result<()> {
+        // Before accepting SOCKS5 connections, prove the full path:
+        // client → server → internet.
+        match verify_server_connection(&self.config).await {
+            Ok(result) if result.success => {
+                tracing::info!(
+                    "Hello verification passed: {} ({} ms)",
+                    result.message,
+                    result.latency_ms
+                );
+            }
+            Ok(result) => {
+                let msg = format!("Hello verification failed: {}", result.message);
+                tracing::error!("{}", msg);
+                return Err(PhantomError::HelloVerification(msg));
+            }
+            Err(e) => {
+                tracing::error!("Hello verification error: {}", e);
+                return Err(e);
+            }
+        }
+
         let listener = TcpListener::bind(&self.config.client.listen).await?;
         tracing::info!("SOCKS5 proxy listening on {}", self.config.client.listen);
 
@@ -41,7 +63,9 @@ impl PhantomClient {
             let failover = Arc::clone(&self.failover);
             let local_secret = self.local_secret;
             tokio::spawn(async move {
-                if let Err(e) = handle_socks5_connection(stream, &config, &failover, local_secret).await {
+                if let Err(e) =
+                    handle_socks5_connection(stream, &config, &failover, local_secret).await
+                {
                     tracing::info!("Connection error from {}: {}", peer, e);
                 }
             });

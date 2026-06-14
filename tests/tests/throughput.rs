@@ -1,13 +1,16 @@
 use phantom_core::CipherPreference;
+use phantom_core::protocol::TargetAddr;
 use phantom_e2e::echo::EchoMode;
 use phantom_e2e::fixture::TestFixture;
 use phantom_e2e::socks5::connect_tunnel;
 use phantom_e2e::throughput::{measure_echo_throughput, measure_send_throughput};
-use phantom_core::protocol::TargetAddr;
 
 const THROUGHPUT_TEST_SIZE: usize = 50 * 1024 * 1024;
 
-async fn measure_cipher_throughput(cipher: CipherPreference, size: usize) -> phantom_e2e::throughput::ThroughputResult {
+async fn measure_cipher_throughput(
+    cipher: CipherPreference,
+    size: usize,
+) -> phantom_e2e::throughput::ThroughputResult {
     let fixture = TestFixture::new_with_mode(cipher, EchoMode::Echo).await;
     let ip_bytes = match fixture.target_addr.ip() {
         std::net::IpAddr::V4(ip) => ip.octets(),
@@ -15,12 +18,21 @@ async fn measure_cipher_throughput(cipher: CipherPreference, size: usize) -> pha
     };
     let target = TargetAddr::IPv4(ip_bytes, fixture.target_addr.port());
     let (mut reader, mut writer, stream_id) = connect_tunnel(
-        fixture.server_addr, &fixture.server_key.public, &fixture.client_key.secret, &target, fixture.cipher_preference,
-    ).await.unwrap();
+        fixture.server_addr,
+        &fixture.server_key.public,
+        &fixture.client_key.secret,
+        &target,
+        fixture.cipher_preference,
+    )
+    .await
+    .unwrap();
     measure_echo_throughput(&mut reader, &mut writer, stream_id, size).await
 }
 
-async fn measure_cipher_send_throughput(cipher: CipherPreference, size: usize) -> phantom_e2e::throughput::ThroughputResult {
+async fn measure_cipher_send_throughput(
+    cipher: CipherPreference,
+    size: usize,
+) -> phantom_e2e::throughput::ThroughputResult {
     let fixture = TestFixture::new_with_mode(cipher, EchoMode::Sink).await;
     let ip_bytes = match fixture.target_addr.ip() {
         std::net::IpAddr::V4(ip) => ip.octets(),
@@ -28,8 +40,14 @@ async fn measure_cipher_send_throughput(cipher: CipherPreference, size: usize) -
     };
     let target = TargetAddr::IPv4(ip_bytes, fixture.target_addr.port());
     let (mut reader, mut writer, stream_id) = connect_tunnel(
-        fixture.server_addr, &fixture.server_key.public, &fixture.client_key.secret, &target, fixture.cipher_preference,
-    ).await.unwrap();
+        fixture.server_addr,
+        &fixture.server_key.public,
+        &fixture.client_key.secret,
+        &target,
+        fixture.cipher_preference,
+    )
+    .await
+    .unwrap();
     measure_send_throughput(&mut reader, &mut writer, stream_id, size).await
 }
 
@@ -60,7 +78,8 @@ async fn throughput_tcp_ascon128() {
 #[tokio::test]
 #[ignore]
 async fn throughput_tcp_chacha20poly() {
-    let result = measure_cipher_throughput(CipherPreference::ChaCha20Poly1305, THROUGHPUT_TEST_SIZE).await;
+    let result =
+        measure_cipher_throughput(CipherPreference::ChaCha20Poly1305, THROUGHPUT_TEST_SIZE).await;
     eprintln!("[ChaCha20-Poly1305] {}", result);
     assert!(result.throughput_mbps > 0.0);
 }
@@ -68,7 +87,8 @@ async fn throughput_tcp_chacha20poly() {
 #[tokio::test]
 #[ignore]
 async fn throughput_tcp_aes256gcm_send_only() {
-    let result = measure_cipher_send_throughput(CipherPreference::Aes256Gcm, THROUGHPUT_TEST_SIZE).await;
+    let result =
+        measure_cipher_send_throughput(CipherPreference::Aes256Gcm, THROUGHPUT_TEST_SIZE).await;
     eprintln!("[AES-256-GCM send-only] {}", result);
     assert!(result.throughput_mbps > 0.0);
 }
@@ -76,7 +96,8 @@ async fn throughput_tcp_aes256gcm_send_only() {
 #[tokio::test]
 #[ignore]
 async fn throughput_tcp_ascon128_send_only() {
-    let result = measure_cipher_send_throughput(CipherPreference::Ascon128, THROUGHPUT_TEST_SIZE).await;
+    let result =
+        measure_cipher_send_throughput(CipherPreference::Ascon128, THROUGHPUT_TEST_SIZE).await;
     eprintln!("[ASCON-128 send-only] {}", result);
     assert!(result.throughput_mbps > 0.0);
 }
@@ -101,8 +122,14 @@ async fn throughput_tcp_concurrent_10() {
         let cipher = fixture.cipher_preference;
         let handle = tokio::spawn(async move {
             let (mut reader, mut writer, stream_id) = connect_tunnel(
-                server_addr, &server_public, &client_secret, &target_clone, cipher,
-            ).await.unwrap();
+                server_addr,
+                &server_public,
+                &client_secret,
+                &target_clone,
+                cipher,
+            )
+            .await
+            .unwrap();
             measure_echo_throughput(&mut reader, &mut writer, stream_id, per_conn_bytes).await
         });
         handles.push(handle);
@@ -114,7 +141,12 @@ async fn throughput_tcp_concurrent_10() {
     }
     let elapsed = start.elapsed();
     let throughput_mbps = (total_bytes as f64 * 8.0) / elapsed.as_secs_f64() / 1_000_000.0;
-    eprintln!("[Concurrent 10] total {} bytes, elapsed {:.2}s, aggregate {:.2} Mbps", total_bytes, elapsed.as_secs_f64(), throughput_mbps);
+    eprintln!(
+        "[Concurrent 10] total {} bytes, elapsed {:.2}s, aggregate {:.2} Mbps",
+        total_bytes,
+        elapsed.as_secs_f64(),
+        throughput_mbps
+    );
     assert!(throughput_mbps > 0.0);
 }
 
@@ -128,7 +160,10 @@ async fn throughput_cipher_comparison() {
         (CipherPreference::ChaCha20Poly1305, "ChaCha20-Poly1305"),
     ];
     let test_size = 20 * 1024 * 1024;
-    eprintln!("\n===== Cipher Throughput Comparison ({} MB echo) =====", test_size / 1024 / 1024);
+    eprintln!(
+        "\n===== Cipher Throughput Comparison ({} MB echo) =====",
+        test_size / 1024 / 1024
+    );
     for (cipher, name) in &ciphers {
         let result = measure_cipher_throughput(*cipher, test_size).await;
         eprintln!("  {:20} {}", name, result);

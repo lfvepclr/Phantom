@@ -12,9 +12,7 @@ fn aes256gcm_encrypt(bencher: Bencher, size: usize) {
     let nonce = [0u8; 12];
     let payload = vec![0xAAu8; size];
 
-    bencher.bench_local(|| {
-        cipher.encrypt(Nonce::from_slice(&nonce), &payload).unwrap()
-    });
+    bencher.bench_local(|| cipher.encrypt(Nonce::from_slice(&nonce), &payload).unwrap());
 }
 
 #[divan::bench(args = [1024, 4096, 16384, 65536])]
@@ -24,9 +22,7 @@ fn aes128gcm_encrypt(bencher: Bencher, size: usize) {
     let nonce = [0u8; 12];
     let payload = vec![0xAAu8; size];
 
-    bencher.bench_local(|| {
-        cipher.encrypt(Nonce::from_slice(&nonce), &payload).unwrap()
-    });
+    bencher.bench_local(|| cipher.encrypt(Nonce::from_slice(&nonce), &payload).unwrap());
 }
 
 #[divan::bench(args = [1024, 4096, 16384, 65536])]
@@ -37,7 +33,9 @@ fn ascon128_encrypt(bencher: Bencher, size: usize) {
     let payload = vec![0xAAu8; size];
 
     bencher.bench_local(|| {
-        cipher.encrypt(AsconAead128Nonce::from_slice(&nonce), &payload).unwrap()
+        cipher
+            .encrypt(AsconAead128Nonce::from_slice(&nonce), &payload)
+            .unwrap()
     });
 }
 
@@ -49,7 +47,9 @@ fn chacha20poly1305_encrypt(bencher: Bencher, size: usize) {
     let payload = vec![0xAAu8; size];
 
     bencher.bench_local(|| {
-        cipher.encrypt(chacha20poly1305::Nonce::from_slice(&nonce), &payload).unwrap()
+        cipher
+            .encrypt(chacha20poly1305::Nonce::from_slice(&nonce), &payload)
+            .unwrap()
     });
 }
 

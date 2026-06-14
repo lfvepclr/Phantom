@@ -1,6 +1,6 @@
+use crate::{PhantomError, Result};
 use bitflags::bitflags;
 use bytes::{BufMut, Bytes, BytesMut};
-use crate::{PhantomError, Result};
 
 use crate::constants::PROTOCOL_VERSION;
 
@@ -90,6 +90,29 @@ impl Frame {
         }
     }
 
+    /// Control frame used to verify client→server→internet connectivity.
+    /// Stream 0 is reserved; payload starts with [`HELLO_MAGIC`] followed by
+    /// an opaque JSON blob (e.g. `{nonce, ts}`).
+    pub fn hello(payload: impl Into<Bytes>) -> Self {
+        Self {
+            version: PROTOCOL_VERSION,
+            stream_id: 0,
+            flags: FrameFlags::DATA,
+            payload: payload.into(),
+        }
+    }
+
+    /// Server response to a Hello frame. Payload starts with [`HELLO_ACK_MAGIC`]
+    /// followed by a JSON result blob.
+    pub fn hello_ack(payload: impl Into<Bytes>) -> Self {
+        Self {
+            version: PROTOCOL_VERSION,
+            stream_id: 0,
+            flags: FrameFlags::DATA,
+            payload: payload.into(),
+        }
+    }
+
     /// Encode frame to bytes.
     /// Wire format: [ver:1][stream_id:4 BE][flags:1][payload_len:2 BE][payload]
     pub fn encode(&self) -> Bytes {
@@ -125,11 +148,15 @@ impl Frame {
         let payload_len = u16::from_be_bytes([data[6], data[7]]) as usize;
 
         if data.len() < crate::constants::FRAME_HEADER_SIZE + payload_len {
-            return Err(PhantomError::Protocol("Frame payload truncated".to_string()));
+            return Err(PhantomError::Protocol(
+                "Frame payload truncated".to_string(),
+            ));
         }
 
         // Zero-copy: slice the original Bytes (increments reference count only)
-        let payload = data.slice(crate::constants::FRAME_HEADER_SIZE..crate::constants::FRAME_HEADER_SIZE + payload_len);
+        let payload = data.slice(
+            crate::constants::FRAME_HEADER_SIZE..crate::constants::FRAME_HEADER_SIZE + payload_len,
+        );
 
         Ok(Self {
             version,
@@ -147,7 +174,8 @@ impl Frame {
 
 #[cfg(test)]
 mod tests {
-    use super::*; use crate::constants::MAX_FRAME_PAYLOAD;
+    use super::*;
+    use crate::constants::MAX_FRAME_PAYLOAD;
 
     #[test]
     fn frame_encode_decode_roundtrip() {
@@ -196,7 +224,8 @@ mod tests {
 // Additional boundary tests appended
 #[cfg(test)]
 mod boundary_tests {
-    use super::*; use crate::constants::MAX_FRAME_PAYLOAD;
+    use super::*;
+    use crate::constants::MAX_FRAME_PAYLOAD;
 
     #[test]
     fn udp_syn_frame_roundtrip() {
@@ -248,7 +277,8 @@ mod boundary_tests {
 
     #[test]
     fn version_mismatch() {
-        let encoded = Frame::data(1, Bytes::from("hello")).encode(); let mut encoded = encoded.to_vec();
+        let encoded = Frame::data(1, Bytes::from("hello")).encode();
+        let mut encoded = encoded.to_vec();
         encoded[0] = 0xFF;
         assert!(Frame::decode(encoded.into()).is_err());
     }
@@ -268,9 +298,14 @@ mod boundary_tests {
 
     #[test]
     fn all_flags_frame() {
-        let all = FrameFlags::SYN | FrameFlags::FIN | FrameFlags::RST
-            | FrameFlags::ACK | FrameFlags::DATA | FrameFlags::PING
-            | FrameFlags::PONG | FrameFlags::UDP;
+        let all = FrameFlags::SYN
+            | FrameFlags::FIN
+            | FrameFlags::RST
+            | FrameFlags::ACK
+            | FrameFlags::DATA
+            | FrameFlags::PING
+            | FrameFlags::PONG
+            | FrameFlags::UDP;
         let frame = Frame {
             version: PROTOCOL_VERSION,
             stream_id: 99,

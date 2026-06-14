@@ -1,7 +1,7 @@
 use phantom_core::{ClientConfig, PhantomError, Result, ServerEntry};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Mutex;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -34,10 +34,12 @@ impl FailoverManager {
         let states = config
             .servers
             .iter()
-            .map(|_| Mutex::new(ServerState {
-                consecutive_failures: 0,
-                status: ServerStatus::Healthy,
-            }))
+            .map(|_| {
+                Mutex::new(ServerState {
+                    consecutive_failures: 0,
+                    status: ServerStatus::Healthy,
+                })
+            })
             .collect();
         Ok(Self {
             servers: config.servers.clone(),
@@ -145,8 +147,5 @@ impl FailoverManager {
 
 /// Simple server selection for MVP (priority-based by order)
 pub fn select_server(config: &ClientConfig) -> Result<&ServerEntry> {
-    config
-        .servers
-        .first()
-        .ok_or(PhantomError::AllServersFailed)
+    config.servers.first().ok_or(PhantomError::AllServersFailed)
 }

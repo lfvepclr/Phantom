@@ -30,6 +30,45 @@ func phantomMacosSocks5Port() -> UInt16 {
     return phantom_macos_get_socks5_port()
 }
 
+/// Fetch new log lines from the Rust log buffer since the given cursor.
+/// Returns a tuple of (lines, new_cursor). Pass 0 as cursor to get all logs.
+func phantomMacosGetLogs(sinceCursor: UInt64) -> (lines: [String], cursor: UInt64) {
+    guard let cStr = phantom_macos_get_logs(sinceCursor) else {
+        return ([], sinceCursor)
+    }
+    defer { phantom_macos_free_logs(cStr) }
+    let full = String(cString: cStr)
+    // Format: "<cursor>\n<line1>\n<line2>..."
+    let parts = full.split(separator: "\n", maxSplits: 1, omittingEmptySubsequences: false)
+    let newCursor = parts.first.flatMap { UInt64($0) } ?? sinceCursor
+    let lines = parts.dropFirst().first?
+        .split(separator: "\n", omittingEmptySubsequences: true)
+        .map(String.init) ?? []
+    return (lines, newCursor)
+}
+
+/// Tunnel lifecycle status mirrored from Rust.
+enum PhantomTunnelStatus: Int32 {
+    case idle = 0
+    case starting = 1
+    case running = 2
+    case error = 3
+}
+
+/// Returns the current tunnel lifecycle status (idle/starting/running/error).
+func phantomMacosGetStatus() -> PhantomTunnelStatus {
+    let code = phantom_macos_get_status()
+    return PhantomTunnelStatus(rawValue: code) ?? .error
+}
+
+/// Returns the last error message when status is `.error`, or `nil`.
+func phantomMacosGetLastError() -> String? {
+    guard let cStr = phantom_macos_get_last_error() else { return nil }
+    defer { phantom_macos_free_logs(cStr) }
+    let msg = String(cString: cStr)
+    return msg.isEmpty ? nil : msg
+}
+
 // MARK: - C FFI Declarations
 
 @_silgen_name("phantom_macos_start_with_uri")
@@ -40,3 +79,15 @@ func phantom_macos_stop() -> Int32
 
 @_silgen_name("phantom_macos_get_socks5_port")
 func phantom_macos_get_socks5_port() -> UInt16
+
+@_silgen_name("phantom_macos_get_logs")
+func phantom_macos_get_logs(_ sinceCursor: UInt64) -> UnsafeMutablePointer<CChar>?
+
+@_silgen_name("phantom_macos_free_logs")
+func phantom_macos_free_logs(_ ptr: UnsafeMutablePointer<CChar>)
+
+@_silgen_name("phantom_macos_get_status")
+func phantom_macos_get_status() -> Int32
+
+@_silgen_name("phantom_macos_get_last_error")
+func phantom_macos_get_last_error() -> UnsafeMutablePointer<CChar>?

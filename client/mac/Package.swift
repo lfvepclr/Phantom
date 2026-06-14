@@ -20,6 +20,11 @@ let package = Package(
         .executableTarget(
             name: "PhantomMac",
             path: "Sources/PhantomMac",
+            resources: [
+                // Bundle MenuBarIcon.png (+ @2x) into PhantomMac_PhantomMac.bundle
+                // so MenuBarExtra can load it via Bundle.module.
+                .process("Resources"),
+            ],
             linkerSettings: [
                 // Link client/mac/PhantomLibs/libphantom_client.dylib (cargo output
                 // is copied there by scripts/build-mac.sh).

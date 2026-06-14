@@ -37,17 +37,27 @@ fn hkdf_full_session_key_derivation(bencher: Bencher) {
         let prefix = "phantom-v2-AES-256-GCM";
         let hk1 = Hkdf::<Sha256>::new(None, &k1);
         let mut write_key = [0u8; 32];
-        hk1.expand(format!("{}-write", prefix).as_bytes(), &mut write_key).unwrap();
+        hk1.expand(format!("{}-write", prefix).as_bytes(), &mut write_key)
+            .unwrap();
 
         let hk2 = Hkdf::<Sha256>::new(None, &k2);
         let mut read_key = [0u8; 32];
-        hk2.expand(format!("{}-read", prefix).as_bytes(), &mut read_key).unwrap();
+        hk2.expand(format!("{}-read", prefix).as_bytes(), &mut read_key)
+            .unwrap();
 
         let mut write_nonce_prefix = [0u8; 4];
-        hk1.expand(format!("{}-write-nonce", prefix).as_bytes(), &mut write_nonce_prefix).unwrap();
+        hk1.expand(
+            format!("{}-write-nonce", prefix).as_bytes(),
+            &mut write_nonce_prefix,
+        )
+        .unwrap();
 
         let mut read_nonce_prefix = [0u8; 4];
-        hk2.expand(format!("{}-read-nonce", prefix).as_bytes(), &mut read_nonce_prefix).unwrap();
+        hk2.expand(
+            format!("{}-read-nonce", prefix).as_bytes(),
+            &mut read_nonce_prefix,
+        )
+        .unwrap();
 
         (write_key, read_key, write_nonce_prefix, read_nonce_prefix)
     });

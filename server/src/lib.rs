@@ -10,7 +10,9 @@ use phantom_core::transport::TransportListener;
 
 use anyhow::Result;
 use base64::Engine;
-use phantom_core::{CipherPreference, CongestionAlgorithm, ServerConfig, ServerEntry, TransportProtocol};
+use phantom_core::{
+    CipherPreference, CongestionAlgorithm, ServerConfig, ServerEntry, TransportProtocol,
+};
 use std::net::SocketAddr;
 
 /// All-in-one runtime configuration for the server, regardless of how the
@@ -29,6 +31,9 @@ pub struct BootstrapOptions {
     pub protocol: TransportProtocol,
     pub quic_congestion: CongestionAlgorithm,
     pub io_uring: bool,
+    /// Optional URL used for the Hello verification probe. When `None`, the
+    /// built-in captive-portal targets are used.
+    pub verification_url: Option<String>,
 }
 
 /// Load a TOML config and dispatch to the unified runtime.
@@ -97,6 +102,7 @@ pub async fn run(config_path: &str) -> Result<()> {
         protocol,
         quic_congestion: config.quic.congestion,
         io_uring,
+        verification_url: config.verification_url.clone(),
     };
 
     run_with_options(opts).await
@@ -116,6 +122,7 @@ pub async fn run_with_options(opts: BootstrapOptions) -> Result<()> {
                 opts.allowed_clients,
                 opts.cipher,
                 opts.io_uring,
+                opts.verification_url,
             )
             .await
         }
@@ -126,6 +133,7 @@ pub async fn run_with_options(opts: BootstrapOptions) -> Result<()> {
                 opts.allowed_clients,
                 opts.cipher,
                 opts.quic_congestion,
+                opts.verification_url,
             )
             .await
         }
@@ -167,9 +175,9 @@ pub async fn run_from_uri(uri: &str, key_path: &str) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to read CWD: {}", e))?
         .join("server.toml");
     let allowed_clients = if toml_path.exists() {
-        let s = toml_path.to_str().ok_or_else(|| {
-            anyhow::anyhow!("non-UTF8 server.toml path: {}", toml_path.display())
-        })?;
+        let s = toml_path
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("non-UTF8 server.toml path: {}", toml_path.display()))?;
         let cfg = ServerConfig::load(s)
             .map_err(|e| anyhow::anyhow!("failed to load {}: {}", toml_path.display(), e))?;
         cfg.load_allowed_clients()
@@ -191,6 +199,7 @@ pub async fn run_from_uri(uri: &str, key_path: &str) -> Result<()> {
         protocol,
         quic_congestion: CongestionAlgorithm::default(),
         io_uring: false,
+        verification_url: None,
     };
 
     run_with_options(opts).await
@@ -202,10 +211,18 @@ async fn run_tcp(
     allowed_clients: Vec<[u8; 32]>,
     cipher_preference: phantom_core::CipherPreference,
     _io_uring: bool,
+    verification_url: Option<String>,
 ) -> Result<()> {
     #[cfg(all(target_os = "linux", feature = "io-uring"))]
     if _io_uring {
-        return linux_ext::run_uring_server(addr, secret_key, allowed_clients, cipher_preference).await;
+        return linux_ext::run_uring_server(
+            addr,
+            secret_key,
+            allowed_clients,
+            cipher_preference,
+            verification_url,
+        )
+        .await;
     }
 
     #[cfg(target_os = "linux")]
@@ -217,8 +234,8 @@ async fn run_tcp(
 
     #[cfg(not(target_os = "linux"))]
     let listener = {
-        use phantom_core::transport::tcp::TcpListener;
         use phantom_core::transport::TransportListener;
+        use phantom_core::transport::tcp::TcpListener;
         let l = TcpListener::bind(&addr).await?;
         tracing::info!("Phantom TCP server listening on {}", l.local_addr()?);
         l
@@ -235,8 +252,9 @@ async fn run_tcp(
                         let sk = secret_key;
                         let allowed = allowed_clients.clone();
                         let cipher = cipher_preference;
+                        let vurl = verification_url.clone();
                         tokio::spawn(async move {
-                            handler::handle_connection(stream, sk, &allowed, cipher).await;
+                            handler::handle_connection(stream, sk, &allowed, cipher, vurl.as_deref()).await;
                         });
                     }
                     Err(e) => {
@@ -260,10 +278,14 @@ async fn run_quic(
     allowed_clients: Vec<[u8; 32]>,
     cipher_preference: phantom_core::CipherPreference,
     congestion: phantom_core::CongestionAlgorithm,
+    verification_url: Option<String>,
 ) -> Result<()> {
     let server_config = phantom_core::transport::quic::create_server_config(congestion)?;
     let endpoint = quinn::Endpoint::server(server_config, addr)?;
-    tracing::info!("Phantom QUIC server listening on {}", endpoint.local_addr()?);
+    tracing::info!(
+        "Phantom QUIC server listening on {}",
+        endpoint.local_addr()?
+    );
 
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -283,8 +305,9 @@ async fn run_quic(
                         let sk = secret_key;
                         let allowed = allowed_clients.clone();
                         let cipher = cipher_preference;
+                        let vurl = verification_url.clone();
                         tokio::spawn(async move {
-                            handler::handle_quic_connection(conn, sk, &allowed, cipher).await;
+                            handler::handle_quic_connection(conn, sk, &allowed, cipher, vurl.as_deref()).await;
                         });
                     }
                     None => {
@@ -304,7 +327,5 @@ async fn run_quic(
 }
 
 fn init_tracing(level: &str) {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(level)
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter(level).try_init();
 }

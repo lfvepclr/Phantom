@@ -1,5 +1,5 @@
-use bytes::Bytes;
 use crate::{PhantomError, Result};
+use bytes::Bytes;
 use tokio::io::AsyncWriteExt;
 
 use crate::crypto::aead_state::AeadState;

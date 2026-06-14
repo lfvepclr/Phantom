@@ -15,9 +15,7 @@ fn main() -> Result<()> {
         );
     }
 
-    tokio_uring::start(async {
-        phantom_server::run(&config_path).await
-    })
+    tokio_uring::start(async { phantom_server::run(&config_path).await })
 }
 
 #[cfg(not(all(feature = "io-uring", target_os = "linux")))]

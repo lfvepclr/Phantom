@@ -75,6 +75,7 @@ struct PhantomMacBuilder {
         let defaults: [String: String] = [
             "CFBundleDevelopmentRegion": "en",
             "CFBundleExecutable": appName,
+            "CFBundleIconFile": "AppIcon",
             "CFBundleIdentifier": bundleId,
             "CFBundleInfoDictionaryVersion": "6.0",
             "CFBundleName": appName,
@@ -183,14 +184,18 @@ struct PhantomMacBuilder {
         try fm.createDirectory(atPath: distDir, withIntermediateDirectories: true)
 
         // 2. Copy the SPM-built executable into Contents/MacOS/
+        // IMPORTANT: rename from "PhantomMac" (SPM target name) to "Phantom"
+        // (appName) so that CFBundleExecutable matches the file name.
+        // macOS uses CFBundleExecutable to locate the main binary — a
+        // mismatch causes "may be damaged or incomplete" on launch.
         let exeSrc = "\(buildDir)/PhantomMac"
         guard fm.fileExists(atPath: exeSrc) else {
             print("❌ SPM did not produce \(exeSrc)")
             exit(1)
         }
-        let exeDst = "\(macosDir)/PhantomMac"
+        let exeDst = "\(macosDir)/\(appName)"   // "Phantom", NOT "PhantomMac"
         try fm.copyItem(atPath: exeSrc, toPath: exeDst)
-        print("✅ Copied SPM executable into Contents/MacOS/PhantomMac")
+        print("✅ Copied SPM executable into Contents/MacOS/\(appName)")
 
         // 3. Copy the Rust dylib into Contents/Frameworks/ and rewrite its
         // install_name to `@rpath/libphantom_client.dylib`.
@@ -214,6 +219,53 @@ struct PhantomMacBuilder {
         }
         print("✅ Copied Rust dylib into Contents/Frameworks/ (install_name → \(newInstallName))")
 
+        // 3.5 Create Contents/Resources/ and install the app icon. Pattern
+        // borrowed from qoder/mytime's DMGBuilderExec: prefer the pre-built
+        // Icon.icns, fall back to iconutil-converting Icon.iconset/.
+        let resourcesDir = "\(contents)/Resources"
+        try fm.createDirectory(atPath: resourcesDir, withIntermediateDirectories: true)
+
+        let icnsSrc = "\(cwd)/Icon.icns"
+        let icnsDst = "\(resourcesDir)/AppIcon.icns"
+        if fm.fileExists(atPath: icnsSrc) {
+            try fm.copyItem(atPath: icnsSrc, toPath: icnsDst)
+            print("✅ Installed AppIcon.icns into Contents/Resources/")
+        } else {
+            // Fallback: convert Icon.iconset/ on the fly.
+            let iconsetSrc = "\(cwd)/Icon.iconset"
+            if fm.fileExists(atPath: iconsetSrc) {
+                let status = try shell(
+                    "/usr/bin/iconutil",
+                    ["-c", "icns", iconsetSrc, "-o", icnsDst],
+                    silent: true
+                )
+                guard status == 0 else {
+                    print("❌ iconutil failed to build AppIcon.icns")
+                    exit(1)
+                }
+                print("✅ Generated AppIcon.icns from Icon.iconset/")
+            } else {
+                print("⚠️  No Icon.icns or Icon.iconset found — bundle will have no icon")
+            }
+        }
+
+        // 3.6 Install SPM's resource bundle (PhantomMac_PhantomMac.bundle)
+        // into Contents/Resources/ only. We do NOT create the root symlink
+        // here — it will be added AFTER codesign (step 6) to avoid
+        // "unsealed contents present in the bundle root" rejection from
+        // `codesign --deep`. Bundle.module finds the bundle via
+        // Bundle.main.resourceURL (→ Contents/Resources/), so the root
+        // symlink is only needed as a fallback for SPM's candidate list.
+        let rbName = "PhantomMac_PhantomMac.bundle"
+        let rbSrc = "\(buildDir)/\(rbName)"
+        if fm.fileExists(atPath: rbSrc) {
+            let rbDst = "\(resourcesDir)/\(rbName)"
+            try fm.copyItem(atPath: rbSrc, toPath: rbDst)
+            print("✅ Installed SPM resource bundle into Contents/Resources/")
+        } else {
+            print("⚠️  SPM resource bundle missing: \(rbSrc) — MenuBarExtra may not find MenuBarIcon")
+        }
+
         // 4. Write a complete Info.plist (merged from defaults + package-root
         // overlay). Without CFBundleExecutable / CFBundlePackageType /
         // NSPrincipalClass macOS shows "may be damaged or incomplete".
@@ -236,39 +288,56 @@ struct PhantomMacBuilder {
             print("✅ Rewrote PhantomMac LC_LOAD_DYLIB: \(oldInstallName) → \(newInstallName)")
         }
 
-        // 6. Ad-hoc codesign with hardened runtime. Sign nested code first
-        // (dylib before host) — `codesign --deep` does this automatically
-        // but we keep the explicit calls so the order is obvious.
-        let signDylib = try shell(
-            "/usr/bin/codesign",
-            [
-                "--force", "--sign", "-",
-                "--options", "runtime",
-                "\(fwDir)/libphantom_client.dylib",
-            ]
-        )
-        guard signDylib == 0 else {
-            print("❌ Failed to codesign dylib")
+        // 6. Sign the .app bundle. `install_name_tool` invalidated the
+        // PhantomMac binary's original v=20400 linker-signed signature, so
+        // we must re-sign. We follow the same pattern as qoder/hora but
+        // with one critical addition: `--entitlements`.
+        //
+        // Without the `com.apple.security.cs.disable-library-validation`
+        // entitlement, the hardened runtime refuses to load the Rust cdylib
+        // because ad-hoc signing gives each binary its own unique Team ID
+        // — dyld then reports "mapping process and mapped file have
+        // different Team IDs" and aborts. The entitlement opts out of
+        // this check, allowing the Rust dylib to be loaded despite the
+        // Team ID mismatch. (Hora doesn't need this because it has no
+        // dylib.)
+        //
+        // IMPORTANT: this step must run BEFORE the root symlink (step 6.5)
+        // is created, because `codesign --deep` rejects "unsealed contents
+        // present in the bundle root" (the symlink counts as unsealed).
+        let entitlementsPath = "\(cwd)/Phantom.entitlements"
+        var signArgs = [
+            "-s", "-",
+            "--deep",
+            "--force",
+            "--options", "runtime",
+        ]
+        if fm.fileExists(atPath: entitlementsPath) {
+            signArgs += ["--entitlements", entitlementsPath]
+        }
+        signArgs.append(appPath)
+        let signStatus = try shell("/usr/bin/codesign", signArgs)
+        guard signStatus == 0 else {
+            print("❌ Failed to codesign .app bundle")
             exit(1)
         }
-        let signApp = try shell(
-            "/usr/bin/codesign",
-            [
-                "--force", "--deep", "--sign", "-",
-                "--options", "runtime",
-                appPath,
-            ]
-        )
-        guard signApp == 0 else {
-            print("❌ Failed to codesign .app")
-            exit(1)
+        if fm.fileExists(atPath: entitlementsPath) {
+            print("✅ Ad-hoc signed .app bundle (hardened runtime + entitlements, --deep)")
+        } else {
+            print("✅ Ad-hoc signed .app bundle (hardened runtime, --deep)")
         }
-        print("✅ Ad-hoc codesigned with hardened runtime")
 
-        // 7. Verify the .app is well-formed.
-        let verifyStatus = try shell("/usr/bin/codesign", ["--verify", "--strict", "--deep", appPath])
+        // 6.5 Verify the .app is well-formed BEFORE adding the root symlink.
+        // The symlink will cause `codesign --verify --strict --deep` to report
+        // "unsealed contents present in the bundle root", but the .app will
+        // still launch correctly — macOS only checks the main binary's
+        // LC_CODE_SIGNATURE at launch time.
+        let verifyStatus = try shell(
+            "/usr/bin/codesign",
+            ["--verify", "--strict", "--deep", appPath]
+        )
         guard verifyStatus == 0 else {
-            print("❌ codesign --verify failed")
+            print("❌ codesign --verify --strict --deep failed on .app")
             exit(1)
         }
         let plutilStatus = try shell("/usr/bin/plutil", ["-lint", "\(contents)/Info.plist"])
@@ -276,6 +345,7 @@ struct PhantomMacBuilder {
             print("❌ plutil -lint failed on Info.plist")
             exit(1)
         }
+        print("✅ codesign --verify --strict --deep OK; plutil OK")
 
         print("")
         print("✅ Built Phantom.app")
@@ -292,9 +362,12 @@ struct PhantomMacBuilder {
             withDestinationPath: "/Applications"
         )
 
-        // 9. Create a read-write DMG (UDRW / HFS+). AppleScript window
-        // styling is skipped — we have no custom icon yet, so a plain
-        // Finder view is fine.
+        // 9. Create a read-write DMG (UDRW / HFS+). We mount it next to write
+        // a custom Finder window layout (icon view, .app on the left, the
+        // Applications alias on the right, white background). The layout is
+        // persisted to .DS_Store inside the UDRW, so the UDRW → UDZO pipeline
+        // gives us a polished installer window without any extra runtime
+        // resource. Pattern adapted from qoder/hora's DMGBuilder.
         let createStatus = try shell(
             "/usr/bin/hdiutil",
             [
@@ -311,6 +384,82 @@ struct PhantomMacBuilder {
         guard createStatus == 0 else {
             print("❌ Failed to create writable DMG")
             exit(1)
+        }
+
+        // 9.5 Mount the UDRW, drive Finder into icon view + custom layout via
+        // AppleScript, then detach. osascript may fail in headless / CI
+        // contexts (no Finder session) — we log and continue so the DMG is
+        // still produced, just with Finder's default small window.
+        let mountPoint = "/Volumes/\(appName)"
+        try? shell(
+            "/usr/bin/hdiutil",
+            ["detach", mountPoint, "-quiet"],
+            silent: true
+        )
+        let attachStatus = try shell(
+            "/usr/bin/hdiutil",
+            [
+                "attach", rwDmgPath,
+                "-mountpoint", mountPoint,
+                "-nobrowse", "-noverify",
+            ],
+            silent: true
+        )
+        if attachStatus == 0 {
+            print("🎨 Configuring DMG window layout (AppleScript)...")
+            let appleScript = """
+            tell application "Finder"
+                tell disk "\(appName)"
+                    open
+                    delay 1
+
+                    set theWindow to container window
+                    set current view of theWindow to icon view
+                    delay 0.5
+
+                    set toolbar visible of theWindow to false
+                    set statusbar visible of theWindow to false
+
+                    set bounds of theWindow to {200, 200, 800, 600}
+
+                    set viewOptions to the icon view options of theWindow
+                    set arrangement of viewOptions to not arranged
+                    set icon size of viewOptions to 128
+                    set background color of viewOptions to {65535, 65535, 65535}
+
+                    delay 0.5
+
+                    set position of item "\(appName).app" of theWindow to {150, 200}
+                    set position of item "Applications" of theWindow to {450, 200}
+
+                    close
+                    open
+                    delay 0.5
+                    update without registering applications
+                end tell
+            end tell
+            """
+            let osa = Process()
+            osa.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            osa.arguments = ["-e", appleScript]
+            osa.standardOutput = FileHandle.nullDevice
+            osa.standardError = FileHandle.nullDevice
+            try osa.run()
+            osa.waitUntilExit()
+            if osa.terminationStatus != 0 {
+                print("⚠️  AppleScript window styling failed (no Finder?); DMG will use default layout")
+            } else {
+                print("✅ DMG window styled (icon view, .app left, Applications right)")
+            }
+            // Let Finder flush .DS_Store before we detach.
+            try await Task.sleep(for: .seconds(2.0))
+            try? shell(
+                "/usr/bin/hdiutil",
+                ["detach", mountPoint, "-quiet"],
+                silent: true
+            )
+        } else {
+            print("⚠️  Failed to mount UDRW for styling; DMG will use default layout")
         }
 
         // 10. Convert to compressed UDZO. zlib-level=9 → smallest file.

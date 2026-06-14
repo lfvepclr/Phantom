@@ -1,5 +1,5 @@
 use crate::error::{PhantomError, Result};
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use std::fs;
 
@@ -45,6 +45,8 @@ pub struct ClientConfig {
     pub failover: FailoverConfig,
     #[serde(default)]
     pub rules: RulesConfig,
+    #[serde(default)]
+    pub hello: HelloConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -82,6 +84,31 @@ impl Default for ClientSettings {
     }
 }
 
+/// Client-side Hello verification settings.
+#[derive(Debug, Clone, Deserialize)]
+pub struct HelloConfig {
+    /// Timeout in seconds for the Hello verification handshake.
+    #[serde(default = "default_hello_timeout")]
+    pub timeout: u64,
+    /// Optional list of HTTP URLs the server should try to reach. When empty
+    /// the built-in captive-portal targets are used.
+    #[serde(default)]
+    pub targets: Vec<String>,
+}
+
+impl Default for HelloConfig {
+    fn default() -> Self {
+        Self {
+            timeout: default_hello_timeout(),
+            targets: Vec::new(),
+        }
+    }
+}
+
+fn default_hello_timeout() -> u64 {
+    10
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProxyMode {
@@ -109,14 +136,28 @@ pub enum RuleAction {
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case", tag = "type")]
 pub enum RulePattern {
-    DomainFull { value: String },
-    DomainSuffix { value: String },
-    DomainKeyword { value: String },
-    DomainRegex { value: String },
-    IpCidr { value: String },
+    DomainFull {
+        value: String,
+    },
+    DomainSuffix {
+        value: String,
+    },
+    DomainKeyword {
+        value: String,
+    },
+    DomainRegex {
+        value: String,
+    },
+    IpCidr {
+        value: String,
+    },
     #[cfg(feature = "geoip")]
-    GeoIp { value: String },
-    Port { value: u16 },
+    GeoIp {
+        value: String,
+    },
+    Port {
+        value: u16,
+    },
     Final,
 }
 
@@ -134,7 +175,6 @@ pub struct RulesConfig {
     pub final_action: RuleAction,
 }
 
-
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
@@ -142,6 +182,7 @@ impl Default for ClientConfig {
             client: ClientSettings::default(),
             failover: FailoverConfig::default(),
             rules: RulesConfig::default(),
+            hello: HelloConfig::default(),
         }
     }
 }
@@ -246,6 +287,11 @@ pub struct ServerConfig {
     pub tls: TlsConfig,
     #[serde(default)]
     pub performance: PerformanceConfig,
+    /// Optional URL the server uses to prove it can reach the public internet
+    /// during the Hello verification handshake. If omitted, the built-in
+    /// captive-portal targets are used.
+    #[serde(default)]
+    pub verification_url: Option<String>,
 }
 
 /// A single entry in the inline `[[allowed_clients]]` array.

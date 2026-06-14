@@ -1,7 +1,7 @@
 use std::fmt;
 
-use bytes::{BufMut, Bytes, BytesMut};
 use crate::{PhantomError, Result};
+use bytes::{BufMut, Bytes, BytesMut};
 use std::net::SocketAddr;
 
 #[derive(Debug, Clone)]
@@ -14,11 +14,9 @@ pub enum TargetAddr {
 impl fmt::Display for TargetAddr {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TargetAddr::IPv4(ip, port) => write!(
-                f,
-                "{}.{}.{}.{}:{}",
-                ip[0], ip[1], ip[2], ip[3], port
-            ),
+            TargetAddr::IPv4(ip, port) => {
+                write!(f, "{}.{}.{}.{}:{}", ip[0], ip[1], ip[2], ip[3], port)
+            }
             TargetAddr::IPv6(ip, port) => write!(
                 f,
                 "[{:#x}:{:#x}:{:#x}:{:#x}:{:#x}:{:#x}:{:#x}:{:#x}]:{}",
@@ -83,18 +81,19 @@ impl TargetAddr {
             }
             0x03 => {
                 if src.len() < 2 {
-                    return Err(PhantomError::Protocol("Domain address too short".to_string()));
+                    return Err(PhantomError::Protocol(
+                        "Domain address too short".to_string(),
+                    ));
                 }
                 let domain_len = src[1] as usize;
                 if src.len() < 2 + domain_len + 2 {
-                    return Err(PhantomError::Protocol("Domain address truncated".to_string()));
+                    return Err(PhantomError::Protocol(
+                        "Domain address truncated".to_string(),
+                    ));
                 }
                 let domain = String::from_utf8(src[2..2 + domain_len].to_vec())
                     .map_err(|e| PhantomError::Protocol(format!("Invalid domain: {}", e)))?;
-                let port = u16::from_be_bytes([
-                    src[2 + domain_len],
-                    src[2 + domain_len + 1],
-                ]);
+                let port = u16::from_be_bytes([src[2 + domain_len], src[2 + domain_len + 1]]);
                 Ok(TargetAddr::Domain(domain, port))
             }
             0x04 => {

@@ -5,14 +5,13 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 
-use phantom_core::{parse_phantom_uri, KeyPair};
+use phantom_core::{KeyPair, parse_phantom_uri};
 
 /// Resolve the phantom CLI binary path.
 /// Looks in target/debug/phantom relative to the workspace root.
 fn phantom_bin() -> String {
     // CARGO_MANIFEST_DIR points to phantom-e2e/, go up one level to workspace.
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
-        .unwrap_or_else(|_| ".".to_string());
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     let workspace = Path::new(&manifest_dir).parent().unwrap();
     let bin_path = workspace.join("target").join("debug").join("phantom");
     bin_path.to_string_lossy().to_string()
@@ -140,7 +139,11 @@ fn cli_server_auto_generates_key_and_uri() {
 
     // Verify key file with 0600 perms.
     let key_path = dir.join("server.key");
-    assert!(key_path.exists(), "server.key missing at {}", key_path.display());
+    assert!(
+        key_path.exists(),
+        "server.key missing at {}",
+        key_path.display()
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -173,7 +176,11 @@ fn cli_server_auto_generates_key_and_uri() {
 
     // Extract the URI quick-link comment.
     let uri = extract_uri_from_server_toml(&toml_path);
-    assert!(uri.starts_with("phantom://"), "URI does not start with phantom://: {}", uri);
+    assert!(
+        uri.starts_with("phantom://"),
+        "URI does not start with phantom://: {}",
+        uri
+    );
 
     // Parse and verify the URI's public key matches the local key file.
     let entry = parse_phantom_uri(&uri).expect("server.toml URI is invalid");
@@ -292,7 +299,13 @@ fn cli_server_auto_reuses_existing_key() {
     let port_a = pick_free_port() + 2000;
     let port_a_str = port_a.to_string();
     let mut first = spawn_phantom_with_cwd(
-        &["server", "--port", &port_a_str, "--public-host", "127.0.0.1"],
+        &[
+            "server",
+            "--port",
+            &port_a_str,
+            "--public-host",
+            "127.0.0.1",
+        ],
         &dir,
     );
     let toml_path = dir.join("server.toml");
@@ -312,7 +325,13 @@ fn cli_server_auto_reuses_existing_key() {
     let port_b = pick_free_port() + 3000;
     let port_b_str = port_b.to_string();
     let mut second = spawn_phantom_with_cwd(
-        &["server", "--port", &port_b_str, "--public-host", "127.0.0.1"],
+        &[
+            "server",
+            "--port",
+            &port_b_str,
+            "--public-host",
+            "127.0.0.1",
+        ],
         &dir,
     );
     assert!(wait_for_file(&toml_path, Duration::from_secs(5)));
@@ -357,10 +376,11 @@ fn workspace_tmp(prefix: &str) -> std::path::PathBuf {
         .parent()
         .unwrap()
         .to_path_buf();
-    let dir = workspace
-        .join("target")
-        .join("tmp")
-        .join(format!("{}_{}", prefix, std::process::id()));
+    let dir =
+        workspace
+            .join("target")
+            .join("tmp")
+            .join(format!("{}_{}", prefix, std::process::id()));
     let _ = fs::create_dir_all(dir.parent().unwrap());
     dir
 }

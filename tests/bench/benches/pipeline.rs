@@ -1,5 +1,5 @@
-use divan::Bencher;
 use bytes::Bytes;
+use divan::Bencher;
 use phantom_core::crypto::aead_state::AeadState;
 use phantom_core::crypto::cipher::CipherSuite;
 use phantom_core::protocol::Frame;
@@ -31,7 +31,8 @@ fn pipeline_bench(bencher: Bencher, cipher: CipherSuite, payload_size: usize) {
 
         // Encode frame to Bytes, then convert to Vec for encrypt
         let encoded: Bytes = frame.encode();
-        let mut buf: Vec<u8> = encoded.try_into_mut()
+        let mut buf: Vec<u8> = encoded
+            .try_into_mut()
             .map(|bm| bm.into())
             .unwrap_or_else(|b| b.to_vec());
         enc_state.encrypt_in_place(&mut buf).unwrap();

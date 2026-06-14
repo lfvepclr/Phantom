@@ -1,7 +1,7 @@
 use divan::Bencher;
+use phantom_core::crypto::cipher::CipherSuite;
 use phantom_core::crypto::session::CipherOffer;
 use phantom_core::crypto::{KeyPair, NoiseInitiator, NoiseResponder};
-use phantom_core::crypto::cipher::CipherSuite;
 use tokio::io::duplex;
 
 #[divan::bench]
