@@ -167,6 +167,16 @@ sequenceDiagram
 
 ## 构建
 
+### 统一构建系统（推荐）
+
+```bash
+# 从项目根目录
+cargo xtask build server          # release 构建
+cargo xtask build server --debug  # debug 构建
+```
+
+### 传统方式
+
 ```bash
 # Release
 cargo build --release -p phantom-server

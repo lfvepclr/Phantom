@@ -163,11 +163,11 @@ struct PhantomMacBuilder {
         }
 
         let buildDir = "\(cwd)/.build/release"
-        let appPath = "\(cwd)/Phantom.app"
+        let appPath = "\(cwd)/.build/Phantom.app"
         let contents = "\(appPath)/Contents"
         let macosDir = "\(contents)/MacOS"
         let fwDir = "\(contents)/Frameworks"
-        let distDir = "\(cwd)/dist"
+        let distDir = "\(cwd)/.build/dist"
         let dmgPath = "\(distDir)/Phantom.dmg"
         let rwDmgPath = "\(cwd)/.build/Phantom-rw.dmg"
         let stagingDir = "\(cwd)/.build/dmg-root"
@@ -199,9 +199,9 @@ struct PhantomMacBuilder {
 
         // 3. Copy the Rust dylib into Contents/Frameworks/ and rewrite its
         // install_name to `@rpath/libphantom_client.dylib`.
-        let dylibSrc = "\(cwd)/PhantomLibs/libphantom_client.dylib"
+        let dylibSrc = "\(cwd)/.build/lib/libphantom_client.dylib"
         guard fm.fileExists(atPath: dylibSrc) else {
-            print("❌ PhantomLibs/libphantom_client.dylib missing — run scripts/build-mac.sh first")
+            print("❌ .build/lib/libphantom_client.dylib missing — run scripts/build-mac.sh first")
             exit(1)
         }
         let dylibDst = "\(fwDir)/libphantom_client.dylib"
@@ -225,14 +225,14 @@ struct PhantomMacBuilder {
         let resourcesDir = "\(contents)/Resources"
         try fm.createDirectory(atPath: resourcesDir, withIntermediateDirectories: true)
 
-        let icnsSrc = "\(cwd)/Icon.icns"
+        let icnsSrc = "\(cwd)/.build/icon/Icon.icns"
         let icnsDst = "\(resourcesDir)/AppIcon.icns"
         if fm.fileExists(atPath: icnsSrc) {
             try fm.copyItem(atPath: icnsSrc, toPath: icnsDst)
             print("✅ Installed AppIcon.icns into Contents/Resources/")
         } else {
             // Fallback: convert Icon.iconset/ on the fly.
-            let iconsetSrc = "\(cwd)/Icon.iconset"
+            let iconsetSrc = "\(cwd)/.build/icon/Icon.iconset"
             if fm.fileExists(atPath: iconsetSrc) {
                 let status = try shell(
                     "/usr/bin/iconutil",

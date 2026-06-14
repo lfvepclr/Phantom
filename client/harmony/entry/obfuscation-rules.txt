@@ -1,0 +1,2 @@
+# Obfuscation rules for HarmonyOS app
+# Add your obfuscation rules here

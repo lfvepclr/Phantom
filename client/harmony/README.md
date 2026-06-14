@@ -183,31 +183,105 @@ graph LR
 
 ## 构建
 
+### 统一构建系统（推荐）
+
+```bash
+# 从项目根目录
+cargo xtask build harmony          # release 构建
+cargo xtask build harmony --debug  # debug 构建
+```
+
+`cargo xtask` 会自动检查依赖（ohos target、DevEco SDK 等），调用 `scripts/build-harmony.sh` 脚本。
+
 ### 一键脚本
 
 ```bash
-./scripts/build-harmony.sh
+scripts/build-harmony.sh           # 默认 release
+BUILD_MODE=debug scripts/build-harmony.sh  # debug 构建
 ```
 
 前置条件：
 - DevEco Studio NEXT（5.0+）+ HarmonyOS SDK API 12
-- `ohos-rs` / `cargo-ohos` 工具链（`aarch64-unknown-linux-ohos` target）
+- Rust target：`rustup target add aarch64-unknown-linux-ohos`
+- `.cargo/config.toml` 中已配置 OHOS clang linker
 
 脚本会：
-1. `cargo build -p phantom-harmony` — 编译 Rust NAPI cdylib
+1. `cargo build -p phantom-harmony --target aarch64-unknown-linux-ohos` — 编译 Rust NAPI cdylib
 2. 复制 `libphantom_harmony.so` → `entry/src/main/resources/rawfile/libphantom.so`
+
+### 构建产物
+
+```
+client/harmony/entry/src/main/
+├── libs/arm64-v8a/                  # Rust NAPI cdylib（真机构建）
+│   └── libphantom_harmony.so
+└── resources/rawfile/               # Rust NAPI cdylib（模拟器构建）
+    └── libphantom.so
+
+client/harmony/build/outputs/        # APP/HAP 产物（gitignore）
+└── default/
+    ├── harmony-default-unsigned.app
+    └── harmony-default-signed.app
+```
 
 ### DevEco Studio 构建
 
 1. 用 DevEco Studio 打开 `client/harmony`
-2. 编译 Rust NAPI：`./scripts/build-harmony.sh`
+2. 编译 Rust NAPI：`scripts/build-harmony.sh` 或 `cargo xtask build harmony`
 3. 选择模拟器或真机 → Run
+
+### 手动构建 Rust NAPI
+
+```bash
+cd client/harmony/rust
+cargo build --target aarch64-unknown-linux-ohos --release
+# 真机：复制到 libs/
+mkdir -p ../entry/src/main/libs/arm64-v8a/
+cp ../../target/aarch64-unknown-linux-ohos/release/libphantom_harmony.so \
+   ../entry/src/main/libs/arm64-v8a/
+```
 
 ## 打包与签名
 
-- **HAP 打包**：DevEco Studio Build → Build Hap(s)/APP(s)
-- **签名**：HarmonyOS NEXT 开发者签名（调试/发布证书）
-- **Rust cdylib 打包**：`libphantom_harmony.so` 放入 `rawfile/`，DevEco 自动打包
+### 构建签名 APP（真机安装）
+
+由于 hvigor 的 `signingConfigs` 要求加密密码（32+ 字符），当前采用 **无签名构建 + 手动签名** 的方式：
+
+```bash
+# 1. 编译 Rust NAPI .so
+cargo build -p phantom-harmony --release --target aarch64-unknown-linux-ohos
+mkdir -p entry/src/main/libs/arm64-v8a/
+cp ../../target/aarch64-unknown-linux-ohos/release/libphantom_harmony.so \
+   entry/src/main/libs/arm64-v8a/
+
+# 2. ohpm 安装依赖
+cd client/harmony && ohpm install
+
+# 3. hvigor 无签名构建 APP
+export DEVECO_SDK_HOME=/Applications/DevEco-Studio.app/Contents/sdk
+./hvigorw --mode project -p product=default assembleApp
+
+# 4. 手动签名（使用 OpenHarmony 调试证书）
+java -jar <hap-sign-tool.jar> sign-app \
+  -keyAlias "openharmony application release" \
+  -keyPwd 123456 \
+  -keystoreFile signing/OpenHarmony.p12 \
+  -keystorePwd 123456 \
+  -appCertFile signing/OpenHarmonyAppCertChain.cer \
+  -profileFile signing/OpenHarmonyDebug.p7b \
+  -inFile build/outputs/default/harmony-default-unsigned.app \
+  -outFile build/outputs/default/harmony-default-signed.app \
+  -signAlg SHA256withECDSA \
+  -mode localSign
+```
+
+> **注意**：签名证书和密钥文件位于 `signing/` 目录（已 gitignore），`hap-sign-tool.jar` 位于 DevEco Studio SDK 目录中。
+
+### HAP 打包（模拟器）
+
+- DevEco Studio Build → Build Hap(s)/APP(s)
+- 签名配置在 `build-profile.json5` 中
+- `libphantom_harmony.so` 放入 `rawfile/`，DevEco 自动打包
 
 ## 测试
 
@@ -221,7 +295,23 @@ cargo test -p phantom-client
 
 ## 安装与部署
 
-### HDC 命令行
+### HDC 命令行（真机）
+
+```bash
+# 安装签名 APP
+hdc install client/harmony/build/outputs/default/harmony-default-signed.app
+
+# 卸载
+hdc uninstall com.phantom.harmony
+
+# 启动应用
+hdc shell am start -a ohos.want.action.home -b com.phantom.harmony -m EntryAbility
+
+# 查看日志
+hdc hilog | grep -i phantom
+```
+
+### HDC 命令行（模拟器）
 
 ```bash
 # 查看可用 AVD
@@ -231,13 +321,13 @@ cargo test -p phantom-client
 /Applications/DevEco-Studio.app/Contents/tools/emulator/emulator -avd <avd_name>
 
 # 安装 HAP
-~/Library/Huawei/Sdk/hmscore/TOOLCHAIN/bin/hdc app install entry/build/default/outputs/default/entry-default-signed.hap
+hdc app install entry/build/default/outputs/default/entry-default-signed.hap
 
 # 启动应用
-~/Library/Huawei/Sdk/hmscore/TOOLCHAIN/bin/hdc shell am start -a ohos.want.action.home -b com.phantom.harmony -m EntryAbility
+hdc shell am start -a ohos.want.action.home -b com.phantom.harmony -m EntryAbility
 
 # 查看日志
-~/Library/Huawei/Sdk/hmscore/TOOLCHAIN/bin/hdc hilog | grep -i phantom
+hdc hilog | grep -i phantom
 ```
 
 ### DevEco Studio
@@ -245,10 +335,40 @@ cargo test -p phantom-client
 1. 打开项目 → 选择设备 → Run
 2. 自动安装 + 启动
 
+## 项目目录结构
+
+```
+client/harmony/
+├── AppScope/                        # 应用级资源
+│   ├── app.json5                    # 应用配置
+│   └── resources/base/media/        # 应用图标
+│       └── app_icon.png
+├── entry/                           # 主模块
+│   ├── src/main/
+│   │   ├── ets/                     # ArkTS 源码
+│   │   │   ├── pages/Index.ets      # 主界面
+│   │   │   ├── entryability/        # 应用入口
+│   │   │   └── vpnextability/       # VPN 扩展能力
+│   │   ├── libs/arm64-v8a/          # Rust NAPI .so（真机，gitignore）
+│   │   │   └── libphantom_harmony.so
+│   │   └── resources/               # 资源文件
+│   │       ├── base/media/          # 图标
+│   │       └── rawfile/             # NAPI .so（模拟器，gitignore）
+│   ├── build-profile.json5         # 模块构建配置
+│   └── oh-package.json5             # 模块依赖
+├── rust/                            # Rust NAPI 源码
+│   └── src/lib.rs                   # #[napi] 宏桥接
+├── signing/                         # 签名证书（gitignore）
+├── build-profile.json5              # 项目构建配置
+├── oh-package.json5                 # 项目依赖
+├── hvigor/                          # hvigor 构建配置
+└── Cargo.toml                       # Rust crate 配置
+```
+
 ## TODO
 
-- [ ] 真机签名验证（HarmonyOS NEXT 开发者签名）
 - [ ] VpnExtensionAbility TUN 创建与 fd 传递实现
+- [ ] 将签名流程集成到 cargo xtask build harmony
 - [ ] 电量测试（长时间运行功耗数据采集）
 - [ ] NAPI 事件通道优化（替代轮询）
 - [ ] CI 自动化构建

@@ -7,7 +7,9 @@ Cargo.lock
 *.pub
 *.pem
 *.crt
+*.cer
 *.p12
+*.p7b
 *.keystore
 *.jks
 
@@ -41,12 +43,6 @@ client/android/.cxx/
 
 # === macOS Client ===
 client/mac/.build/
-client/mac/Phantom.app/
-client/mac/PhantomLibs/*.dylib
-client/mac/dist/
-client/mac/Icon.iconset/
-client/mac/Icon.icns
-client/mac/AppIcon.png
 client/mac/Package.resolved
 *.xcodeproj
 *.xcworkspace
@@ -54,8 +50,13 @@ client/mac/Package.resolved
 # === HarmonyOS ===
 client/harmony/build/
 client/harmony/.preview/
+client/harmony/.hvigor/
+client/harmony/oh_modules/
+client/harmony/signing/
 client/harmony/entry/build/
+client/harmony/entry/src/main/libs/
 client/harmony/rust/target/
+client/harmony/.codegenie/
 
 # === Test / Bench ===
 /tests/target

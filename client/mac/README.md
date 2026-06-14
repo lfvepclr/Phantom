@@ -190,7 +190,17 @@ graph LR
 
 ## 构建
 
-### 一键脚本（推荐）
+### 统一构建系统（推荐）
+
+```bash
+# 从项目根目录
+cargo xtask build mac           # release 构建
+cargo xtask build mac --debug   # debug 构建
+```
+
+`cargo xtask` 会自动检查依赖、调用 `scripts/build-mac.sh` 脚本。
+
+### 一键脚本
 
 ```bash
 cd <repo-root>
@@ -200,9 +210,26 @@ scripts/build-mac.sh --debug      # debug 构建
 
 脚本会：
 1. `cargo build -p phantom-client --lib` → Rust cdylib
-2. 复制 dylib → `client/mac/PhantomLibs/`
+2. 复制 dylib → `client/mac/.build/lib/`
 3. `xcrun swift build -c release` → SPM 编译 Swift
 4. `xcrun swift run PhantomMacBuilder` → 打包 `Phantom.app` + `dist/Phantom.dmg`
+
+### 构建产物
+
+所有构建产物统一存放在 `client/mac/.build/` 目录下：
+
+```
+client/mac/.build/
+├── icon/                    # 应用图标
+│   ├── Icon.iconset/        # macOS 图标集
+│   └── Icon.icns            # 编译后 .icns
+├── lib/                     # Rust cdylib
+│   └── libphantom_client.dylib
+├── Phantom.app/             # macOS 应用包
+├── dist/                    # 分发产物
+│   └── Phantom.dmg          # DMG 安装镜像
+└── arm64-apple-macosx/      # SPM 构建缓存
+```
 
 ### 手动分步构建
 
@@ -211,14 +238,14 @@ scripts/build-mac.sh --debug      # debug 构建
 cargo build --release -p phantom-client --lib
 
 # 2. 复制 dylib
-mkdir -p client/mac/PhantomLibs
-cp target/release/libphantom_client.dylib client/mac/PhantomLibs/
+mkdir -p client/mac/.build/lib
+cp target/release/libphantom_client.dylib client/mac/.build/lib/
 
 # 3. SPM 编译
 cd client/mac
 xcrun swift build -c release
 
-# 4. 打包 .app
+# 4. 打包 .app + .dmg
 xcrun swift run -c release PhantomMacBuilder
 ```
 
@@ -233,11 +260,15 @@ xcrun swift build -c release
 ### 重新生成图标
 
 ```bash
+# 方式一：统一构建系统（推荐）
+cargo xtask icons              # 生成所有平台图标
+
+# 方式二：手动 sips
+# 覆盖 appicon.png (1024×1024) 后：
 cd client/mac
-# 覆盖 AppIcon.png (1024×1024) 后：
-sips -z 1024 1024 AppIcon.png --out Icon.iconset/icon_512x512@2x.png
+sips -z 1024 1024 ../../appicon.png --out .build/icon/Icon.iconset/icon_512x512@2x.png
 # ... 其他尺寸
-iconutil -c icns Icon.iconset -o Icon.icns
+iconutil -c icns .build/icon/Icon.iconset -o .build/icon/Icon.icns
 scripts/build-mac.sh
 ```
 
@@ -259,8 +290,8 @@ scripts/build-mac.sh
 
 ## 打包与签名
 
-- **.app 打包**：`PhantomMacBuilder`（仿 mytime DMGBuilderExec 模式）
-- **DMG 打包**：同上，`dist/Phantom.dmg`
+- **.app 打包**：`PhantomMacBuilder`（SPM executable target，自动组装 .app bundle）
+- **DMG 打包**：同上，`.build/dist/Phantom.dmg`
 - **Ad-hoc 签名**：`codesign --entitlements Phantom.entitlements --force --sign - Phantom.app`
 - **开发者签名**：需 Apple Developer ID + `productsign`
 - **Entitlements**：`Phantom.entitlements` 包含 `com.apple.vm.networking` (TUN 需要) / `com.apple.security.network.client` / `com.apple.security.network.server`
@@ -272,7 +303,7 @@ scripts/build-mac.sh
 cargo test -p phantom-client
 
 # 手动验证
-sudo open client/mac/Phantom.app
+sudo open client/mac/.build/Phantom.app
 # 菜单栏出现图标 → 输入 URI → 选模式 → Start
 # 验证 Hello 探测成功 → 显示 "Connected"
 ```
@@ -281,14 +312,45 @@ sudo open client/mac/Phantom.app
 
 ```bash
 # TUN 需要 root：
-sudo open client/mac/Phantom.app
+sudo open client/mac/.build/Phantom.app
 
 # 或复制到 /Applications
-sudo cp -r client/mac/Phantom.app /Applications/
+sudo cp -r client/mac/.build/Phantom.app /Applications/
 sudo open /Applications/Phantom.app
 
 # 清除 Gatekeeper 隔离
 xattr -dr com.apple.quarantine /Applications/Phantom.app
+
+# 或通过 DMG 安装
+open client/mac/.build/dist/Phantom.dmg
+# 然后 drag Phantom.app into /Applications
+```
+
+## 项目目录结构
+
+```
+client/mac/
+├── .build/                          # 构建产物（gitignore）
+│   ├── icon/                        # 应用图标
+│   │   ├── Icon.iconset/            # macOS 图标集（10 个尺寸）
+│   │   └── Icon.icns                # .icns 图标文件
+│   ├── lib/                         # Rust cdylib
+│   │   └── libphantom_client.dylib
+│   ├── Phantom.app/                 # 打包后的应用
+│   └── dist/                        # 分发产物
+│       └── Phantom.dmg
+├── Sources/
+│   ├── PhantomMac/                  # SwiftUI 主程序
+│   │   ├── PhantomMacApp.swift      # 入口 + MenuBarExtra
+│   │   ├── PhantomTunnel.swift      # 隧道状态管理
+│   │   ├── Bridge.swift             # C FFI 声明
+│   │   └── SystemProxy.swift        # 系统代理开关
+│   └── PhantomMacBuilder/           # .app/.dmg 打包工具
+│       └── main.swift
+├── Package.swift                     # SPM 配置
+├── Info.plist                        # .plist 模板
+├── Phantom.entitlements             # 权限声明
+└── README.md
 ```
 
 ## TODO

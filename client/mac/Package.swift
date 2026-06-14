@@ -32,7 +32,7 @@ let package = Package(
                 // rpath lets the bundled .app/Contents/MacOS/PhantomMac find its
                 // dylib at runtime via Frameworks/, regardless of launch context.
                 .unsafeFlags([
-                    "-L", "PhantomLibs",
+                    "-L", ".build/lib",
                     "-l", "phantom_client",
                     "-Xlinker", "-rpath",
                     "-Xlinker", "@executable_path/../Frameworks",

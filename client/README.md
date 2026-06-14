@@ -272,12 +272,35 @@ graph LR
 
 ## 构建
 
+### 统一构建系统（推荐）
+
+项目使用 `cargo xtask` 作为统一构建编排器，自动检查依赖并构建：
+
+```bash
+# 构建所有可用目标
+cargo xtask build
+
+# 构建指定目标
+cargo xtask build server          # 服务端
+cargo xtask build cli             # CLI 客户端
+cargo xtask build mac            # macOS 客户端
+cargo xtask build android        # Android 客户端
+cargo xtask build harmony        # HarmonyOS 客户端
+
+# 其他命令
+cargo xtask check-deps           # 检查依赖状态（自动安装可安装的）
+cargo xtask icons                # 重新生成所有平台图标
+cargo xtask clean                # 清理所有构建产物
+```
+
 ### 依赖
 
 - Rust toolchain >= 1.85, edition 2024
-- Android: NDK + `cargo-ndk` + `aarch64-linux-android` target
-- HarmonyOS: DevEco Studio NEXT + `ohos-rs` 工具链
 - macOS: Xcode Command Line Tools
+- Android: NDK + `aarch64-linux-android` target
+- HarmonyOS: DevEco Studio NEXT + `aarch64-unknown-linux-ohos` target
+
+运行 `cargo xtask check-deps` 查看依赖状态，可自动安装 Rust targets。
 
 ### 构建 Rust 共享库
 
@@ -291,7 +314,7 @@ export ANDROID_NDK_HOME=$HOME/Library/Android/sdk/ndk/26.1.10909125
 cargo build --release -p phantom-client --lib --target aarch64-linux-android
 
 # HarmonyOS
-cargo build --release -p phantom-harmony
+cargo build --release -p phantom-harmony --target aarch64-unknown-linux-ohos
 ```
 
 ### 一键脚本
@@ -323,6 +346,7 @@ cargo test --workspace --test rule_engine
 
 各平台的安装方式见对应子目录 README：
 
+- **CLI 客户端**：`cargo xtask build cli` 或 `cargo build --release -p phantom-cli`，二进制 `target/release/phantom`
 - [client/android/README.md](android/README.md) — APK 安装、Gradle 构建
 - [client/harmony/README.md](harmony/README.md) — HAP 安装、HDC 部署
 - [client/mac/README.md](mac/README.md) — .app / DMG 打包签名

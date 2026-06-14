@@ -1,20 +1,18 @@
-# SPM build output
+# SPM build output + all custom build artifacts
 .build/
 Package.resolved
 
 # Cargo output copied here by scripts/build-mac.sh
-PhantomLibs/*.dylib
+# (now lives inside .build/lib/)
 
-# Final .app bundle
-Phantom.app/
-
-# DMG distributable + dist staging
-dist/
+# DMG distributable
+# (now lives inside .build/dist/)
 
 # Icon generation intermediates
-Icon.iconset/
-Icon.icns
-AppIcon.png
+# (now lives inside .build/icon/)
+
+# Final .app bundle
+# (now lives inside .build/Phantom.app/)
 
 # Xcode artifacts
 *.xcodeproj
