@@ -6,13 +6,20 @@ Package.resolved
 PhantomLibs/*.dylib
 
 # Final .app bundle
-Phantom.app
+Phantom.app/
 
 # DMG distributable + dist staging
 dist/
 
-# Xcode artifacts (in case anyone uses Xcode later)
+# Icon generation intermediates
+Icon.iconset/
+Icon.icns
+AppIcon.png
+
+# Xcode artifacts
 *.xcodeproj
+*.xcworkspace
 
 # macOS metadata
 .DS_Store
+._*

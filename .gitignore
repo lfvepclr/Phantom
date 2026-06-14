@@ -1,4 +1,62 @@
+# === Rust ===
 /target
-/Cargo.lock
+Cargo.lock
+
+# === Secrets / Keys ===
 *.key
 *.pub
+*.pem
+*.crt
+*.p12
+*.keystore
+*.jks
+
+# === macOS ===
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+
+# === IDE / Editor ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# === Build artifacts (root level) ===
+test_lock
+server.toml
+
+# === Android ===
+client/android/.gradle/
+client/android/build/
+client/android/app/build/
+client/android/app/src/main/jniLibs/
+client/android/app/src/main/gen/
+client/android/local.properties
+client/android/.cxx/
+*.apk
+*.aab
+
+# === macOS Client ===
+client/mac/.build/
+client/mac/Phantom.app/
+client/mac/PhantomLibs/*.dylib
+client/mac/dist/
+client/mac/Icon.iconset/
+client/mac/Icon.icns
+client/mac/AppIcon.png
+client/mac/Package.resolved
+*.xcodeproj
+*.xcworkspace
+
+# === HarmonyOS ===
+client/harmony/build/
+client/harmony/.preview/
+client/harmony/entry/build/
+client/harmony/rust/target/
+
+# === Test / Bench ===
+/tests/target
+/tests/bench/target
