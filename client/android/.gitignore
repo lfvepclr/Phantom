@@ -1,0 +1,27 @@
+# Gradle
+.gradle/
+build/
+app/build/
+
+# Native libs (built by cross-compile, copied here)
+app/src/main/jniLibs/
+
+# Generated sources
+app/src/main/gen/
+
+# Local config
+local.properties
+
+# NDK / Cargo-ndk
+.cxx/
+
+# Android Studio
+.idea/
+*.iml
+
+# APK / AAB
+*.apk
+*.aab
+
+# macOS
+.DS_Store

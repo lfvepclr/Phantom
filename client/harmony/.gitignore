@@ -1,0 +1,10 @@
+# HarmonyOS build
+build/
+.preview/
+entry/build/
+
+# Rust cross-compile output
+rust/target/
+
+# macOS
+.DS_Store
