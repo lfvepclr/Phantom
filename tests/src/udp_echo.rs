@@ -11,7 +11,7 @@ impl UdpEchoServer {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = socket.local_addr().unwrap();
         let (tx, rx) = tokio::sync::oneshot::channel();
-        
+
         tokio::spawn(async move {
             let mut buf = vec![0u8; 65535];
             let mut rx = rx;
@@ -28,7 +28,10 @@ impl UdpEchoServer {
             }
         });
 
-        Self { addr, shutdown: Some(tx) }
+        Self {
+            addr,
+            shutdown: Some(tx),
+        }
     }
 }
 

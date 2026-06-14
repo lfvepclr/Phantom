@@ -122,7 +122,11 @@ impl DnsProxy {
         let socket = UdpSocket::bind(bind_addr)
             .await
             .map_err(|e| PhantomError::Io(e))?;
-        tracing::info!("DNS proxy bound to {}, upstream = {}", socket.local_addr()?, upstream_addr);
+        tracing::info!(
+            "DNS proxy bound to {}, upstream = {}",
+            socket.local_addr()?,
+            upstream_addr
+        );
         Ok(Self {
             socket: Arc::new(socket),
             upstream: upstream_addr,
@@ -288,7 +292,12 @@ pub fn extract_a_records(buf: &[u8]) -> Vec<Ipv4Addr> {
         let rdlength = u16::from_be_bytes([buf[offset + 8], buf[offset + 9]]) as usize;
         offset += 10;
         if rtype == 1 && rclass == 1 && rdlength == 4 && offset + 4 <= buf.len() {
-            let ip = Ipv4Addr::new(buf[offset], buf[offset + 1], buf[offset + 2], buf[offset + 3]);
+            let ip = Ipv4Addr::new(
+                buf[offset],
+                buf[offset + 1],
+                buf[offset + 2],
+                buf[offset + 3],
+            );
             ips.push(ip);
         }
         offset += rdlength;
@@ -303,23 +312,28 @@ pub fn extract_a_records(buf: &[u8]) -> Vec<Ipv4Addr> {
 
 /// Build a raw IPv4/UDP packet containing `payload` destined back to the
 /// original querier.  `payload` should be the raw DNS response bytes.
-pub fn build_dns_response_packet(
-    payload: &[u8],
-    ctx: &DnsQueryContext,
-) -> Result<Vec<u8>> {
+pub fn build_dns_response_packet(payload: &[u8], ctx: &DnsQueryContext) -> Result<Vec<u8>> {
     use etherparse::PacketBuilder;
 
     let src_ip = match ctx.dst_ip {
         IpAddr::V4(v4) => v4,
-        _ => return Err(PhantomError::Protocol("IPv6 DNS not yet supported".to_string())),
+        _ => {
+            return Err(PhantomError::Protocol(
+                "IPv6 DNS not yet supported".to_string(),
+            ));
+        }
     };
     let dst_ip = match ctx.src_ip {
         IpAddr::V4(v4) => v4,
-        _ => return Err(PhantomError::Protocol("IPv6 DNS not yet supported".to_string())),
+        _ => {
+            return Err(PhantomError::Protocol(
+                "IPv6 DNS not yet supported".to_string(),
+            ));
+        }
     };
 
-    let builder = PacketBuilder::ipv4(src_ip.octets(), dst_ip.octets(), 64)
-        .udp(ctx.dst_port, ctx.src_port);
+    let builder =
+        PacketBuilder::ipv4(src_ip.octets(), dst_ip.octets(), 64).udp(ctx.dst_port, ctx.src_port);
 
     let mut pkt = Vec::with_capacity(20 + 8 + payload.len());
     builder

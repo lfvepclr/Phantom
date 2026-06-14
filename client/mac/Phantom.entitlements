@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Allow loading dylibs signed with a different Team ID.
+         Required for hardened runtime + ad-hoc signing because
+         the Rust cdylib and the Swift binary each get their own
+         unique ad-hoc Team ID; without this entitlement dyld
+         refuses to load the dylib ("different Team IDs"). -->
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
+</plist>

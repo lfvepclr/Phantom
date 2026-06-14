@@ -1,17 +1,17 @@
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::BytesMut;
-use phantom_core::constants::MAX_FRAME_PAYLOAD;
 use phantom_core::CipherPreference;
-use phantom_core::{ClientConfig, PhantomError, Result, ServerEntry};
+use phantom_core::TransportProtocol;
+use phantom_core::constants::MAX_FRAME_PAYLOAD;
 use phantom_core::crypto::cipher::CipherSuite;
 use phantom_core::crypto::session::CipherOffer;
-use phantom_core::crypto::{split_after_handshake, NoiseInitiator};
+use phantom_core::crypto::{NoiseInitiator, split_after_handshake};
 use phantom_core::protocol::codec::{FrameReader, FrameWriter};
 use phantom_core::protocol::frame::FrameFlags;
 use phantom_core::protocol::{Frame, TargetAddr};
-use phantom_core::TransportProtocol;
-use phantom_core::transport::tcp::TcpTransport;
 use phantom_core::transport::Transport;
+use phantom_core::transport::tcp::TcpTransport;
+use phantom_core::{ClientConfig, PhantomError, Result, ServerEntry};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -38,11 +38,24 @@ pub async fn handle_socks5_connection(
     match server.protocol {
         TransportProtocol::Tcp => {
             let transport = TcpTransport::new(std::time::Duration::from_secs(10));
-            match establish_tunnel(&transport, server, &local_secret, &target, config.client.cipher).await {
+            match establish_tunnel(
+                &transport,
+                server,
+                &local_secret,
+                &target,
+                config.client.cipher,
+            )
+            .await
+            {
                 Ok((frame_reader, frame_writer, stream_id)) => {
-                    tracing::info!("Tunnel established → {} (cipher={:?})", target, config.client.cipher);
+                    tracing::info!(
+                        "Tunnel established → {} (cipher={:?})",
+                        target,
+                        config.client.cipher
+                    );
                     send_reply(&mut socks5, 0x00).await?;
-                    relay_socks5_tunnel(socks5, frame_reader, frame_writer, stream_id, &target).await
+                    relay_socks5_tunnel(socks5, frame_reader, frame_writer, stream_id, &target)
+                        .await
                 }
                 Err(e) => {
                     tracing::info!("Tunnel failed → {}: {}", target, e);
@@ -57,11 +70,24 @@ pub async fn handle_socks5_connection(
                 std::time::Duration::from_secs(10),
                 &server_name,
             );
-            match establish_tunnel(&transport, server, &local_secret, &target, config.client.cipher).await {
+            match establish_tunnel(
+                &transport,
+                server,
+                &local_secret,
+                &target,
+                config.client.cipher,
+            )
+            .await
+            {
                 Ok((frame_reader, frame_writer, stream_id)) => {
-                    tracing::info!("Tunnel established → {} (cipher={:?})", target, config.client.cipher);
+                    tracing::info!(
+                        "Tunnel established → {} (cipher={:?})",
+                        target,
+                        config.client.cipher
+                    );
                     send_reply(&mut socks5, 0x00).await?;
-                    relay_socks5_tunnel(socks5, frame_reader, frame_writer, stream_id, &target).await
+                    relay_socks5_tunnel(socks5, frame_reader, frame_writer, stream_id, &target)
+                        .await
                 }
                 Err(e) => {
                     tracing::info!("Tunnel failed → {}: {}", target, e);
@@ -135,30 +161,51 @@ async fn read_request(stream: &mut TcpStream) -> Result<TargetAddr> {
     let target = match atyp {
         0x01 => {
             let mut addr = [0u8; 4];
-            stream.read_exact(&mut addr).await.map_err(PhantomError::Io)?;
+            stream
+                .read_exact(&mut addr)
+                .await
+                .map_err(PhantomError::Io)?;
             let mut port_buf = [0u8; 2];
-            stream.read_exact(&mut port_buf).await.map_err(PhantomError::Io)?;
+            stream
+                .read_exact(&mut port_buf)
+                .await
+                .map_err(PhantomError::Io)?;
             let port = u16::from_be_bytes(port_buf);
             TargetAddr::IPv4(addr, port)
         }
         0x03 => {
             let mut len_buf = [0u8; 1];
-            stream.read_exact(&mut len_buf).await.map_err(PhantomError::Io)?;
+            stream
+                .read_exact(&mut len_buf)
+                .await
+                .map_err(PhantomError::Io)?;
             let domain_len = len_buf[0] as usize;
             let mut domain = vec![0u8; domain_len];
-            stream.read_exact(&mut domain).await.map_err(PhantomError::Io)?;
+            stream
+                .read_exact(&mut domain)
+                .await
+                .map_err(PhantomError::Io)?;
             let domain_str = String::from_utf8(domain)
                 .map_err(|e| PhantomError::Protocol(format!("Invalid domain: {}", e)))?;
             let mut port_buf = [0u8; 2];
-            stream.read_exact(&mut port_buf).await.map_err(PhantomError::Io)?;
+            stream
+                .read_exact(&mut port_buf)
+                .await
+                .map_err(PhantomError::Io)?;
             let port = u16::from_be_bytes(port_buf);
             TargetAddr::Domain(domain_str, port)
         }
         0x04 => {
             let mut addr = [0u8; 16];
-            stream.read_exact(&mut addr).await.map_err(PhantomError::Io)?;
+            stream
+                .read_exact(&mut addr)
+                .await
+                .map_err(PhantomError::Io)?;
             let mut port_buf = [0u8; 2];
-            stream.read_exact(&mut port_buf).await.map_err(PhantomError::Io)?;
+            stream
+                .read_exact(&mut port_buf)
+                .await
+                .map_err(PhantomError::Io)?;
             let port = u16::from_be_bytes(port_buf);
             TargetAddr::IPv6(addr, port)
         }
@@ -186,7 +233,7 @@ async fn send_reply(stream: &mut TcpStream, reply: u8) -> Result<()> {
     Ok(())
 }
 
-fn resolve_offer(cipher_preference: CipherPreference) -> CipherOffer {
+pub(crate) fn resolve_offer(cipher_preference: CipherPreference) -> CipherOffer {
     match cipher_preference {
         CipherPreference::Auto => CipherOffer::default_offer(),
         CipherPreference::Aes256Gcm => CipherOffer::new(vec![CipherSuite::Aes256Gcm]),
@@ -310,8 +357,7 @@ where
                     .write_all(&frame.payload)
                     .await
                     .map_err(PhantomError::Io)?;
-            } else if frame.flags.contains(FrameFlags::FIN)
-                || frame.flags.contains(FrameFlags::RST)
+            } else if frame.flags.contains(FrameFlags::FIN) || frame.flags.contains(FrameFlags::RST)
             {
                 break;
             }

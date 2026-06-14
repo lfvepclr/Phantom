@@ -2,7 +2,7 @@ use crate::{PhantomError, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::crypto::cipher::CipherSuite;
-use crate::crypto::session::{negotiate, CipherAccept, CipherOffer};
+use crate::crypto::session::{CipherAccept, CipherOffer, negotiate};
 
 const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
 
@@ -244,7 +244,10 @@ mod tests {
 
         let server_handle = tokio::spawn(async move {
             let responder = NoiseResponder::new(&server_secret);
-            responder.handshake(server_stream, &supported).await.unwrap()
+            responder
+                .handshake(server_stream, &supported)
+                .await
+                .unwrap()
         });
 
         let client_handle = tokio::spawn(async move {
@@ -252,10 +255,8 @@ mod tests {
             initiator.handshake(client_stream, &offer).await.unwrap()
         });
 
-        let (server_result, client_result) = (
-            server_handle.await.unwrap(),
-            client_handle.await.unwrap(),
-        );
+        let (server_result, client_result) =
+            (server_handle.await.unwrap(), client_handle.await.unwrap());
 
         // Verify cipher negotiation succeeded
         assert_eq!(server_result.chosen_cipher, client_result.chosen_cipher);

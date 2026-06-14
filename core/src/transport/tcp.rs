@@ -1,5 +1,5 @@
-use async_trait::async_trait;
 use crate::{PhantomError, Result};
+use async_trait::async_trait;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpStream;
@@ -66,10 +66,7 @@ impl TransportListener for TcpListener {
     type Stream = TcpStream;
 
     async fn accept(&self) -> Result<(Self::Stream, SocketAddr)> {
-        self.inner
-            .accept()
-            .await
-            .map_err(PhantomError::Io)
+        self.inner.accept().await.map_err(PhantomError::Io)
     }
 
     fn local_addr(&self) -> Result<SocketAddr> {
@@ -92,9 +89,7 @@ pub async fn try_bind_tcp_with_fallback(
         let addr = SocketAddr::new(ip, port);
         match TcpListener::bind(&addr).await {
             Ok(listener) => return Ok((listener, addr)),
-            Err(PhantomError::Io(io_err))
-                if io_err.kind() == std::io::ErrorKind::AddrInUse =>
-            {
+            Err(PhantomError::Io(io_err)) if io_err.kind() == std::io::ErrorKind::AddrInUse => {
                 last_err = Some(io_err);
             }
             Err(e) => return Err(e),

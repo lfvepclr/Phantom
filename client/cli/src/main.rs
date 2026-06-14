@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use phantom_core::{parse_phantom_uri, ClientConfig, CipherPreference, TransportProtocol};
-use phantom_server::bootstrap::{run_auto, run_interactive, AutoOptions};
+use phantom_core::{CipherPreference, ClientConfig, TransportProtocol, parse_phantom_uri};
+use phantom_server::bootstrap::{AutoOptions, run_auto, run_interactive};
 
 #[derive(Parser)]
 #[command(name = "phantom", version, about = "Phantom proxy tool (幽灵)")]
@@ -64,7 +64,9 @@ async fn main() -> Result<()> {
                 config.servers = vec![entry];
             }
             if config.servers.is_empty() {
-                return Err(anyhow::anyhow!("No servers configured. Use --server or provide a client.toml with [[servers]]"));
+                return Err(anyhow::anyhow!(
+                    "No servers configured. Use --server or provide a client.toml with [[servers]]"
+                ));
             }
             init_tracing("info");
             let client = phantom_client::PhantomClient::new(config)?;
@@ -133,7 +135,5 @@ async fn main() -> Result<()> {
 }
 
 fn init_tracing(level: &str) {
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(level)
-        .try_init();
+    let _ = tracing_subscriber::fmt().with_env_filter(level).try_init();
 }

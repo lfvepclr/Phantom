@@ -1,11 +1,13 @@
 use phantom_core::CipherPreference;
+use phantom_core::protocol::TargetAddr;
+use phantom_core::transport::TransportListener;
 use phantom_e2e::echo::start_http_echo_server;
 use phantom_e2e::socks5::connect_tunnel;
 use phantom_e2e::throughput::echo_data;
-use phantom_core::protocol::TargetAddr;
-use phantom_core::transport::TransportListener;
 
-async fn setup_http_tunnel(fixture: &HttpTestFixture) -> anyhow::Result<(
+async fn setup_http_tunnel(
+    fixture: &HttpTestFixture,
+) -> anyhow::Result<(
     phantom_core::protocol::FrameReader<tokio::io::ReadHalf<tokio::net::TcpStream>>,
     phantom_core::protocol::FrameWriter<tokio::io::WriteHalf<tokio::net::TcpStream>>,
     u32,
@@ -37,15 +39,18 @@ struct HttpTestFixture {
 
 impl HttpTestFixture {
     pub async fn new(cipher: CipherPreference) -> Self {
-        let server_key = phantom_core::crypto::KeyPair::generate().expect("Failed to generate server key");
-        let client_key = phantom_core::crypto::KeyPair::generate().expect("Failed to generate client key");
+        let server_key =
+            phantom_core::crypto::KeyPair::generate().expect("Failed to generate server key");
+        let client_key =
+            phantom_core::crypto::KeyPair::generate().expect("Failed to generate client key");
 
         let http_server = start_http_echo_server().await;
         let http_addr = http_server.addr;
 
-        let server_listener = phantom_core::transport::tcp::TcpListener::bind(&"127.0.0.1:0".parse().unwrap())
-            .await
-            .expect("Failed to bind phantom server");
+        let server_listener =
+            phantom_core::transport::tcp::TcpListener::bind(&"127.0.0.1:0".parse().unwrap())
+                .await
+                .expect("Failed to bind phantom server");
         let server_addr = server_listener.local_addr().unwrap();
         let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let server_secret = server_key.secret;
@@ -59,7 +64,7 @@ impl HttpTestFixture {
                                 let sk = server_secret;
                                 let cp = cipher;
                                 tokio::spawn(async move {
-                                    phantom_server::handler::handle_connection(stream, sk, &[], cp).await;
+                                    phantom_server::handler::handle_connection(stream, sk, &[], cp, None).await;
                                 });
                             }
                             Err(e) => { tracing::error!("Server accept error: {}", e); }
@@ -137,9 +142,15 @@ async fn http_delay_through_tunnel() {
     // Send request without FIN — let the HTTP server close the connection after responding.
     let mut offset = 0;
     while offset < data.len() {
-        let end = std::cmp::min(offset + phantom_core::constants::MAX_FRAME_PAYLOAD, data.len());
+        let end = std::cmp::min(
+            offset + phantom_core::constants::MAX_FRAME_PAYLOAD,
+            data.len(),
+        );
         let chunk = Bytes::copy_from_slice(&data[offset..end]);
-        writer.write_frame(&Frame::data(stream_id, chunk)).await.unwrap();
+        writer
+            .write_frame(&Frame::data(stream_id, chunk))
+            .await
+            .unwrap();
         offset = end;
     }
     writer.flush().await.unwrap();

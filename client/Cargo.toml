@@ -11,6 +11,7 @@ crate-type = ["rlib", "cdylib"]
 phantom-core = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
 anyhow = { workspace = true }
 base64 = { workspace = true }
 bytes = { workspace = true }
@@ -24,7 +25,14 @@ regex = { version = "1.10", default-features = false, features = ["std", "unicod
 maxminddb = { version = "0.24", optional = true }
 daachorse = "1"
 iptrie = "0.8"
+serde_json = { workspace = true }
 
 [features]
 default = []
 geoip = ["maxminddb"]
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+
+[target.'cfg(any(target_os = "android", target_env = "ohos"))'.dependencies]
+libc = "0.2.186"

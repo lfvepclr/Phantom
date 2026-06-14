@@ -10,15 +10,15 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::{Bytes, BytesMut};
 use etherparse::IpNumber;
-use phantom_core::{PhantomError, ProxyMode, Result, RuleAction, ServerEntry, CipherPreference};
-use phantom_core::crypto::{NoiseInitiator, split_after_handshake};
-use phantom_core::crypto::session::CipherOffer;
 use phantom_core::crypto::cipher::CipherSuite;
+use phantom_core::crypto::session::CipherOffer;
+use phantom_core::crypto::{NoiseInitiator, split_after_handshake};
 use phantom_core::protocol::codec::{FrameReader, FrameWriter};
 use phantom_core::protocol::frame::FrameFlags;
 use phantom_core::protocol::{Frame, TargetAddr};
-use phantom_core::transport::tcp::TcpTransport;
 use phantom_core::transport::Transport;
+use phantom_core::transport::tcp::TcpTransport;
+use phantom_core::{CipherPreference, PhantomError, ProxyMode, Result, RuleAction, ServerEntry};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -27,7 +27,7 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 
 use crate::dns::{
-    build_dns_response_packet, DnsCache, DnsProxy, DnsQueryContext, extract_a_records,
+    DnsCache, DnsProxy, DnsQueryContext, build_dns_response_packet, extract_a_records,
     extract_query_domain,
 };
 use crate::rules::RuleEngine;
@@ -38,29 +38,29 @@ const TUN_MTU: usize = 1500;
 /// A TUN device wrapper that works on both macOS (self-created) and Android
 /// (fd passed from VpnService).
 pub struct TunDevice {
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_env = "ohos")))]
     inner: tun::AsyncDevice,
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
     inner: AsyncFd<FdWrapper>,
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 use tokio::io::unix::AsyncFd;
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 #[derive(Debug)]
 struct FdWrapper(OwnedFd);
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 impl AsRawFd for FdWrapper {
     fn as_raw_fd(&self) -> RawFd {
         self.0.as_raw_fd()
     }
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_env = "ohos")))]
 impl TunDevice {
     pub fn create() -> Result<Self> {
         let mut config = tun::Configuration::default();
@@ -77,35 +77,63 @@ impl TunDevice {
     }
 }
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 impl TunDevice {
+    /// Wrap a raw TUN file descriptor (passed from the OS / VpnService) into a
+    /// [TunDevice].
+    ///
+    /// The function first validates that `fd` is open via `fcntl(F_GETFD)`
+    /// before taking ownership, so calling it with a stale or closed fd returns
+    /// an error rather than undefined behavior.
     pub fn from_fd(fd: RawFd) -> Result<Self> {
+        // Validate the fd is open before taking ownership.
+        // SAFETY: `fd` is assumed to be a valid raw fd at the call site; we
+        // only read its flags and do not take ownership yet.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD, 0) };
+        if flags < 0 {
+            return Err(PhantomError::Io(std::io::Error::last_os_error()));
+        }
+        // SAFETY: `fd` is validated above as an open file descriptor and
+        // ownership is transferred from the caller (Kotlin/ArkTS) into Rust.
         let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-        let async_fd = AsyncFd::new(FdWrapper(owned))
-            .map_err(PhantomError::Io)?;
+        let async_fd = AsyncFd::new(FdWrapper(owned)).map_err(PhantomError::Io)?;
         Ok(Self { inner: async_fd })
+    }
+}
+
+/// Host-only stub for `TunDevice::from_fd` so that the Android platform
+/// module (which HarmonyOS reuses) can be compiled on macOS/Linux for
+/// `cargo check` and other host-side validation.
+#[cfg(all(
+    target_family = "unix",
+    not(any(target_os = "android", target_env = "ohos"))
+))]
+impl TunDevice {
+    pub fn from_fd(_fd: std::os::unix::io::RawFd) -> Result<Self> {
+        Err(PhantomError::Config(
+            "TUN fd hand-off is only used on Android/HarmonyOS".to_string(),
+        ))
     }
 }
 
 impl TunDevice {
     /// Read a raw IP packet into `buf`.
     pub async fn read_packet(&mut self, buf: &mut BytesMut) -> Result<usize> {
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_env = "ohos")))]
         {
             buf.clear();
-            let n = self
-                .inner
-                .read_buf(buf)
-                .await
-                .map_err(PhantomError::Io)?;
+            let n = self.inner.read_buf(buf).await.map_err(PhantomError::Io)?;
             Ok(n)
         }
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
         {
             buf.clear();
             buf.resize(TUN_MTU, 0);
             loop {
                 let mut guard = self.inner.readable().await.map_err(PhantomError::Io)?;
+                // SAFETY: `buf` is a `BytesMut` resized to `TUN_MTU` bytes, and
+                // `read` is only allowed to write within its bounds.  The fd is
+                // registered with `AsyncFd` and confirmed readable above.
                 let n = unsafe {
                     libc::read(
                         guard.get_inner().as_raw_fd(),
@@ -129,19 +157,19 @@ impl TunDevice {
 
     /// Write a raw IP packet.
     pub async fn write_packet(&mut self, pkt: &[u8]) -> Result<()> {
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_env = "ohos")))]
         {
-            self.inner
-                .write_all(pkt)
-                .await
-                .map_err(PhantomError::Io)?;
+            self.inner.write_all(pkt).await.map_err(PhantomError::Io)?;
             Ok(())
         }
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_env = "ohos"))]
         {
             let mut offset = 0;
             while offset < pkt.len() {
                 let mut guard = self.inner.writable().await.map_err(PhantomError::Io)?;
+                // SAFETY: `pkt` outlives this call and `offset`/`len` are kept
+                // within bounds.  The fd is registered with `AsyncFd` and
+                // confirmed writable above.
                 let n = unsafe {
                     libc::write(
                         guard.get_inner().as_raw_fd(),
@@ -408,7 +436,9 @@ impl TunProxy {
                                     Ok(cfg) => {
                                         let mut hot = hot.lock().await;
                                         hot.proxy_mode = cfg.client.mode;
-                                        if let Ok(engine) = crate::rules::RuleEngine::from_config(&cfg.rules) {
+                                        if let Ok(engine) =
+                                            crate::rules::RuleEngine::from_config(&cfg.rules)
+                                        {
                                             hot.rule_engine = Some(Arc::new(engine));
                                             tracing::info!("Config reloaded: rules updated");
                                         } else {
@@ -660,7 +690,10 @@ impl TunProxy {
                 };
                 let socket = self.udp_flows.get_or_create(&key).await?;
                 let dst_sa = SocketAddr::new(dst_ip, dst_port);
-                socket.send_to(data, dst_sa).await.map_err(PhantomError::Io)?;
+                socket
+                    .send_to(data, dst_sa)
+                    .await
+                    .map_err(PhantomError::Io)?;
 
                 // Spawn receiver for this UDP flow if not already running.
                 let device = Arc::clone(&self.device);
@@ -675,17 +708,14 @@ impl TunProxy {
                                 break;
                             }
                         };
-                        let pkt = match build_udp_packet(
-                            dst_ip, dst_port,
-                            src_ip, src_port,
-                            &buf[..n],
-                        ) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                tracing::debug!("UDP packet build error: {}", e);
-                                continue;
-                            }
-                        };
+                        let pkt =
+                            match build_udp_packet(dst_ip, dst_port, src_ip, src_port, &buf[..n]) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    tracing::debug!("UDP packet build error: {}", e);
+                                    continue;
+                                }
+                            };
                         {
                             let mut dev = device.lock().await;
                             if let Err(e) = dev.write_packet(&pkt).await {
@@ -705,14 +735,21 @@ impl TunProxy {
                     dst_port,
                     proto: IpNumber::UDP.0,
                 };
-                if let Err(e) = self.spawn_udp_proxy_flow(&key, dst_ip, dst_port, data.to_vec()).await {
+                if let Err(e) = self
+                    .spawn_udp_proxy_flow(&key, dst_ip, dst_port, data.to_vec())
+                    .await
+                {
                     tracing::debug!("UDP proxy flow error: {}", e);
                 }
             }
             RuleAction::Reject => {
                 tracing::debug!(
                     "UDP {}:{} -> {}:{} ({} bytes) - rejected by rule",
-                    src_ip, src_port, dst_ip, dst_port, data.len()
+                    src_ip,
+                    src_port,
+                    dst_ip,
+                    dst_port,
+                    data.len()
                 );
             }
         }
@@ -809,16 +846,9 @@ impl TunProxy {
         let device = Arc::clone(&self.device);
         let flows = self.flows.clone();
         tokio::spawn(async move {
-            if let Err(e) = tcp_direct_relay_task(
-                rx_from_tun,
-                device,
-                flows,
-                key,
-                state,
-                dst_ip,
-                dst_port,
-            )
-            .await
+            if let Err(e) =
+                tcp_direct_relay_task(rx_from_tun, device, flows, key, state, dst_ip, dst_port)
+                    .await
             {
                 tracing::debug!("TCP direct relay task ended: {}", e);
             }
@@ -846,9 +876,11 @@ impl TunProxy {
         }
 
         // Need server info to establish a direct tunnel.
-        let server = self.server.clone()
-            .ok_or_else(|| PhantomError::Config("No server configured for UDP proxy".to_string()))?;
-        let local_secret = self.local_secret
+        let server = self.server.clone().ok_or_else(|| {
+            PhantomError::Config("No server configured for UDP proxy".to_string())
+        })?;
+        let local_secret = self
+            .local_secret
             .ok_or_else(|| PhantomError::Config("No local secret for UDP proxy".to_string()))?;
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
@@ -862,7 +894,9 @@ impl TunProxy {
         syn_payload.extend_from_slice(&datagram);
 
         // Establish Noise tunnel to server.
-        let addr: SocketAddr = server.address.parse()
+        let addr: SocketAddr = server
+            .address
+            .parse()
             .map_err(|e| PhantomError::Config(format!("Invalid server address: {}", e)))?;
         let transport = TcpTransport::new(std::time::Duration::from_secs(10));
         let stream = transport.connect(&addr).await?;
@@ -878,7 +912,10 @@ impl TunProxy {
         };
         let result = initiator.handshake(stream, &offer).await?;
         let (session_reader, session_writer) = split_after_handshake(
-            result.stream, result.split_keys, result.chosen_cipher, result.is_initiator,
+            result.stream,
+            result.split_keys,
+            result.chosen_cipher,
+            result.is_initiator,
         );
         let mut frame_reader = FrameReader::new(session_reader);
         let mut frame_writer = FrameWriter::new(session_writer);
@@ -920,8 +957,12 @@ impl TunProxy {
                         flags: FrameFlags::UDP | FrameFlags::DATA,
                         payload: Bytes::from(data),
                     };
-                    if frame_writer.write_frame(&frame).await.is_err() { break; }
-                    if frame_writer.flush().await.is_err() { break; }
+                    if frame_writer.write_frame(&frame).await.is_err() {
+                        break;
+                    }
+                    if frame_writer.flush().await.is_err() {
+                        break;
+                    }
                 }
                 let _ = frame_writer.write_frame(&Frame::fin(stream_id)).await;
                 let _ = frame_writer.flush().await;
@@ -935,10 +976,14 @@ impl TunProxy {
                         Ok(f) => f,
                         Err(_) => break,
                     };
-                    if frame.flags.contains(FrameFlags::DATA) && frame.flags.contains(FrameFlags::UDP) {
+                    if frame.flags.contains(FrameFlags::DATA)
+                        && frame.flags.contains(FrameFlags::UDP)
+                    {
                         let pkt = match build_udp_packet(
-                            dst_ip, dst_port,
-                            src_ip, src_port,
+                            dst_ip,
+                            dst_port,
+                            src_ip,
+                            src_port,
                             &frame.payload,
                         ) {
                             Ok(p) => p,
@@ -946,7 +991,9 @@ impl TunProxy {
                         };
                         let mut dev = device.lock().await;
                         let _ = dev.write_packet(&pkt).await;
-                    } else if frame.flags.contains(FrameFlags::FIN) || frame.flags.contains(FrameFlags::RST) {
+                    } else if frame.flags.contains(FrameFlags::FIN)
+                        || frame.flags.contains(FrameFlags::RST)
+                    {
                         break;
                     }
                 }
@@ -969,7 +1016,9 @@ impl TunProxy {
                     .syn()
                     .ack(state.ack)
                     .write(&mut pkt, &[])
-                    .map_err(|e| PhantomError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                    .map_err(|e| {
+                        PhantomError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+                    })?;
             }
             (IpAddr::V6(dst), IpAddr::V6(src)) => {
                 etherparse::PacketBuilder::ipv6(dst.octets(), src.octets(), 64)
@@ -977,7 +1026,9 @@ impl TunProxy {
                     .syn()
                     .ack(state.ack)
                     .write(&mut pkt, &[])
-                    .map_err(|e| PhantomError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                    .map_err(|e| {
+                        PhantomError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+                    })?;
             }
             _ => return Ok(()),
         }
@@ -993,14 +1044,18 @@ impl TunProxy {
                     .tcp(state.dst_port, state.src_port, state.seq, 65535)
                     .ack(ack)
                     .write(&mut pkt, &[])
-                    .map_err(|e| PhantomError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                    .map_err(|e| {
+                        PhantomError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+                    })?;
             }
             (IpAddr::V6(dst), IpAddr::V6(src)) => {
                 etherparse::PacketBuilder::ipv6(dst.octets(), src.octets(), 64)
                     .tcp(state.dst_port, state.src_port, state.seq, 65535)
                     .ack(ack)
                     .write(&mut pkt, &[])
-                    .map_err(|e| PhantomError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                    .map_err(|e| {
+                        PhantomError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+                    })?;
             }
             _ => return Ok(()),
         }
@@ -1025,7 +1080,9 @@ impl TunProxy {
                     .rst()
                     .ack(0)
                     .write(&mut pkt, &[])
-                    .map_err(|e| PhantomError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                    .map_err(|e| {
+                        PhantomError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+                    })?;
             }
             (IpAddr::V6(dst), IpAddr::V6(src)) => {
                 etherparse::PacketBuilder::ipv6(dst.octets(), src.octets(), 64)
@@ -1033,7 +1090,9 @@ impl TunProxy {
                     .rst()
                     .ack(0)
                     .write(&mut pkt, &[])
-                    .map_err(|e| PhantomError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+                    .map_err(|e| {
+                        PhantomError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
+                    })?;
             }
             _ => return Ok(()),
         }
@@ -1056,9 +1115,15 @@ async fn tcp_relay_task(
         .await
         .map_err(PhantomError::Io)?;
 
-    socks5.write_all(&[0x05, 0x01, 0x00]).await.map_err(PhantomError::Io)?;
+    socks5
+        .write_all(&[0x05, 0x01, 0x00])
+        .await
+        .map_err(PhantomError::Io)?;
     let mut resp = [0u8; 2];
-    socks5.read_exact(&mut resp).await.map_err(PhantomError::Io)?;
+    socks5
+        .read_exact(&mut resp)
+        .await
+        .map_err(PhantomError::Io)?;
     if resp[0] != 0x05 || resp[1] != 0x00 {
         return Err(PhantomError::Protocol("SOCKS5 auth failed".into()));
     }
@@ -1079,7 +1144,10 @@ async fn tcp_relay_task(
     socks5.write_all(&req).await.map_err(PhantomError::Io)?;
 
     let mut reply = [0u8; 10];
-    socks5.read_exact(&mut reply).await.map_err(PhantomError::Io)?;
+    socks5
+        .read_exact(&mut reply)
+        .await
+        .map_err(PhantomError::Io)?;
     if reply[1] != 0x00 {
         return Err(PhantomError::Protocol(format!(
             "SOCKS5 connect failed: 0x{:02x}",
@@ -1246,7 +1314,11 @@ fn build_tcp_psh_packet(state: &TcpFlowState, payload: &[u8]) -> Result<Vec<u8>>
                 .write(&mut pkt, payload)
                 .map_err(|e| PhantomError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         }
-        _ => return Err(PhantomError::Protocol("IP version mismatch in TCP packet".to_string())),
+        _ => {
+            return Err(PhantomError::Protocol(
+                "IP version mismatch in TCP packet".to_string(),
+            ));
+        }
     }
     Ok(pkt)
 }
@@ -1271,7 +1343,11 @@ fn build_tcp_fin_packet(state: &TcpFlowState) -> Result<Vec<u8>> {
                 .write(&mut pkt, &[])
                 .map_err(|e| PhantomError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         }
-        _ => return Err(PhantomError::Protocol("IP version mismatch in TCP packet".to_string())),
+        _ => {
+            return Err(PhantomError::Protocol(
+                "IP version mismatch in TCP packet".to_string(),
+            ));
+        }
     }
     Ok(pkt)
 }
@@ -1298,7 +1374,11 @@ fn build_udp_packet(
                 .write(&mut pkt, payload)
                 .map_err(|e| PhantomError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         }
-        _ => return Err(PhantomError::Protocol("IP version mismatch in UDP packet".to_string())),
+        _ => {
+            return Err(PhantomError::Protocol(
+                "IP version mismatch in UDP packet".to_string(),
+            ));
+        }
     }
     Ok(pkt)
 }

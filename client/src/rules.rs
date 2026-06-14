@@ -77,18 +77,19 @@ impl RuleEngine {
                 }
                 RulePattern::IpCidr { value } => {
                     if let Ok(net) = value.parse::<Ipv4Net>() {
-                        let prefix = Ipv4Prefix::new(net.network(), net.prefix_len())
-                            .map_err(|e| PhantomError::Config(format!("Invalid IPv4 prefix: {}", e)))?;
+                        let prefix =
+                            Ipv4Prefix::new(net.network(), net.prefix_len()).map_err(|e| {
+                                PhantomError::Config(format!("Invalid IPv4 prefix: {}", e))
+                            })?;
                         ip_cidr_v4_pairs.push((prefix, rule.action));
                     } else if let Ok(net) = value.parse::<Ipv6Net>() {
-                        let prefix = Ipv6Prefix::new(net.network(), net.prefix_len())
-                            .map_err(|e| PhantomError::Config(format!("Invalid IPv6 prefix: {}", e)))?;
+                        let prefix =
+                            Ipv6Prefix::new(net.network(), net.prefix_len()).map_err(|e| {
+                                PhantomError::Config(format!("Invalid IPv6 prefix: {}", e))
+                            })?;
                         ip_cidr_v6_pairs.push((prefix, rule.action));
                     } else {
-                        return Err(PhantomError::Config(format!(
-                            "Invalid IP-CIDR: {}",
-                            value
-                        )));
+                        return Err(PhantomError::Config(format!("Invalid IP-CIDR: {}", value)));
                     }
                 }
                 RulePattern::Port { value } => {
@@ -138,12 +139,10 @@ impl RuleEngine {
             // `build`, which insists on `TryFrom<usize>`); perfect for our enum.
             let automaton = DoubleArrayAhoCorasickBuilder::new()
                 .match_kind(daachorse::MatchKind::LeftmostFirst)
-                .build_with_values(
-                    domain_keyword_pairs
-                        .iter()
-                        .map(|(p, a)| (p.clone(), *a)),
-                )
-                .map_err(|e| PhantomError::Config(format!("Failed to build keyword automaton: {}", e)))?;
+                .build_with_values(domain_keyword_pairs.iter().map(|(p, a)| (p.clone(), *a)))
+                .map_err(|e| {
+                    PhantomError::Config(format!("Failed to build keyword automaton: {}", e))
+                })?;
             Some(automaton)
         };
 
@@ -365,7 +364,10 @@ mod tests {
     }
 
     fn make_config(rules: Vec<ClientRule>, final_action: RuleAction) -> RulesConfig {
-        RulesConfig { rules, final_action }
+        RulesConfig {
+            rules,
+            final_action,
+        }
     }
 
     #[test]
@@ -469,10 +471,7 @@ mod tests {
 
     #[test]
     fn port_match() {
-        let cfg = make_cfg(vec![(
-            RulePattern::Port { value: 22 },
-            RuleAction::Direct,
-        )]);
+        let cfg = make_cfg(vec![(RulePattern::Port { value: 22 }, RuleAction::Direct)]);
         let engine = RuleEngine::from_config(&cfg).unwrap();
         assert_eq!(engine.query(None, None, Some(22)), RuleAction::Direct);
         assert_eq!(engine.query(None, None, Some(443)), RuleAction::Proxy);
@@ -522,42 +521,89 @@ mod tests {
 
     #[test]
     fn domain_full_case_insensitive() {
-        let cfg = make_config(vec![
-            ClientRule { pattern: RulePattern::DomainFull { value: "Google.COM".to_string() }, action: RuleAction::Proxy }
-        ], RuleAction::Direct);
+        let cfg = make_config(
+            vec![ClientRule {
+                pattern: RulePattern::DomainFull {
+                    value: "Google.COM".to_string(),
+                },
+                action: RuleAction::Proxy,
+            }],
+            RuleAction::Direct,
+        );
         let engine = RuleEngine::from_config(&cfg).unwrap();
-        assert_eq!(engine.query(Some("google.com"), None, None), RuleAction::Proxy);
-        assert_eq!(engine.query(Some("GOOGLE.COM"), None, None), RuleAction::Proxy);
+        assert_eq!(
+            engine.query(Some("google.com"), None, None),
+            RuleAction::Proxy
+        );
+        assert_eq!(
+            engine.query(Some("GOOGLE.COM"), None, None),
+            RuleAction::Proxy
+        );
     }
 
     #[test]
     fn ip_cidr_longest_prefix() {
-        let cfg = make_config(vec![
-            ClientRule { pattern: RulePattern::IpCidr { value: "10.0.0.0/8".to_string() }, action: RuleAction::Direct },
-            ClientRule { pattern: RulePattern::IpCidr { value: "10.0.1.0/24".to_string() }, action: RuleAction::Proxy },
-        ], RuleAction::Direct);
+        let cfg = make_config(
+            vec![
+                ClientRule {
+                    pattern: RulePattern::IpCidr {
+                        value: "10.0.0.0/8".to_string(),
+                    },
+                    action: RuleAction::Direct,
+                },
+                ClientRule {
+                    pattern: RulePattern::IpCidr {
+                        value: "10.0.1.0/24".to_string(),
+                    },
+                    action: RuleAction::Proxy,
+                },
+            ],
+            RuleAction::Direct,
+        );
         let engine = RuleEngine::from_config(&cfg).unwrap();
         // 10.0.1.5 matches both /8 and /24, /24 is more specific
-        assert_eq!(engine.query(None, Some("10.0.1.5".parse().unwrap()), None), RuleAction::Proxy);
+        assert_eq!(
+            engine.query(None, Some("10.0.1.5".parse().unwrap()), None),
+            RuleAction::Proxy
+        );
         // 10.1.2.3 matches only /8
-        assert_eq!(engine.query(None, Some("10.1.2.3".parse().unwrap()), None), RuleAction::Direct);
+        assert_eq!(
+            engine.query(None, Some("10.1.2.3".parse().unwrap()), None),
+            RuleAction::Direct
+        );
     }
 
     #[test]
     fn domain_keyword_proxy_on_match() {
-        let cfg = make_config(vec![
-            ClientRule { pattern: RulePattern::DomainKeyword { value: "google".to_string() }, action: RuleAction::Proxy }
-        ], RuleAction::Direct);
+        let cfg = make_config(
+            vec![ClientRule {
+                pattern: RulePattern::DomainKeyword {
+                    value: "google".to_string(),
+                },
+                action: RuleAction::Proxy,
+            }],
+            RuleAction::Direct,
+        );
         let engine = RuleEngine::from_config(&cfg).unwrap();
-        assert_eq!(engine.query(Some("mail.google.com"), None, None), RuleAction::Proxy);
-        assert_eq!(engine.query(Some("example.com"), None, None), RuleAction::Direct);
+        assert_eq!(
+            engine.query(Some("mail.google.com"), None, None),
+            RuleAction::Proxy
+        );
+        assert_eq!(
+            engine.query(Some("example.com"), None, None),
+            RuleAction::Direct
+        );
     }
 
     #[test]
     fn port_proxy_on_match() {
-        let cfg = make_config(vec![
-            ClientRule { pattern: RulePattern::Port { value: 443 }, action: RuleAction::Proxy }
-        ], RuleAction::Direct);
+        let cfg = make_config(
+            vec![ClientRule {
+                pattern: RulePattern::Port { value: 443 },
+                action: RuleAction::Proxy,
+            }],
+            RuleAction::Direct,
+        );
         let engine = RuleEngine::from_config(&cfg).unwrap();
         assert_eq!(engine.query(None, None, Some(443)), RuleAction::Proxy);
         assert_eq!(engine.query(None, None, Some(80)), RuleAction::Direct);
@@ -565,12 +611,28 @@ mod tests {
 
     #[test]
     fn domain_priority_over_ip() {
-        let cfg = make_config(vec![
-            ClientRule { pattern: RulePattern::DomainFull { value: "example.com".to_string() }, action: RuleAction::Proxy },
-            ClientRule { pattern: RulePattern::IpCidr { value: "1.2.3.0/24".to_string() }, action: RuleAction::Direct },
-        ], RuleAction::Direct);
+        let cfg = make_config(
+            vec![
+                ClientRule {
+                    pattern: RulePattern::DomainFull {
+                        value: "example.com".to_string(),
+                    },
+                    action: RuleAction::Proxy,
+                },
+                ClientRule {
+                    pattern: RulePattern::IpCidr {
+                        value: "1.2.3.0/24".to_string(),
+                    },
+                    action: RuleAction::Direct,
+                },
+            ],
+            RuleAction::Direct,
+        );
         let engine = RuleEngine::from_config(&cfg).unwrap();
         // Domain match takes priority
-        assert_eq!(engine.query(Some("example.com"), Some("1.2.3.4".parse().unwrap()), None), RuleAction::Proxy);
+        assert_eq!(
+            engine.query(Some("example.com"), Some("1.2.3.4".parse().unwrap()), None),
+            RuleAction::Proxy
+        );
     }
 }

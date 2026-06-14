@@ -1,8 +1,8 @@
 //! Lightweight traffic statistics with atomic counters.
 //! Can be exposed as Prometheus metrics via an HTTP endpoint.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Default)]
 pub struct TrafficStats {

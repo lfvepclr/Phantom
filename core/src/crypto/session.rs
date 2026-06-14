@@ -207,7 +207,10 @@ pub fn split_after_handshake<S>(
     split_keys: ([u8; 32], [u8; 32]),
     cipher: CipherSuite,
     is_initiator: bool,
-) -> (SessionReader<tokio::io::ReadHalf<S>>, SessionWriter<tokio::io::WriteHalf<S>>)
+) -> (
+    SessionReader<tokio::io::ReadHalf<S>>,
+    SessionWriter<tokio::io::WriteHalf<S>>,
+)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -223,7 +226,10 @@ pub fn split_for_stream<S>(
     cipher: CipherSuite,
     is_initiator: bool,
     stream_id: u32,
-) -> (SessionReader<tokio::io::ReadHalf<S>>, SessionWriter<tokio::io::WriteHalf<S>>)
+) -> (
+    SessionReader<tokio::io::ReadHalf<S>>,
+    SessionWriter<tokio::io::WriteHalf<S>>,
+)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -236,18 +242,31 @@ fn split_stream<S>(
     cipher: CipherSuite,
     is_initiator: bool,
     stream_id: Option<u32>,
-) -> (SessionReader<tokio::io::ReadHalf<S>>, SessionWriter<tokio::io::WriteHalf<S>>)
+) -> (
+    SessionReader<tokio::io::ReadHalf<S>>,
+    SessionWriter<tokio::io::WriteHalf<S>>,
+)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let session_keys = match stream_id {
-        Some(id) => SessionKeys::derive_stream(&split_keys.0, &split_keys.1, cipher, is_initiator, id),
+        Some(id) => {
+            SessionKeys::derive_stream(&split_keys.0, &split_keys.1, cipher, is_initiator, id)
+        }
         None => SessionKeys::derive(&split_keys.0, &split_keys.1, cipher, is_initiator),
     };
     let (read_half, write_half) = tokio::io::split(stream);
 
-    let read_state = AeadState::new(cipher, &session_keys.read_key, session_keys.read_nonce_prefix);
-    let write_state = AeadState::new(cipher, &session_keys.write_key, session_keys.write_nonce_prefix);
+    let read_state = AeadState::new(
+        cipher,
+        &session_keys.read_key,
+        session_keys.read_nonce_prefix,
+    );
+    let write_state = AeadState::new(
+        cipher,
+        &session_keys.write_key,
+        session_keys.write_nonce_prefix,
+    );
 
     let reader = SessionReader::new(read_half, read_state);
     let writer = SessionWriter::new(write_half, write_state);
@@ -260,10 +279,7 @@ mod tests {
 
     #[test]
     fn cipher_offer_roundtrip() {
-        let offer = CipherOffer::new(vec![
-            CipherSuite::Aes256Gcm,
-            CipherSuite::Ascon128,
-        ]);
+        let offer = CipherOffer::new(vec![CipherSuite::Aes256Gcm, CipherSuite::Ascon128]);
         let encoded = offer.encode();
         let decoded = CipherOffer::decode(&encoded).unwrap();
         assert_eq!(decoded.version, CIPHER_OFFER_VERSION);

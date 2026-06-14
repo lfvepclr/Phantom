@@ -4,11 +4,11 @@
 //! by default so they do not run in CI; run with `cargo test -- --ignored`.
 
 use phantom_core::CipherPreference;
+use phantom_core::protocol::TargetAddr;
 use phantom_e2e::echo::EchoMode;
 use phantom_e2e::fixture::TestFixture;
 use phantom_e2e::socks5::connect_tunnel;
 use phantom_e2e::throughput::{echo_data, generate_random_data, measure_echo_throughput};
-use phantom_core::protocol::TargetAddr;
 use std::time::Instant;
 
 fn target_from_fixture(fixture: &TestFixture) -> TargetAddr {
@@ -34,9 +34,13 @@ async fn perf_tcp_throughput_aes256gcm() {
     .await
     .unwrap();
 
-    let result = measure_echo_throughput(&mut reader, &mut writer, stream_id, 10 * 1024 * 1024).await;
+    let result =
+        measure_echo_throughput(&mut reader, &mut writer, stream_id, 10 * 1024 * 1024).await;
     eprintln!("[AES-256-GCM throughput] {}", result);
-    assert!(result.throughput_mbps > 0.0, "Throughput should be positive");
+    assert!(
+        result.throughput_mbps > 0.0,
+        "Throughput should be positive"
+    );
 }
 
 #[tokio::test]
@@ -53,15 +57,20 @@ async fn perf_tcp_throughput_ascon128() {
     .await
     .unwrap();
 
-    let result = measure_echo_throughput(&mut reader, &mut writer, stream_id, 10 * 1024 * 1024).await;
+    let result =
+        measure_echo_throughput(&mut reader, &mut writer, stream_id, 10 * 1024 * 1024).await;
     eprintln!("[ASCON-128 throughput] {}", result);
-    assert!(result.throughput_mbps > 0.0, "Throughput should be positive");
+    assert!(
+        result.throughput_mbps > 0.0,
+        "Throughput should be positive"
+    );
 }
 
 #[tokio::test]
 #[ignore]
 async fn perf_tcp_throughput_chacha20poly1305() {
-    let fixture = TestFixture::new_with_mode(CipherPreference::ChaCha20Poly1305, EchoMode::Echo).await;
+    let fixture =
+        TestFixture::new_with_mode(CipherPreference::ChaCha20Poly1305, EchoMode::Echo).await;
     let (mut reader, mut writer, stream_id) = connect_tunnel(
         fixture.server_addr,
         &fixture.server_key.public,
@@ -72,9 +81,13 @@ async fn perf_tcp_throughput_chacha20poly1305() {
     .await
     .unwrap();
 
-    let result = measure_echo_throughput(&mut reader, &mut writer, stream_id, 10 * 1024 * 1024).await;
+    let result =
+        measure_echo_throughput(&mut reader, &mut writer, stream_id, 10 * 1024 * 1024).await;
     eprintln!("[ChaCha20-Poly1305 throughput] {}", result);
-    assert!(result.throughput_mbps > 0.0, "Throughput should be positive");
+    assert!(
+        result.throughput_mbps > 0.0,
+        "Throughput should be positive"
+    );
 }
 
 /// Measure handshake latency for each cipher suite.
@@ -94,8 +107,14 @@ async fn perf_handshake_latency_aes256gcm() {
     .await
     .unwrap();
     let elapsed = start.elapsed();
-    eprintln!("[AES-256-GCM handshake] {:.2} ms", elapsed.as_secs_f64() * 1000.0);
-    assert!(elapsed.as_secs() < 5, "Handshake should complete within 5 seconds");
+    eprintln!(
+        "[AES-256-GCM handshake] {:.2} ms",
+        elapsed.as_secs_f64() * 1000.0
+    );
+    assert!(
+        elapsed.as_secs() < 5,
+        "Handshake should complete within 5 seconds"
+    );
 }
 
 #[tokio::test]
@@ -113,8 +132,14 @@ async fn perf_handshake_latency_ascon128() {
     .await
     .unwrap();
     let elapsed = start.elapsed();
-    eprintln!("[ASCON-128 handshake] {:.2} ms", elapsed.as_secs_f64() * 1000.0);
-    assert!(elapsed.as_secs() < 5, "Handshake should complete within 5 seconds");
+    eprintln!(
+        "[ASCON-128 handshake] {:.2} ms",
+        elapsed.as_secs_f64() * 1000.0
+    );
+    assert!(
+        elapsed.as_secs() < 5,
+        "Handshake should complete within 5 seconds"
+    );
 }
 
 #[tokio::test]
@@ -132,8 +157,14 @@ async fn perf_handshake_latency_chacha20poly1305() {
     .await
     .unwrap();
     let elapsed = start.elapsed();
-    eprintln!("[ChaCha20-Poly1305 handshake] {:.2} ms", elapsed.as_secs_f64() * 1000.0);
-    assert!(elapsed.as_secs() < 5, "Handshake should complete within 5 seconds");
+    eprintln!(
+        "[ChaCha20-Poly1305 handshake] {:.2} ms",
+        elapsed.as_secs_f64() * 1000.0
+    );
+    assert!(
+        elapsed.as_secs() < 5,
+        "Handshake should complete within 5 seconds"
+    );
 }
 
 #[tokio::test]
@@ -151,8 +182,14 @@ async fn perf_handshake_latency_aes128gcm() {
     .await
     .unwrap();
     let elapsed = start.elapsed();
-    eprintln!("[AES-128-GCM handshake] {:.2} ms", elapsed.as_secs_f64() * 1000.0);
-    assert!(elapsed.as_secs() < 5, "Handshake should complete within 5 seconds");
+    eprintln!(
+        "[AES-128-GCM handshake] {:.2} ms",
+        elapsed.as_secs_f64() * 1000.0
+    );
+    assert!(
+        elapsed.as_secs() < 5,
+        "Handshake should complete within 5 seconds"
+    );
 }
 
 /// Measure concurrent connection throughput.
@@ -174,11 +211,14 @@ async fn perf_concurrent_connections() {
         let target = target_from_fixture(&fixture);
         let cipher = fixture.cipher_preference;
         let handle = tokio::spawn(async move {
-            let (mut reader, mut writer, stream_id) = connect_tunnel(
-                server_addr, &server_public, &client_secret, &target, cipher,
-            ).await.unwrap();
+            let (mut reader, mut writer, stream_id) =
+                connect_tunnel(server_addr, &server_public, &client_secret, &target, cipher)
+                    .await
+                    .unwrap();
             let mut data = vec![0u8; payload_size];
-            for byte in data.iter_mut() { *byte = (i % 256) as u8; }
+            for byte in data.iter_mut() {
+                *byte = (i % 256) as u8;
+            }
             let echoed = echo_data(&mut reader, &mut writer, stream_id, &data).await;
             assert_eq!(echoed, data, "Concurrent connection {} data mismatch", i);
         });
@@ -192,9 +232,15 @@ async fn perf_concurrent_connections() {
     let throughput_mbps = (total_bytes as f64 * 8.0) / elapsed.as_secs_f64() / 1_000_000.0;
     eprintln!(
         "[Concurrent {} x {}KB] elapsed {:.2}s, aggregate {:.2} Mbps",
-        num_concurrent, payload_size / 1024, elapsed.as_secs_f64(), throughput_mbps
+        num_concurrent,
+        payload_size / 1024,
+        elapsed.as_secs_f64(),
+        throughput_mbps
     );
-    assert!(throughput_mbps > 0.0, "Aggregate throughput should be positive");
+    assert!(
+        throughput_mbps > 0.0,
+        "Aggregate throughput should be positive"
+    );
 }
 
 /// Cipher comparison: run the same workload with each cipher and print
@@ -210,7 +256,10 @@ async fn perf_cipher_comparison() {
     ];
     let test_size = 20 * 1024 * 1024;
 
-    eprintln!("\n===== Cipher Performance Comparison ({} MB echo) =====", test_size / 1024 / 1024);
+    eprintln!(
+        "\n===== Cipher Performance Comparison ({} MB echo) =====",
+        test_size / 1024 / 1024
+    );
     for (cipher, name) in &ciphers {
         let fixture = TestFixture::new_with_mode(*cipher, EchoMode::Echo).await;
         let (mut reader, mut writer, stream_id) = connect_tunnel(

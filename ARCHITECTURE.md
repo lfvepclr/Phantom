@@ -157,6 +157,8 @@ Reject → RST packet   Proxy  → Noise tunnel (UDP SYN frame) → Server
 | `failover.health_check_interval` | `u64` | `failover.rs` run_health_check_loop() | **已实现** |
 | `failover.failover_threshold` | `u32` | 连续失败 N 次后切换服务器 | **已实现** |
 | `failover.graceful_migration` | `bool` | 切服时不断已有连接 | 部分实现 |
+| `hello.timeout` | `u64` | `client/src/hello.rs` Hello-ACK 等待超时 | **已实现** |
+| `server.verification_url` | `Option<String>` | `server/src/handler.rs` 自定义外网探测目标 | **已实现** |
 | `performance.workers` | `u32` | server/bin.rs 自定义 tokio runtime | **已实现** |
 | `performance.io_uring` | `bool` | linux_ext.rs tokio_uring | **已实现** |
 | `performance.zero_copy` | `bool` | 占位 | 占位 |
@@ -233,6 +235,31 @@ info: "phantom-v3-stream-{stream_id}-{cipher}"
        ▼
 per-stream SessionReader / SessionWriter
 ```
+
+### 6.5 HelloWorld 连接验证协议
+
+启动 SOCKS5 / TUN 数据面之前，客户端会先通过一条**独立的 Noise 会话**完成一次 Hello/Hello-ACK 握手，验证 `客户端 → 服务端 → 外网` 完整链路可用，避免"本地代理已启动就显示已连接"的误导。
+
+```
+客户端                                 服务端
+  │                                      │
+  │──── TCP/QUIC connect ─────────────▶  │
+  │──── Noise IK handshake ───────────▶  │
+  │◄─── Noise IK handshake response ───  │
+  │                                      │
+  │──── DATA stream_id=0 ─────────────▶  │  payload = "PH/HELLO" + {nonce}
+  │                                      │  http_probe(captive.apple.com)
+  │◄─── DATA stream_id=0 ──────────────  │  payload = "PH/HELLO_ACK" + {ok, message, ts}
+  │                                      │
+  │  ok=true  → 打开本地 SOCKS5 / TUN    │
+  │  ok=false → 报错，不进入数据面        │
+```
+
+设计要点：
+- 复用已建立的 Noise 加密会话，Hello 帧本身也是加密的。
+- 使用 `stream_id = 0` 作为保留控制流，与 SOCKS5 relay 的 `stream_id >= 1` 不冲突。
+- 不新增 FrameFlags，Hello 帧是普通的 `DATA` 帧，通过 payload 前缀 `PH/HELLO` / `PH/HELLO_ACK` 识别，保持与旧版客户端的最大兼容（旧版服务端会把该帧当普通 SYN 处理并关闭连接，不会误判）。
+- 服务端默认探测 `http://captive.apple.com/hotspot-detect.html`，失败时回退 `http://detectportal.firefox.com/success.txt`；可通过 `server.toml` 的 `verification_url` 自定义。
 
 ---
 

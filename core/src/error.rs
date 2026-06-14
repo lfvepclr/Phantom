@@ -20,6 +20,8 @@ pub enum PhantomError {
     AllServersFailed,
     #[error("Cipher negotiation failed: {0}")]
     CipherNegotiation(String),
+    #[error("Hello verification failed: {0}")]
+    HelloVerification(String),
 }
 
 pub type Result<T> = std::result::Result<T, PhantomError>;

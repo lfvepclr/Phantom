@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
-use phantom_core::constants::{HANDSHAKE_TIMEOUT_SECS, MAX_FRAME_PAYLOAD};
 use phantom_core::CipherPreference;
-use phantom_core::{PhantomError, Result};
+use phantom_core::constants::{HANDSHAKE_TIMEOUT_SECS, MAX_FRAME_PAYLOAD};
 use phantom_core::crypto::cipher::CipherSuite;
-use phantom_core::crypto::{split_after_handshake, split_for_stream, NoiseResponder};
+use phantom_core::crypto::{NoiseResponder, split_after_handshake, split_for_stream};
 use phantom_core::protocol::codec::{FrameReader, FrameWriter};
 use phantom_core::protocol::frame::FrameFlags;
 use phantom_core::protocol::{Frame, TargetAddr};
+use phantom_core::{PhantomError, Result};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpStream, UdpSocket};
 
@@ -19,6 +19,7 @@ pub async fn handle_connection<S>(
     secret_key: [u8; 32],
     allowed_clients: &[[u8; 32]],
     cipher_preference: CipherPreference,
+    verification_url: Option<&str>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -49,7 +50,7 @@ pub async fn handle_connection<S>(
     let frame_reader = FrameReader::new(session_reader);
     let frame_writer = FrameWriter::new(session_writer);
 
-    let _ = handle_frame_stream(frame_reader, frame_writer).await;
+    let _ = handle_frame_stream(frame_reader, frame_writer, verification_url).await;
 }
 
 /// Handle a multiplexed QUIC connection.
@@ -62,6 +63,7 @@ pub async fn handle_quic_connection(
     secret_key: [u8; 32],
     allowed_clients: &[[u8; 32]],
     cipher_preference: CipherPreference,
+    verification_url: Option<&str>,
 ) {
     use phantom_core::transport::quic::QuicStream;
 
@@ -110,7 +112,7 @@ pub async fn handle_quic_connection(
             let frame_reader = FrameReader::new(session_reader);
             let frame_writer = FrameWriter::new(session_writer);
 
-            let _ = handle_frame_stream(frame_reader, frame_writer).await;
+            let _ = handle_frame_stream(frame_reader, frame_writer, verification_url).await;
         } else {
             let keys = match conn_keys {
                 Some(k) => k,
@@ -126,7 +128,7 @@ pub async fn handle_quic_connection(
             let frame_reader = FrameReader::new(session_reader);
             let frame_writer = FrameWriter::new(session_writer);
 
-            let _ = handle_frame_stream(frame_reader, frame_writer).await;
+            let _ = handle_frame_stream(frame_reader, frame_writer, verification_url).await;
         }
     }
 }
@@ -136,15 +138,31 @@ pub async fn handle_quic_connection(
 async fn handle_frame_stream<R, W>(
     mut frame_reader: FrameReader<R>,
     mut frame_writer: FrameWriter<W>,
+    verification_url: Option<&str>,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let syn_frame = match frame_reader.read_frame().await {
-        Ok(f) if f.flags.contains(FrameFlags::SYN) => f,
+    let first_frame = match frame_reader.read_frame().await {
+        Ok(f) => f,
         _ => return Ok(()),
     };
+
+    // Hello verification takes precedence: stream_id 0 + HELLO magic.
+    if first_frame.stream_id == 0
+        && first_frame
+            .payload
+            .starts_with(phantom_core::constants::HELLO_MAGIC)
+    {
+        return handle_hello(first_frame, frame_writer, verification_url).await;
+    }
+
+    // From here on we expect a normal SOCKS5 relay SYN.
+    if !first_frame.flags.contains(FrameFlags::SYN) {
+        return Ok(());
+    }
+    let syn_frame = first_frame;
 
     if syn_frame.flags.contains(FrameFlags::UDP) {
         return udp_relay(syn_frame, frame_reader, frame_writer).await;
@@ -154,7 +172,9 @@ where
     let target = match TargetAddr::decode(&syn_frame.payload) {
         Ok(t) => t,
         Err(_) => {
-            let _ = frame_writer.write_frame(&Frame::rst(syn_frame.stream_id)).await;
+            let _ = frame_writer
+                .write_frame(&Frame::rst(syn_frame.stream_id))
+                .await;
             let _ = frame_writer.flush().await;
             return Ok(());
         }
@@ -165,7 +185,9 @@ where
     let target_addr = match target.to_socket_addr().await {
         Ok(a) => a,
         Err(_) => {
-            let _ = frame_writer.write_frame(&Frame::rst(syn_frame.stream_id)).await;
+            let _ = frame_writer
+                .write_frame(&Frame::rst(syn_frame.stream_id))
+                .await;
             let _ = frame_writer.flush().await;
             return Ok(());
         }
@@ -175,7 +197,9 @@ where
         Ok(s) => s,
         Err(e) => {
             tracing::info!("Connect failed → {}: {}", target, e);
-            let _ = frame_writer.write_frame(&Frame::rst(syn_frame.stream_id)).await;
+            let _ = frame_writer
+                .write_frame(&Frame::rst(syn_frame.stream_id))
+                .await;
             let _ = frame_writer.flush().await;
             return Ok(());
         }
@@ -190,7 +214,14 @@ where
     }
     let _ = frame_writer.flush().await;
 
-    relay(target_stream, frame_reader, frame_writer, syn_frame.stream_id, &target).await
+    relay(
+        target_stream,
+        frame_reader,
+        frame_writer,
+        syn_frame.stream_id,
+        &target,
+    )
+    .await
 }
 
 /// UDP relay: SYN payload contains the first datagram target address + data.
@@ -238,7 +269,11 @@ where
     let _ = socket.send_to(datagram, target_addr).await;
 
     // ACK the SYN.
-    if frame_writer.write_frame(&Frame::ack(stream_id)).await.is_err() {
+    if frame_writer
+        .write_frame(&Frame::ack(stream_id))
+        .await
+        .is_err()
+    {
         return Ok(());
     }
     let _ = frame_writer.flush().await;
@@ -293,7 +328,7 @@ fn decode_udp_syn(payload: &[u8]) -> Option<(TargetAddr, &[u8])> {
     }
     let atyp = payload[0];
     let (_addr_len, target_end) = match atyp {
-        0x01 => (4 + 2, 1 + 4 + 2),  // IPv4: 4 bytes + 2 port
+        0x01 => (4 + 2, 1 + 4 + 2),   // IPv4: 4 bytes + 2 port
         0x04 => (16 + 2, 1 + 16 + 2), // IPv6: 16 bytes + 2 port
         0x03 => {
             if payload.len() < 2 {
@@ -340,7 +375,10 @@ where
         let mut total_down: u64 = 0;
         loop {
             buf.clear();
-            let n = target_read.read_buf(&mut buf).await.map_err(PhantomError::Io)?;
+            let n = target_read
+                .read_buf(&mut buf)
+                .await
+                .map_err(PhantomError::Io)?;
             if n == 0 {
                 break;
             }
@@ -363,8 +401,12 @@ where
             let frame = frame_reader.read_frame().await?;
             if frame.flags.contains(FrameFlags::DATA) {
                 total_up += frame.payload.len() as u64;
-                target_write.write_all(&frame.payload).await.map_err(PhantomError::Io)?;
-            } else if frame.flags.contains(FrameFlags::FIN) || frame.flags.contains(FrameFlags::RST) {
+                target_write
+                    .write_all(&frame.payload)
+                    .await
+                    .map_err(PhantomError::Io)?;
+            } else if frame.flags.contains(FrameFlags::FIN) || frame.flags.contains(FrameFlags::RST)
+            {
                 break;
             }
         }
@@ -377,6 +419,125 @@ where
 
     tokio::try_join!(to_tunnel, from_tunnel)?;
     Ok(())
+}
+
+/// Handle a Hello verification frame: probe the public internet and echo the
+/// result back to the client inside an encrypted Hello-ACK frame.
+async fn handle_hello<W>(
+    _frame: Frame,
+    mut frame_writer: FrameWriter<W>,
+    verification_url: Option<&str>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    use phantom_core::constants::{DEFAULT_HELLO_TARGETS, HELLO_ACK_MAGIC};
+
+    let targets: Vec<&str> = verification_url
+        .into_iter()
+        .chain(DEFAULT_HELLO_TARGETS.iter().copied())
+        .collect();
+
+    let mut last_error = String::from("No verification target configured");
+    let mut success = false;
+    let mut message = String::new();
+
+    for url in targets {
+        match http_probe(url).await {
+            Ok(body_snippet) => {
+                success = true;
+                message = format!("{} reachable ({})", url, body_snippet);
+                break;
+            }
+            Err(e) => {
+                last_error = format!("{} failed: {}", url, e);
+            }
+        }
+    }
+
+    if !success {
+        message = last_error;
+    }
+
+    let ack = serde_json::json!({
+        "ok": success,
+        "message": message,
+        "ts": std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    });
+    let mut payload = HELLO_ACK_MAGIC.to_vec();
+    payload.extend_from_slice(ack.to_string().as_bytes());
+
+    let _ = frame_writer.write_frame(&Frame::hello_ack(payload)).await;
+    let _ = frame_writer.flush().await;
+
+    tracing::info!(
+        "Hello verification {}",
+        if success { "passed" } else { "failed" }
+    );
+    Ok(())
+}
+
+/// Tiny HTTP/1.0 GET probe. Returns a short body snippet on 200 OK.
+async fn http_probe(url: &str) -> Result<String> {
+    let url = url.strip_prefix("http://").unwrap_or(url);
+    let (host_port, path) = url
+        .split_once('/')
+        .map(|(h, p)| (h, format!("/{}", p)))
+        .unwrap_or((url, "/".to_string()));
+    let (host, port) = host_port
+        .split_once(':')
+        .map(|(h, p)| (h, p.parse::<u16>().unwrap_or(80)))
+        .unwrap_or((host_port, 80));
+
+    let addr = match tokio::net::lookup_host(format!("{}:{}", host, port)).await {
+        Ok(mut iter) => iter.next().ok_or_else(|| {
+            PhantomError::Protocol("DNS lookup returned no addresses".to_string())
+        })?,
+        Err(e) => return Err(PhantomError::Io(e)),
+    };
+
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        tokio::net::TcpStream::connect(addr),
+    )
+    .await
+    .map_err(|_| PhantomError::Timeout)??;
+
+    let request = format!(
+        "GET {} HTTP/1.0\r\nHost: {}\r\nUser-Agent: Phantom/1.0\r\nConnection: close\r\n\r\n",
+        path, host
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .map_err(PhantomError::Io)?;
+    stream.flush().await.map_err(PhantomError::Io)?;
+
+    let mut buf = vec![0u8; 4096];
+    let n = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf))
+        .await
+        .map_err(|_| PhantomError::Timeout)??;
+    buf.truncate(n);
+
+    let response = String::from_utf8_lossy(&buf);
+    if !response.starts_with("HTTP/1.0 200") && !response.starts_with("HTTP/1.1 200") {
+        return Err(PhantomError::Protocol(format!(
+            "Unexpected response: {}",
+            response.lines().next().unwrap_or("empty").to_string()
+        )));
+    }
+
+    // Return the first line of the body as the snippet.
+    let body = response.splitn(2, "\r\n\r\n").nth(1).unwrap_or("");
+    let snippet = body.lines().next().unwrap_or("").to_string();
+    if snippet.is_empty() {
+        Ok("200 OK".to_string())
+    } else {
+        Ok(snippet)
+    }
 }
 
 #[cfg(test)]

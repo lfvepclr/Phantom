@@ -1,15 +1,15 @@
-use base64::{engine::general_purpose::STANDARD, Engine};
 use crate::{PhantomError, Result};
+use base64::{Engine, engine::general_purpose::STANDARD};
+use rand_core::OsRng;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use x25519_dalek::{PublicKey, StaticSecret};
-use rand_core::OsRng;
 
 use zeroize::Zeroize;
 
 #[derive(Zeroize)]
 pub struct KeyPair {
-    #[zeroize(skip)]  // Public key doesn't need zeroing
+    #[zeroize(skip)] // Public key doesn't need zeroing
     pub public: [u8; 32],
     pub secret: [u8; 32],
 }
@@ -58,15 +58,20 @@ impl KeyPair {
             .map_err(|e| PhantomError::Crypto(format!("Failed to create key file: {}", e)))?;
         file.lock()
             .map_err(|e| PhantomError::Crypto(format!("Failed to lock key file: {}", e)))?;
-        let content = format!("{}\n{}\n", self.public_key_base64(), self.secret_key_base64());
+        let content = format!(
+            "{}\n{}\n",
+            self.public_key_base64(),
+            self.secret_key_base64()
+        );
         file.write_all(content.as_bytes())
             .map_err(|e| PhantomError::Crypto(format!("Failed to write key file: {}", e)))?;
         let mut perms = fs::metadata(path)
             .map_err(|e| PhantomError::Crypto(format!("Failed to stat key file: {}", e)))?
             .permissions();
         perms.set_mode(0o600);
-        fs::set_permissions(path, perms)
-            .map_err(|e| PhantomError::Crypto(format!("Failed to set key file permissions: {}", e)))?;
+        fs::set_permissions(path, perms).map_err(|e| {
+            PhantomError::Crypto(format!("Failed to set key file permissions: {}", e))
+        })?;
         Ok(())
     }
 
@@ -94,7 +99,9 @@ impl KeyPair {
             .map_err(|e| PhantomError::Crypto(format!("Secret key decode failed: {}", e)))?;
 
         if public_decoded.len() != 32 || secret_decoded.len() != 32 {
-            return Err(PhantomError::Crypto("Keys must be 32 bytes each".to_string()));
+            return Err(PhantomError::Crypto(
+                "Keys must be 32 bytes each".to_string(),
+            ));
         }
 
         let mut public = [0u8; 32];

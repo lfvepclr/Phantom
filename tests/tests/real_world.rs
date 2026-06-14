@@ -1,8 +1,8 @@
 use phantom_core::CipherPreference;
+use phantom_core::protocol::TargetAddr;
 use phantom_e2e::mock_web::MockWebServer;
 use phantom_e2e::socks5::connect_tunnel;
 use phantom_e2e::throughput::echo_data;
-use phantom_core::protocol::TargetAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Helper: establish a Phantom tunnel to a specific IPv4 target address.

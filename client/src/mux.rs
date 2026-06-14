@@ -6,12 +6,12 @@
 //! keys using the implicit stream counter (1, 2, 3 …).
 
 use async_trait::async_trait;
-use phantom_core::{CipherPreference, PhantomError, Result};
 use phantom_core::crypto::cipher::CipherSuite;
 use phantom_core::crypto::session::CipherOffer;
-use phantom_core::crypto::{split_after_handshake, split_for_stream, NoiseInitiator};
-use phantom_core::transport::quic::{create_client_endpoint, QuicStream};
+use phantom_core::crypto::{NoiseInitiator, split_after_handshake, split_for_stream};
 use phantom_core::transport::Transport;
+use phantom_core::transport::quic::{QuicStream, create_client_endpoint};
+use phantom_core::{CipherPreference, PhantomError, Result};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -52,9 +52,12 @@ impl MuxSession {
         let connecting = endpoint
             .connect(addr, server_name)
             .map_err(|e| PhantomError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-        let conn = connecting
-            .await
-            .map_err(|e| PhantomError::Io(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e)))?;
+        let conn = connecting.await.map_err(|e| {
+            PhantomError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                e,
+            ))
+        })?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
             state: Arc::new(Mutex::new(MuxState::HandshakePending {

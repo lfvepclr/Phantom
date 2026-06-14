@@ -50,11 +50,11 @@ ls -l "$LIB_DIR/$DYLIB_NAME"
 
 # Step 3: swift build (SPM 编译 PhantomMac + PhantomMacBuilder)
 echo "[3/4] swift build -c release ..."
-( cd "$MAC_DIR" && swift build -c release )
+( cd "$MAC_DIR" && xcrun swift build -c release )
 
 # Step 4: 跑 bundler 生成 Phantom.app
 echo "[4/4] swift run PhantomMacBuilder ..."
-( cd "$MAC_DIR" && swift run -c release PhantomMacBuilder )
+( cd "$MAC_DIR" && xcrun swift run -c release PhantomMacBuilder )
 
 echo ""
 echo "════════════════════════════════════════════════"

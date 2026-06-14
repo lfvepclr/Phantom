@@ -5,6 +5,7 @@ members = [
     "server",
     "client",
     "client/cli",
+    "client/harmony",
     "tests",
     "tests/bench",
 ]
@@ -32,7 +33,6 @@ bytes = "1"
 
 # Crypto
 snow = { version = "0.9", features = ["risky-raw-split"] }
-ring = "0.17"
 base64 = "0.22"
 aes-gcm = "0.10"
 chacha20poly1305 = "0.10"

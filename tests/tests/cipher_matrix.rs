@@ -1,8 +1,8 @@
 use phantom_core::CipherPreference;
+use phantom_core::protocol::TargetAddr;
 use phantom_e2e::fixture::TestFixture;
 use phantom_e2e::socks5::connect_tunnel;
 use phantom_e2e::throughput::echo_data;
-use phantom_core::protocol::TargetAddr;
 
 fn target_from_fixture(fixture: &TestFixture) -> TargetAddr {
     match fixture.target_addr.ip() {

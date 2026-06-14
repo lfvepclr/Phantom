@@ -22,6 +22,7 @@ pub async fn run_uring_server(
     secret_key: [u8; 32],
     allowed_clients: Vec<[u8; 32]>,
     cipher_preference: phantom_core::CipherPreference,
+    verification_url: Option<String>,
 ) -> Result<()> {
     use tokio_uring::net::TcpListener;
     use tokio_uring::net::TcpStream;
@@ -35,8 +36,9 @@ pub async fn run_uring_server(
                 let sk = secret_key;
                 let allowed = allowed_clients.clone();
                 let cipher = cipher_preference;
+                let vurl = verification_url.clone();
                 tokio::spawn(async move {
-                    handle_uring_stream(stream, sk, &allowed, cipher).await;
+                    handle_uring_stream(stream, sk, &allowed, cipher, vurl.as_deref()).await;
                 });
             }
             Err(e) => {
@@ -52,10 +54,18 @@ async fn handle_uring_stream(
     secret_key: [u8; 32],
     allowed_clients: &[[u8; 32]],
     cipher_preference: phantom_core::CipherPreference,
+    verification_url: Option<&str>,
 ) {
     // tokio_uring::net::TcpStream implements AsyncRead + AsyncWrite,
     // so it can be passed directly to the generic handler.
-    crate::handler::handle_connection(stream, secret_key, allowed_clients, cipher_preference).await;
+    crate::handler::handle_connection(
+        stream,
+        secret_key,
+        allowed_clients,
+        cipher_preference,
+        verification_url,
+    )
+    .await;
 }
 
 /// Fallback: standard tokio listener (no io_uring).

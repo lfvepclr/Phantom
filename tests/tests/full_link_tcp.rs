@@ -1,10 +1,12 @@
 use phantom_core::CipherPreference;
+use phantom_core::protocol::TargetAddr;
 use phantom_e2e::fixture::TestFixture;
 use phantom_e2e::socks5::connect_tunnel;
 use phantom_e2e::throughput::{echo_data, generate_random_data};
-use phantom_core::protocol::TargetAddr;
 
-async fn setup_tunnel(fixture: &TestFixture) -> anyhow::Result<(
+async fn setup_tunnel(
+    fixture: &TestFixture,
+) -> anyhow::Result<(
     phantom_core::protocol::FrameReader<tokio::io::ReadHalf<tokio::net::TcpStream>>,
     phantom_core::protocol::FrameWriter<tokio::io::WriteHalf<tokio::net::TcpStream>>,
     u32,
@@ -44,7 +46,13 @@ async fn tcp_full_link_large_data() {
 
     let data = generate_random_data(64 * 1024);
     let echoed = echo_data(&mut reader, &mut writer, stream_id, &data).await;
-    assert_eq!(echoed.len(), data.len(), "Data length mismatch: sent {}, received {}", data.len(), echoed.len());
+    assert_eq!(
+        echoed.len(),
+        data.len(),
+        "Data length mismatch: sent {}, received {}",
+        data.len(),
+        echoed.len()
+    );
     assert_eq!(echoed, data, "Echoed 64KB data does not match original");
 }
 
@@ -69,7 +77,11 @@ async fn tcp_full_link_concurrent() {
 
         let handle = tokio::spawn(async move {
             let (mut reader, mut writer, stream_id) = connect_tunnel(
-                server_addr, &server_public, &client_secret, &target_clone, cipher,
+                server_addr,
+                &server_public,
+                &client_secret,
+                &target_clone,
+                cipher,
             )
             .await
             .unwrap();

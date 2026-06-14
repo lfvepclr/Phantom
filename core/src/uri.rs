@@ -11,22 +11,23 @@
 //! Example:
 //!   phantom://dGVzdA==@example.com:443?cipher=auto&proto=quic#primary
 
-use crate::{
-    CipherPreference, PhantomError, Result, ServerEntry, TransportProtocol,
-};
-use base64::{engine::general_purpose::STANDARD, Engine};
+use crate::{CipherPreference, PhantomError, Result, ServerEntry, TransportProtocol};
+use base64::{Engine, engine::general_purpose::STANDARD};
 
 /// Parse a phantom:// URI into a `ServerEntry`.
 pub fn parse_phantom_uri(uri: &str) -> Result<ServerEntry> {
-    let rest = uri.strip_prefix("phantom://")
+    let rest = uri
+        .strip_prefix("phantom://")
         .ok_or_else(|| PhantomError::Config("URI must start with phantom://".to_string()))?;
 
     // Split userinfo and the rest.
-    let (userinfo, rest) = rest.split_once('@')
+    let (userinfo, rest) = rest
+        .split_once('@')
         .ok_or_else(|| PhantomError::Config("URI missing @ separator".to_string()))?;
 
     // Decode base64 public key.
-    let public_key_bytes = STANDARD.decode(userinfo.trim())
+    let public_key_bytes = STANDARD
+        .decode(userinfo.trim())
         .map_err(|e| PhantomError::Config(format!("Invalid base64 public key: {}", e)))?;
     if public_key_bytes.len() != 32 {
         return Err(PhantomError::Config(format!(
@@ -67,9 +68,19 @@ fn parse_addr_query_fragment(rest: &str) -> (&str, Option<&str>, Option<String>)
     // URI format: host:port?query#fragment
     // Split fragment first (it comes last), then query.
     let (before_fragment, fragment) = rest.split_once('#').unwrap_or((rest, ""));
-    let (addr_part, query_part) = before_fragment.split_once('?').unwrap_or((before_fragment, ""));
-    let query = if query_part.is_empty() { None } else { Some(query_part) };
-    let name = if fragment.is_empty() { None } else { Some(fragment.to_string()) };
+    let (addr_part, query_part) = before_fragment
+        .split_once('?')
+        .unwrap_or((before_fragment, ""));
+    let query = if query_part.is_empty() {
+        None
+    } else {
+        Some(query_part)
+    };
+    let name = if fragment.is_empty() {
+        None
+    } else {
+        Some(fragment.to_string())
+    };
     (addr_part, query, name)
 }
 
@@ -155,7 +166,10 @@ mod tests {
         let entry = parse_phantom_uri(uri).unwrap();
         assert_eq!(entry.name, "default");
         assert_eq!(entry.address, "example.com:443");
-        assert_eq!(entry.public_key, "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=");
+        assert_eq!(
+            entry.public_key,
+            "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY="
+        );
         assert_eq!(entry.cipher, CipherPreference::Auto);
         assert_eq!(entry.protocol, TransportProtocol::Tcp);
     }
@@ -166,7 +180,10 @@ mod tests {
         let entry = parse_phantom_uri(uri).unwrap();
         assert_eq!(entry.name, "primary");
         assert_eq!(entry.address, "example.com:443");
-        assert_eq!(entry.public_key, "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=");
+        assert_eq!(
+            entry.public_key,
+            "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY="
+        );
         assert_eq!(entry.cipher, CipherPreference::Aes256Gcm);
         assert_eq!(entry.protocol, TransportProtocol::Quic);
     }

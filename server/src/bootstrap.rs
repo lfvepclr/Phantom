@@ -13,22 +13,22 @@
 //! In interactive mode (`phantom server -i`), the same flow is followed but
 //! the user is prompted for port / IP / cipher / protocol on stdin.
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use phantom_core::transport::{try_bind_quic_with_fallback, try_bind_tcp_with_fallback};
 
 use phantom_core::{
-    build_phantom_uri, parse_phantom_uri, CipherPreference, CongestionAlgorithm, KeyPair,
-    ServerConfig, ServerEntry, TransportProtocol,
+    CipherPreference, CongestionAlgorithm, KeyPair, ServerConfig, ServerEntry, TransportProtocol,
+    build_phantom_uri, parse_phantom_uri,
 };
 use std::io::{IsTerminal, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
-use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
 use qr2term::print_qr;
 
-use crate::{run_from_uri as run_from_uri_impl, run_with_options, BootstrapOptions};
+use crate::{BootstrapOptions, run_from_uri as run_from_uri_impl, run_with_options};
 
 /// Default port to attempt first.
 pub const DEFAULT_PORT: u16 = 443;
@@ -89,9 +89,7 @@ pub async fn run_auto(opts: AutoOptions) -> Result<()> {
     let (bound_port, _proto_ctx) = probe_port(protocol, start_port, max_tries)
         .await
         .with_context(|| {
-            format!(
-                "auto-bootstrap failed to find a free port starting at {start_port}"
-            )
+            format!("auto-bootstrap failed to find a free port starting at {start_port}")
         })?;
 
     let public_host = resolve_public_host(opts.public_host.as_deref());
@@ -133,6 +131,7 @@ pub async fn run_auto(opts: AutoOptions) -> Result<()> {
         protocol,
         quic_congestion: CongestionAlgorithm::default(),
         io_uring: false,
+        verification_url: None,
     };
 
     run_with_options(opts).await
@@ -173,7 +172,9 @@ pub async fn run_interactive(mut opts: AutoOptions) -> Result<()> {
         opts.public_host = Some(ip_raw);
     }
 
-    let cipher_raw = prompt("Cipher (auto / aes-256-gcm / aes-128-gcm / ascon-128 / chacha20-poly1305) [auto]: ")?;
+    let cipher_raw = prompt(
+        "Cipher (auto / aes-256-gcm / aes-128-gcm / ascon-128 / chacha20-poly1305) [auto]: ",
+    )?;
     if !cipher_raw.is_empty() {
         opts.cipher = Some(parse_cipher_interactive(&cipher_raw)?);
     }
@@ -238,6 +239,7 @@ pub async fn run_interactive(mut opts: AutoOptions) -> Result<()> {
         protocol,
         quic_congestion: CongestionAlgorithm::default(),
         io_uring: false,
+        verification_url: None,
     };
 
     run_with_options(opts).await
@@ -253,8 +255,8 @@ pub async fn run_from_uri(uri: &str) -> Result<()> {
         .to_str()
         .ok_or_else(|| anyhow!("non-UTF8 key path"))?;
     // First sanity-check: ensure URI's public key matches the local key.
-    let entry: ServerEntry = parse_phantom_uri(uri)
-        .map_err(|e| anyhow!("Failed to parse server URI: {}", e))?;
+    let entry: ServerEntry =
+        parse_phantom_uri(uri).map_err(|e| anyhow!("Failed to parse server URI: {}", e))?;
     if !paths.key_path.exists() {
         bail!(
             "URI bootstrap requires an existing key file at {}, but it does not exist",
@@ -408,16 +410,11 @@ struct TomlSnapshot<'a> {
 /// Write the generated `server.toml`. The file is intentionally annotated
 /// with the URI quick-link at the top so the operator can copy it for
 /// clients without digging through the rest of the file.
-fn write_server_toml(
-    path: &Path,
-    key_path: &Path,
-    snap: TomlSnapshot<'_>,
-) -> Result<()> {
+fn write_server_toml(path: &Path, key_path: &Path, snap: TomlSnapshot<'_>) -> Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() && !parent.exists() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create directory {}", parent.display())
-            })?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create directory {}", parent.display()))?;
         }
     }
 
@@ -447,9 +444,7 @@ fn write_server_toml(
     body.push_str(&format!("protocol = \"{protocol}\"\n"));
     body.push_str("\n");
     body.push_str("# --- Client whitelist ----------------------------------------------------\n");
-    body.push_str(
-        "# Add base64 X25519 public keys below. Empty list = OPEN mode (any client\n",
-    );
+    body.push_str("# Add base64 X25519 public keys below. Empty list = OPEN mode (any client\n");
     body.push_str(
         "# with the server's public key can connect). Reload by restarting the server.\n",
     );
@@ -645,10 +640,8 @@ mod tests {
     #[test]
     fn parse_allowed_clients_from_toml_empty_section() {
         // server.toml with no [[allowed_clients]] -> 0 keys.
-        let dir = std::env::temp_dir().join(format!(
-            "phantom_allowed_empty_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("phantom_allowed_empty_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("server.toml");
         std::fs::write(
@@ -669,10 +662,7 @@ cipher = "auto"
         let b64_str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
         assert_eq!(b64_str.len(), 44);
         let key = [0u8; 32];
-        let dir = std::env::temp_dir().join(format!(
-            "phantom_allowed_real_{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("phantom_allowed_real_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("server.toml");
         std::fs::write(
@@ -695,10 +685,8 @@ name = "alice"
 
     #[test]
     fn parse_allowed_clients_from_toml_missing_file_is_open() {
-        let dir = std::env::temp_dir().join(format!(
-            "phantom_allowed_missing_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("phantom_allowed_missing_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("server.toml"); // never created
         let parsed = test_helpers::load_allowed_clients_or_empty(&path);
@@ -717,10 +705,8 @@ name = "alice"
 
     #[test]
     fn write_server_toml_writes_uri_header_and_whitelist() {
-        let dir = std::env::temp_dir().join(format!(
-            "phantom_bootstrap_toml_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("phantom_bootstrap_toml_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("server.toml");
         let key_path = PathBuf::from("./server.key");
@@ -740,7 +726,10 @@ name = "alice"
         .unwrap();
         let body = std::fs::read_to_string(&path).unwrap();
         // Header must contain the URI quick link.
-        assert!(body.contains(uri), "URI quick link missing from server.toml");
+        assert!(
+            body.contains(uri),
+            "URI quick link missing from server.toml"
+        );
         // Header must point at the key file.
         assert!(body.contains("server.key"));
         // The bind field must reflect dummy_bind (0.0.0.0:8443).
@@ -756,10 +745,8 @@ name = "alice"
 
     #[test]
     fn write_server_toml_open_mode_omits_entries() {
-        let dir = std::env::temp_dir().join(format!(
-            "phantom_bootstrap_open_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("phantom_bootstrap_open_{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("server.toml");
         let key_path = PathBuf::from("./server.key");

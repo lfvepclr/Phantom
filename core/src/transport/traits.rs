@@ -1,5 +1,5 @@
-use async_trait::async_trait;
 use crate::Result;
+use async_trait::async_trait;
 use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncWrite};
 

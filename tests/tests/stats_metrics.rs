@@ -5,12 +5,12 @@
 //! TrafficStats::render_prometheus() directly and verify that counters
 //! are updated correctly after tunnel activity.
 
-use phantom_core::CipherPreference;
 use phantom_client::TrafficStats;
+use phantom_core::CipherPreference;
+use phantom_core::protocol::TargetAddr;
 use phantom_e2e::fixture::TestFixture;
 use phantom_e2e::socks5::connect_tunnel;
 use phantom_e2e::throughput::{echo_data, generate_random_data};
-use phantom_core::protocol::TargetAddr;
 use std::sync::atomic::Ordering;
 
 fn target_from_fixture(fixture: &TestFixture) -> TargetAddr {
@@ -28,13 +28,34 @@ fn stats_initial_zero_prometheus_format() {
     let output = stats.render_prometheus();
 
     // All counters should be zero initially
-    assert!(output.contains("phantom_tcp_bytes_up 0"), "tcp_bytes_up should start at 0");
-    assert!(output.contains("phantom_tcp_bytes_down 0"), "tcp_bytes_down should start at 0");
-    assert!(output.contains("phantom_udp_bytes_up 0"), "udp_bytes_up should start at 0");
-    assert!(output.contains("phantom_udp_bytes_down 0"), "udp_bytes_down should start at 0");
-    assert!(output.contains("phantom_tcp_connections 0"), "tcp_connections should start at 0");
-    assert!(output.contains("phantom_udp_datagrams_up 0"), "udp_datagrams_up should start at 0");
-    assert!(output.contains("phantom_udp_datagrams_down 0"), "udp_datagrams_down should start at 0");
+    assert!(
+        output.contains("phantom_tcp_bytes_up 0"),
+        "tcp_bytes_up should start at 0"
+    );
+    assert!(
+        output.contains("phantom_tcp_bytes_down 0"),
+        "tcp_bytes_down should start at 0"
+    );
+    assert!(
+        output.contains("phantom_udp_bytes_up 0"),
+        "udp_bytes_up should start at 0"
+    );
+    assert!(
+        output.contains("phantom_udp_bytes_down 0"),
+        "udp_bytes_down should start at 0"
+    );
+    assert!(
+        output.contains("phantom_tcp_connections 0"),
+        "tcp_connections should start at 0"
+    );
+    assert!(
+        output.contains("phantom_udp_datagrams_up 0"),
+        "udp_datagrams_up should start at 0"
+    );
+    assert!(
+        output.contains("phantom_udp_datagrams_down 0"),
+        "udp_datagrams_down should start at 0"
+    );
 
     // Verify TYPE annotations are present
     assert!(output.contains("# TYPE phantom_tcp_bytes_up counter"));
@@ -56,13 +77,34 @@ fn stats_record_traffic_and_render() {
     stats.record_udp_down(256);
 
     let output = stats.render_prometheus();
-    assert!(output.contains("phantom_tcp_connections 2"), "expected 2 TCP connections");
-    assert!(output.contains("phantom_tcp_bytes_up 1024"), "expected 1024 TCP bytes up");
-    assert!(output.contains("phantom_tcp_bytes_down 2048"), "expected 2048 TCP bytes down");
-    assert!(output.contains("phantom_udp_bytes_up 512"), "expected 512 UDP bytes up");
-    assert!(output.contains("phantom_udp_bytes_down 256"), "expected 256 UDP bytes down");
-    assert!(output.contains("phantom_udp_datagrams_up 1"), "expected 1 UDP datagram up");
-    assert!(output.contains("phantom_udp_datagrams_down 1"), "expected 1 UDP datagram down");
+    assert!(
+        output.contains("phantom_tcp_connections 2"),
+        "expected 2 TCP connections"
+    );
+    assert!(
+        output.contains("phantom_tcp_bytes_up 1024"),
+        "expected 1024 TCP bytes up"
+    );
+    assert!(
+        output.contains("phantom_tcp_bytes_down 2048"),
+        "expected 2048 TCP bytes down"
+    );
+    assert!(
+        output.contains("phantom_udp_bytes_up 512"),
+        "expected 512 UDP bytes up"
+    );
+    assert!(
+        output.contains("phantom_udp_bytes_down 256"),
+        "expected 256 UDP bytes down"
+    );
+    assert!(
+        output.contains("phantom_udp_datagrams_up 1"),
+        "expected 1 UDP datagram up"
+    );
+    assert!(
+        output.contains("phantom_udp_datagrams_down 1"),
+        "expected 1 UDP datagram down"
+    );
 }
 
 /// Verify that counters accumulate correctly across multiple record calls.

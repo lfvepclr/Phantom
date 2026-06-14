@@ -3,12 +3,12 @@
 //! Tests that the RuleEngine produces correct routing decisions and that
 //! traffic is proxied through the tunnel when the rule action is Proxy.
 
-use phantom_core::{CipherPreference, ClientRule, RuleAction, RulePattern, RulesConfig};
 use phantom_client::RuleEngine;
+use phantom_core::protocol::TargetAddr;
+use phantom_core::{CipherPreference, ClientRule, RuleAction, RulePattern, RulesConfig};
 use phantom_e2e::fixture::TestFixture;
 use phantom_e2e::socks5::connect_tunnel;
 use phantom_e2e::throughput::{echo_data, generate_random_data};
-use phantom_core::protocol::TargetAddr;
 use std::net::IpAddr;
 
 fn target_from_fixture(fixture: &TestFixture) -> TargetAddr {
@@ -69,7 +69,10 @@ async fn domain_suffix_proxy_routes_through_tunnel() {
 
     let data = generate_random_data(4096);
     let echoed = echo_data(&mut reader, &mut writer, stream_id, &data).await;
-    assert_eq!(echoed, data, "Echoed data should match through proxied tunnel");
+    assert_eq!(
+        echoed, data,
+        "Echoed data should match through proxied tunnel"
+    );
 }
 
 /// IP-CIDR rule with Direct action: IP ranges that match should route

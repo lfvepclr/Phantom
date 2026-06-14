@@ -1,8 +1,8 @@
+use crate::{PhantomError, Result};
 use aead::{Aead, AeadInPlace, KeyInit};
 use aes_gcm::{Aes128Gcm, Aes256Gcm};
 use ascon_aead::{AsconAead128, AsconAead128Nonce, AsconAead128Tag};
 use chacha20poly1305::ChaCha20Poly1305;
-use crate::{PhantomError, Result};
 use zeroize::Zeroize;
 
 use crate::crypto::cipher::CipherSuite;
@@ -26,7 +26,12 @@ enum OwnedCipher {
 
 impl AeadState {
     pub fn new(cipher: CipherSuite, key: &[u8], nonce_prefix: [u8; 4]) -> Self {
-        assert_eq!(key.len(), cipher.key_len(), "key length mismatch for {:?}", cipher);
+        assert_eq!(
+            key.len(),
+            cipher.key_len(),
+            "key length mismatch for {:?}",
+            cipher
+        );
         let owned = match cipher {
             CipherSuite::Aes256Gcm => {
                 OwnedCipher::Aes256Gcm(Aes256Gcm::new_from_slice(key).unwrap())
@@ -59,19 +64,23 @@ impl AeadState {
         match &self.cipher {
             OwnedCipher::Aes256Gcm(c) => {
                 let n = aes_gcm::Nonce::from_slice(&nonce[..12]);
-                c.encrypt(n, plaintext).map_err(|e| PhantomError::Crypto(format!("AES-256-GCM encrypt: {}", e)))
+                c.encrypt(n, plaintext)
+                    .map_err(|e| PhantomError::Crypto(format!("AES-256-GCM encrypt: {}", e)))
             }
             OwnedCipher::Aes128Gcm(c) => {
                 let n = aes_gcm::Nonce::from_slice(&nonce[..12]);
-                c.encrypt(n, plaintext).map_err(|e| PhantomError::Crypto(format!("AES-128-GCM encrypt: {}", e)))
+                c.encrypt(n, plaintext)
+                    .map_err(|e| PhantomError::Crypto(format!("AES-128-GCM encrypt: {}", e)))
             }
             OwnedCipher::Ascon128(c) => {
                 let n = AsconAead128Nonce::from_slice(&nonce[..16]);
-                c.encrypt(n, plaintext).map_err(|e| PhantomError::Crypto(format!("ASCON-128 encrypt: {}", e)))
+                c.encrypt(n, plaintext)
+                    .map_err(|e| PhantomError::Crypto(format!("ASCON-128 encrypt: {}", e)))
             }
             OwnedCipher::ChaCha20Poly(c) => {
                 let n = chacha20poly1305::Nonce::from_slice(&nonce[..12]);
-                c.encrypt(n, plaintext).map_err(|e| PhantomError::Crypto(format!("ChaCha20 encrypt: {}", e)))
+                c.encrypt(n, plaintext)
+                    .map_err(|e| PhantomError::Crypto(format!("ChaCha20 encrypt: {}", e)))
             }
         }
     }
@@ -85,22 +94,30 @@ impl AeadState {
         match &self.cipher {
             OwnedCipher::Aes256Gcm(c) => {
                 let n = aes_gcm::Nonce::from_slice(&nonce[..12]);
-                let tag = c.encrypt_in_place_detached(n, b"", payload).map_err(|e| PhantomError::Crypto(format!("AES-256-GCM encrypt_in_place: {}", e)))?;
+                let tag = c.encrypt_in_place_detached(n, b"", payload).map_err(|e| {
+                    PhantomError::Crypto(format!("AES-256-GCM encrypt_in_place: {}", e))
+                })?;
                 payload.extend_from_slice(&tag);
             }
             OwnedCipher::Aes128Gcm(c) => {
                 let n = aes_gcm::Nonce::from_slice(&nonce[..12]);
-                let tag = c.encrypt_in_place_detached(n, b"", payload).map_err(|e| PhantomError::Crypto(format!("AES-128-GCM encrypt_in_place: {}", e)))?;
+                let tag = c.encrypt_in_place_detached(n, b"", payload).map_err(|e| {
+                    PhantomError::Crypto(format!("AES-128-GCM encrypt_in_place: {}", e))
+                })?;
                 payload.extend_from_slice(&tag);
             }
             OwnedCipher::Ascon128(c) => {
                 let n = AsconAead128Nonce::from_slice(&nonce[..16]);
-                let tag = c.encrypt_in_place_detached(n, b"", payload).map_err(|e| PhantomError::Crypto(format!("ASCON-128 encrypt_in_place: {}", e)))?;
+                let tag = c.encrypt_in_place_detached(n, b"", payload).map_err(|e| {
+                    PhantomError::Crypto(format!("ASCON-128 encrypt_in_place: {}", e))
+                })?;
                 payload.extend_from_slice(&tag);
             }
             OwnedCipher::ChaCha20Poly(c) => {
                 let n = chacha20poly1305::Nonce::from_slice(&nonce[..12]);
-                let tag = c.encrypt_in_place_detached(n, b"", payload).map_err(|e| PhantomError::Crypto(format!("ChaCha20 encrypt_in_place: {}", e)))?;
+                let tag = c.encrypt_in_place_detached(n, b"", payload).map_err(|e| {
+                    PhantomError::Crypto(format!("ChaCha20 encrypt_in_place: {}", e))
+                })?;
                 payload.extend_from_slice(&tag);
             }
         }
@@ -114,19 +131,23 @@ impl AeadState {
         match &self.cipher {
             OwnedCipher::Aes256Gcm(c) => {
                 let n = aes_gcm::Nonce::from_slice(&nonce[..12]);
-                c.decrypt(n, ciphertext).map_err(|e| PhantomError::Crypto(format!("AES-256-GCM decrypt: {}", e)))
+                c.decrypt(n, ciphertext)
+                    .map_err(|e| PhantomError::Crypto(format!("AES-256-GCM decrypt: {}", e)))
             }
             OwnedCipher::Aes128Gcm(c) => {
                 let n = aes_gcm::Nonce::from_slice(&nonce[..12]);
-                c.decrypt(n, ciphertext).map_err(|e| PhantomError::Crypto(format!("AES-128-GCM decrypt: {}", e)))
+                c.decrypt(n, ciphertext)
+                    .map_err(|e| PhantomError::Crypto(format!("AES-128-GCM decrypt: {}", e)))
             }
             OwnedCipher::Ascon128(c) => {
                 let n = AsconAead128Nonce::from_slice(&nonce[..16]);
-                c.decrypt(n, ciphertext).map_err(|e| PhantomError::Crypto(format!("ASCON-128 decrypt: {}", e)))
+                c.decrypt(n, ciphertext)
+                    .map_err(|e| PhantomError::Crypto(format!("ASCON-128 decrypt: {}", e)))
             }
             OwnedCipher::ChaCha20Poly(c) => {
                 let n = chacha20poly1305::Nonce::from_slice(&nonce[..12]);
-                c.decrypt(n, ciphertext).map_err(|e| PhantomError::Crypto(format!("ChaCha20 decrypt: {}", e)))
+                c.decrypt(n, ciphertext)
+                    .map_err(|e| PhantomError::Crypto(format!("ChaCha20 decrypt: {}", e)))
             }
         }
     }
@@ -149,22 +170,34 @@ impl AeadState {
             OwnedCipher::Aes256Gcm(c) => {
                 let n = aes_gcm::Nonce::from_slice(&nonce[..12]);
                 let tag = aes_gcm::Tag::from_slice(&tag_bytes[..tag_len]);
-                c.decrypt_in_place_detached(n, b"", payload, &tag).map_err(|e| PhantomError::Crypto(format!("AES-256-GCM decrypt_in_place: {}", e)))?;
+                c.decrypt_in_place_detached(n, b"", payload, &tag)
+                    .map_err(|e| {
+                        PhantomError::Crypto(format!("AES-256-GCM decrypt_in_place: {}", e))
+                    })?;
             }
             OwnedCipher::Aes128Gcm(c) => {
                 let n = aes_gcm::Nonce::from_slice(&nonce[..12]);
                 let tag = aes_gcm::Tag::from_slice(&tag_bytes[..tag_len]);
-                c.decrypt_in_place_detached(n, b"", payload, &tag).map_err(|e| PhantomError::Crypto(format!("AES-128-GCM decrypt_in_place: {}", e)))?;
+                c.decrypt_in_place_detached(n, b"", payload, &tag)
+                    .map_err(|e| {
+                        PhantomError::Crypto(format!("AES-128-GCM decrypt_in_place: {}", e))
+                    })?;
             }
             OwnedCipher::Ascon128(c) => {
                 let n = AsconAead128Nonce::from_slice(&nonce[..16]);
                 let tag = AsconAead128Tag::from_slice(&tag_bytes[..tag_len]);
-                c.decrypt_in_place_detached(n, b"", payload, &tag).map_err(|e| PhantomError::Crypto(format!("ASCON-128 decrypt_in_place: {}", e)))?;
+                c.decrypt_in_place_detached(n, b"", payload, &tag)
+                    .map_err(|e| {
+                        PhantomError::Crypto(format!("ASCON-128 decrypt_in_place: {}", e))
+                    })?;
             }
             OwnedCipher::ChaCha20Poly(c) => {
                 let n = chacha20poly1305::Nonce::from_slice(&nonce[..12]);
                 let tag = chacha20poly1305::Tag::from_slice(&tag_bytes[..tag_len]);
-                c.decrypt_in_place_detached(n, b"", payload, &tag).map_err(|e| PhantomError::Crypto(format!("ChaCha20 decrypt_in_place: {}", e)))?;
+                c.decrypt_in_place_detached(n, b"", payload, &tag)
+                    .map_err(|e| {
+                        PhantomError::Crypto(format!("ChaCha20 decrypt_in_place: {}", e))
+                    })?;
             }
         }
         Ok(())
@@ -208,16 +241,24 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_aes256gcm() { test_roundtrip(CipherSuite::Aes256Gcm); }
+    fn roundtrip_aes256gcm() {
+        test_roundtrip(CipherSuite::Aes256Gcm);
+    }
 
     #[test]
-    fn roundtrip_aes128gcm() { test_roundtrip(CipherSuite::Aes128Gcm); }
+    fn roundtrip_aes128gcm() {
+        test_roundtrip(CipherSuite::Aes128Gcm);
+    }
 
     #[test]
-    fn roundtrip_ascon128() { test_roundtrip(CipherSuite::Ascon128); }
+    fn roundtrip_ascon128() {
+        test_roundtrip(CipherSuite::Ascon128);
+    }
 
     #[test]
-    fn roundtrip_chacha20poly() { test_roundtrip(CipherSuite::ChaCha20Poly); }
+    fn roundtrip_chacha20poly() {
+        test_roundtrip(CipherSuite::ChaCha20Poly);
+    }
 
     #[test]
     fn in_place_roundtrip() {
