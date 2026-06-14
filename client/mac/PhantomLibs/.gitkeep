@@ -1,3 +1,0 @@
-# Placeholder so PhantomLibs/ stays in the repo.
-# scripts/build-mac.sh copies the real libphantom_client.dylib here at build time
-# (the .dylib itself is gitignored — see .gitignore).

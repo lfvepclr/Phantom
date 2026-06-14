@@ -190,7 +190,17 @@ graph LR
 
 ## 构建
 
-### 一键脚本（推荐）
+### 统一构建系统（推荐）
+
+```bash
+# 从项目根目录
+cargo xtask build android          # release 构建
+cargo xtask build android --debug  # debug 构建
+```
+
+`cargo xtask` 会自动检查依赖（NDK、Rust target 等），调用 `scripts/build-android.sh` 脚本。
+
+### 一键脚本
 
 ```bash
 scripts/build-android.sh              # 默认 release
@@ -203,6 +213,31 @@ ALL_TARGETS=1 scripts/build-android.sh  # 全 ABI
 - [`cargo-ndk`](https://github.com/bbqsrc/cargo-ndk)：`cargo install cargo-ndk`
 - Android NDK：设置 `ANDROID_NDK_HOME`
 
+脚本会：
+1. `rustup target add aarch64-linux-android` — 安装 Android Rust target
+2. `cargo build -p phantom-client --lib --target aarch64-linux-android` — 编译 Rust cdylib
+3. 复制 `libphantom_client.so` → `jniLibs/arm64-v8a/`
+4. 可选 Gradle APK 构建
+
+### 构建产物
+
+```
+client/android/app/src/main/
+├── jniLibs/                        # Rust cdylib（gitignore）
+│   └── arm64-v8a/
+│       └── libphantom_client.so
+└── res/
+    ├── drawable/                   # 自适应图标前景/背景
+    │   ├── ic_launcher_foreground.png
+    │   └── ic_launcher_background.xml
+    └── mipmap/                     # 自适应图标配置
+        ├── ic_launcher.xml
+        └── ic_launcher_round.xml
+
+client/android/app/build/outputs/   # APK 产物（gitignore）
+└── apk/debug/app-debug.apk
+```
+
 ### 手动构建
 
 ```bash
@@ -214,6 +249,23 @@ CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$ANDROID_NDK_HOME/toolchains/llvm/preb
 cp target/aarch64-linux-android/release/libphantom_client.so \
    client/android/app/src/main/jniLibs/arm64-v8a/
 ```
+
+### 重新生成图标
+
+```bash
+# 统一构建系统
+cargo xtask icons              # 生成所有平台图标（含 Android 5 密度）
+```
+
+或手动使用 `sips` 从 `appicon.png` 生成自适应图标前景：
+
+| 密度 | 尺寸 (px) | 目录 |
+|------|-----------|------|
+| mdpi | 108 | `drawable-mdpi/` |
+| hdpi | 162 | `drawable-hdpi/` |
+| xhdpi | 216 | `drawable-xhdpi/` |
+| xxhdpi | 324 | `drawable-xxhdpi/` |
+| xxxhdpi | 432 | `drawable-xxxhdpi/` |
 
 ### Gradle 构建
 
@@ -243,7 +295,7 @@ cargo test -p phantom-client
 
 ```bash
 # ADB 安装
-adb install app/build/outputs/apk/release/app-release.apk
+adb install app/build/outputs/apk/debug/app-debug.apk
 
 # Android Studio
 # Run on device → 自动安装

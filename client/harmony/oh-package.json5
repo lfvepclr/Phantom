@@ -1,0 +1,14 @@
+{
+  "modelVersion": "5.0.0",
+  "name": "phantom",
+  "version": "0.1.0",
+  "description": "Phantom VPN Client for HarmonyOS",
+  "main": "",
+  "author": "",
+  "license": "Apache-2.0",
+  "dependencies": {},
+  "overrides": {},
+  "devDependencies": {
+    "@ohos/hypium": "1.0.21"
+  }
+}

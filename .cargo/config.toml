@@ -6,3 +6,18 @@ registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"
 
 [net]
 git-fetch-with-cli = true
+
+# cargo xtask alias: `cargo xtask <args>` → `cargo run -p xtask -- <args>`
+[alias]
+xtask = "run -p xtask --"
+
+# HarmonyOS cross-compilation (aarch64-unknown-linux-ohos)
+[target.aarch64-unknown-linux-ohos]
+linker = "/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/native/llvm/bin/aarch64-unknown-linux-ohos-clang"
+
+# Environment overrides for ohos target builds
+[env]
+CC_aarch64-unknown-linux-ohos = "/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/native/llvm/bin/aarch64-unknown-linux-ohos-clang"
+CXX_aarch64-unknown-linux-ohos = "/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/native/llvm/bin/aarch64-unknown-linux-ohos-clang++"
+AR_aarch64-unknown-linux-ohos = "/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/native/llvm/bin/llvm-ar"
+RANLIB_aarch64-unknown-linux-ohos = "/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/native/llvm/bin/llvm-ranlib"

@@ -3,8 +3,23 @@ build/
 .preview/
 entry/build/
 
+# Hvigor build tool cache
+.hvigor/
+
+# OHPM dependencies (like node_modules)
+oh_modules/
+
+# Signing certificates & keys (sensitive)
+signing/
+
 # Rust cross-compile output
 rust/target/
+
+# Rust .so output (built by scripts/build-harmony.sh)
+entry/src/main/libs/
+
+# Tool artifacts
+.codegenie/
 
 # macOS
 .DS_Store

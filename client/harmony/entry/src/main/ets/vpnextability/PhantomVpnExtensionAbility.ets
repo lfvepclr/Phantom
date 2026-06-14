@@ -1,4 +1,5 @@
 import { VpnExtensionAbility } from '@kit.NetworkKit';
+import phantomLib from 'libphantom_harmony.so';
 
 // HarmonyOS VPN extension entry point.
 // This ability receives a protected fd from the system and passes it to the
@@ -11,7 +12,7 @@ export default class PhantomVpnExtensionAbility extends VpnExtensionAbility {
   onDestroy(): void {
     console.info('[Phantom] VpnExtensionAbility onDestroy');
     try {
-      (globalThis as any).phantomHarmonyStop();
+      phantomLib.phantomHarmonyStop();
     } catch (e) {
       console.error('[Phantom] stop on destroy: ' + JSON.stringify(e));
     }

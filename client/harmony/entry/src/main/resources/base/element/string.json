@@ -1,10 +1,6 @@
 {
   "string": [
     {
-      "name": "app_name",
-      "value": "Phantom"
-    },
-    {
       "name": "module_desc",
       "value": "Phantom HarmonyOS entry module"
     },

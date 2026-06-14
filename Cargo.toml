@@ -6,8 +6,16 @@ members = [
     "client",
     "client/cli",
     "client/harmony",
+    "xtask",
     "tests",
     "tests/bench",
+]
+
+default-members = [
+    "core",
+    "server",
+    "client",
+    "client/cli",
 ]
 
 [workspace.package]
