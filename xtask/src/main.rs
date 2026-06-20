@@ -158,6 +158,18 @@ fn check_deps() -> Vec<DepStatus> {
         hint: "Install: https://developer.huawei.com/consumer/cn/deveco-studio/",
     });
 
+    // Java (required by hap-sign-tool for HAP signing)
+    let java_ok = Command::new("java")
+        .arg("-version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    deps.push(DepStatus {
+        name: "Java (hap-sign-tool)",
+        installed: java_ok,
+        hint: "Install JDK 17+ (bundled with DevEco Studio)",
+    });
+
     // Gradle (for Android APK)
     let gradlew = root.join("client/android/gradlew");
     let gradle_ok = gradlew.exists();
@@ -228,11 +240,24 @@ fn is_available(target: &str) -> bool {
                 .installed;
             ndk && target
         }
-        "harmony" => deps
-            .iter()
-            .find(|d| d.name == "Rust aarch64-unknown-linux-ohos")
-            .unwrap()
-            .installed,
+        "harmony" => {
+            let rust_target = deps
+                .iter()
+                .find(|d| d.name == "Rust aarch64-unknown-linux-ohos")
+                .unwrap()
+                .installed;
+            let deveco = deps
+                .iter()
+                .find(|d| d.name == "DevEco Studio / OHOS SDK")
+                .unwrap()
+                .installed;
+            let java = deps
+                .iter()
+                .find(|d| d.name == "Java (hap-sign-tool)")
+                .unwrap()
+                .installed;
+            rust_target && deveco && java
+        }
         _ => false,
     }
 }
@@ -303,17 +328,131 @@ fn build_android(release: bool) -> Result<()> {
 
 fn build_harmony(release: bool) -> Result<()> {
     let root = project_root();
-    let script = root.join("scripts/build-harmony.sh");
-    if !script.exists() {
-        bail!("scripts/build-harmony.sh not found");
-    }
-    let mut cmd = Command::new("bash");
-    cmd.arg(&script);
-    if !release {
-        cmd.env("BUILD_MODE", "debug");
+    let harmony_dir = root.join("client/harmony");
+    let target = "aarch64-unknown-linux-ohos";
+    let profile = if release { "release" } else { "debug" };
+
+    // ── Step 1: Build Rust .so ──
+    let mut cmd = cargo_cmd();
+    cmd.arg("build")
+        .arg("-p")
+        .arg("phantom-harmony")
+        .arg("--target")
+        .arg(target);
+    if release {
+        cmd.arg("--release");
     }
     cmd.current_dir(&root);
-    run_cmd(&mut cmd, "Build HarmonyOS .so")
+    run_cmd(&mut cmd, "Build phantom-harmony .so")?;
+
+    // ── Step 2: Copy .so to entry/src/main/libs/arm64-v8a/ ──
+    let so_src = root
+        .join("target")
+        .join(target)
+        .join(profile)
+        .join("libphantom_harmony.so");
+    if !so_src.exists() {
+        bail!("Rust .so not found: {}. Build may have failed.", so_src.display());
+    }
+    let libs_dir = harmony_dir.join("entry/src/main/libs/arm64-v8a");
+    fs::create_dir_all(&libs_dir)?;
+    let so_dst = libs_dir.join("libphantom_harmony.so");
+    fs::copy(&so_src, &so_dst)?;
+    println!("  Copied .so -> {}", so_dst.display());
+
+    // ── Step 3: hvigor assembleHap ──
+    let deveco_sdk = env::var("DEVECO_SDK_HOME")
+        .unwrap_or_else(|_| "/Applications/DevEco-Studio.app/Contents/sdk".to_string());
+    let node_home = env::var("NODE_HOME")
+        .unwrap_or_else(|_| "/Applications/DevEco-Studio.app/Contents/tools/node".to_string());
+    let hvigorw = "/Applications/DevEco-Studio.app/Contents/tools/hvigor/bin/hvigorw";
+    if !Path::new(hvigorw).exists() {
+        bail!("hvigorw not found at {}. Install DevEco Studio NEXT.", hvigorw);
+    }
+
+    let build_mode = if release { "release" } else { "debug" };
+    let mut cmd = Command::new("bash");
+    cmd.arg(hvigorw)
+        .arg("--mode")
+        .arg("module")
+        .arg("-p")
+        .arg("product=default")
+        .arg("-p")
+        .arg(format!("buildMode={}", build_mode))
+        .arg("--no-daemon")
+        .arg("assembleHap")
+        .env("DEVECO_SDK_HOME", &deveco_sdk)
+        .env("NODE_HOME", &node_home)
+        .current_dir(&harmony_dir);
+    run_cmd(&mut cmd, "hvigor assembleHap")?;
+
+    // ── Step 4: Sign HAP with hap-sign-tool.jar ──
+    let hap_sign_tool = Path::new(&deveco_sdk)
+        .join("default/openharmony/toolchains/lib/hap-sign-tool.jar");
+    if !hap_sign_tool.exists() {
+        bail!("hap-sign-tool.jar not found at {}. Check DEVECO_SDK_HOME.", hap_sign_tool.display());
+    }
+
+    let unsigned_hap = harmony_dir
+        .join("entry/build/default/outputs/default/entry-default-unsigned.hap");
+    if !unsigned_hap.exists() {
+        bail!("Unsigned HAP not found: {}", unsigned_hap.display());
+    }
+
+    let signing_dir = harmony_dir.join("signing");
+    let keystore = signing_dir.join("OpenHarmony.p12");
+    let app_cert = signing_dir.join("OpenHarmonyAppCertChain.cer");
+    let debug_profile = signing_dir.join("OpenHarmonyDebug.p7b");
+
+    for (name, path) in [
+        ("keystore", &keystore),
+        ("app cert chain", &app_cert),
+        ("debug profile", &debug_profile),
+    ] {
+        if !path.exists() {
+            bail!("Signing file '{}' not found: {}", name, path.display());
+        }
+    }
+
+    let signed_name = if release {
+        "entry-default-signed.hap"
+    } else {
+        "entry-default-debug-signed.hap"
+    };
+    let signed_hap = harmony_dir.join(signed_name);
+
+    let mut cmd = Command::new("java");
+    cmd.arg("-jar")
+        .arg(&hap_sign_tool)
+        .arg("sign-app")
+        .arg("-mode")
+        .arg("localSign")
+        .arg("-keyAlias")
+        .arg("openharmony application release")
+        .arg("-keyPwd")
+        .arg("123456")
+        .arg("-keystoreFile")
+        .arg(&keystore)
+        .arg("-keystorePwd")
+        .arg("123456")
+        .arg("-signAlg")
+        .arg("SHA256withECDSA")
+        .arg("-appCertFile")
+        .arg(&app_cert)
+        .arg("-profileFile")
+        .arg(&debug_profile)
+        .arg("-inFile")
+        .arg(&unsigned_hap)
+        .arg("-outFile")
+        .arg(&signed_hap)
+        .current_dir(&harmony_dir);
+    run_cmd(&mut cmd, "Sign HAP (hap-sign-tool)")?;
+
+    println!();
+    println!("  Signed HAP: {}", signed_hap.display());
+    println!("  Install:    hdc install {}", signed_hap.display());
+
+    Ok(())
 }
 
 // ── Icons ────────────────────────────────────────────────────────────────────
