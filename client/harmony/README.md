@@ -367,8 +367,8 @@ client/harmony/
 
 ## TODO
 
-- [ ] VpnExtensionAbility TUN 创建与 fd 传递实现
-- [ ] 将签名流程集成到 cargo xtask build harmony
+- [ ] VpnExtensionAbility TUN 创建与 fd 传递实现（当前 Index.ets 使用 placeholderFd=-1）
+- [x] 将签名流程集成到 cargo xtask build harmony（`cargo xtask build harmony --debug` 一键打包签名 HAP）
 - [ ] 电量测试（长时间运行功耗数据采集）
-- [ ] NAPI 事件通道优化（替代轮询）
-- [ ] CI 自动化构建
+- [ ] NAPI 事件通道优化（替代轮询，当前 500ms setInterval）
+- [x] CI 自动化构建（`cargo xtask build harmony` 全流程：.so 构建 → hvigor → hap-sign-tool 签名）
