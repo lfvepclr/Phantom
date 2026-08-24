@@ -8,6 +8,11 @@
 #   sudo systemctl restart phantom
 #
 # 详细说明见 deploy/README.md §2。
+#
+# 注意：private_key 指向的文件是三行格式 —— 第 1 行公钥、第 2 行私钥、
+# 第 3 行握手 PSK。必须整体拷贝，不能只拷前两行。若文件只有两行（PSK
+# 支持之前生成的），启动时会自动补一个 PSK 并回写，此时已分发的 URI 全部
+# 失效，需重新分发启动日志里打印的新 URI。
 
 bind = "0.0.0.0:443"
 private_key = "/etc/phantom/server_private"
@@ -19,10 +24,6 @@ max_streams = 100
 keep_alive_interval = 45
 congestion = "cubic"          # cubic / bbr / new-reno
 
-[tls]
-disguise = false              # stub，未实现
-
 [performance]
 io_uring = false              # Linux 5.1+
-zero_copy = false
 workers = 0                   # 0 = CPU 核心数

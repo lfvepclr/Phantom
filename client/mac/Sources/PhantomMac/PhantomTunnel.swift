@@ -12,6 +12,7 @@ enum ProxyMode: String, CaseIterable {
 /// The actual tunnel (utun creation, packet processing, encryption)
 /// runs entirely inside the Rust cdylib.  This Swift class is purely
 /// a control-plane wrapper that polls the real Rust state machine.
+@MainActor
 class PhantomTunnel: ObservableObject {
     @Published var isRunning = false
     @Published var status = "Idle"
@@ -48,8 +49,9 @@ class PhantomTunnel: ObservableObject {
         logCursor = 0
         startLogPolling()
 
+        let uri = serverURI
         Task { [weak self] in
-            let rc = phantomMacosStartWithURI(serverURI, modeString)
+            let rc = phantomMacosStartWithURI(uri, modeString)
             await MainActor.run {
                 guard let self else { return }
                 if rc != 0 {
@@ -82,7 +84,10 @@ class PhantomTunnel: ObservableObject {
     private func startStatusPolling() {
         stopStatusPolling()
         statusTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
-            self?.pollStatusOnce()
+            // Timer fires on the main run loop; the closure itself is @Sendable.
+            MainActor.assumeIsolated {
+                self?.pollStatusOnce()
+            }
         }
     }
 
@@ -134,7 +139,9 @@ class PhantomTunnel: ObservableObject {
     private func startLogPolling() {
         stopLogPolling()
         logTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
-            self?.pollLogsOnce()
+            MainActor.assumeIsolated {
+                self?.pollLogsOnce()
+            }
         }
     }
 

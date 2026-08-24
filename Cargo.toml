@@ -53,8 +53,17 @@ cfg-if = "1"
 zeroize = { version = "1.8", features = ["derive"] }
 
 # QUIC
-quinn = { version = "0.11", features = ["rustls-ring"] }
-rcgen = "0.13"
+#
+# `default-features = false` drops quinn's rustls/ring stack: the Noise
+# handshake from quinn-hyphae replaces TLS entirely, which is what keeps the
+# whole dependency tree free of C code. Verify with `cargo tree -i ring`.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "log"] }
+quinn-hyphae = "0.1.0-beta.0"
+hyphae-handshake = "0.1.0-beta.0"
+
+# Raw socket options (SO_SNDBUF/SO_RCVBUF sized to the path BDP)
+socket2 = "0.5"
+libc = "0.2"
 
 # Logging
 tracing = "0.1"
@@ -82,3 +91,12 @@ divan = "0.1"
 phantom-core = { path = "core" }
 phantom-client = { path = "client" }
 phantom-server = { path = "server" }
+
+# Release builds: cross-crate inlining + single codegen unit for maximum
+# runtime performance (hot crypto/relay paths span crate boundaries).
+# panic=abort: no #[should_panic] tests exist; smaller/faster binaries.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"

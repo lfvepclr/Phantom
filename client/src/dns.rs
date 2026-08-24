@@ -12,9 +12,22 @@ use bytes::{Bytes, BytesMut};
 use phantom_core::{PhantomError, Result};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
+
+/// Parse a `client.dns` config value into a socket address.
+///
+/// Accepts a bare IP (`1.1.1.1` → port 53), an `ip:port` pair, and tolerates
+/// the `tls://` / `https://` scheme prefixes used in the config templates.
+pub fn parse_dns_addr(dns: &str) -> Option<SocketAddr> {
+    let stripped = dns.strip_prefix("tls://").unwrap_or(dns);
+    let stripped = stripped.strip_prefix("https://").unwrap_or(stripped);
+    stripped
+        .parse()
+        .ok()
+        .or_else(|| format!("{}:53", stripped).parse().ok())
+}
 
 /// Simple DNS header (12 bytes).
 #[derive(Debug, Clone, Copy)]
@@ -108,7 +121,9 @@ pub struct DnsQueryContext {
 /// Shared DNS proxy state.
 pub struct DnsProxy {
     socket: Arc<UdpSocket>,
-    upstream: SocketAddr,
+    /// Upstream resolver. Behind a lock so a config hot reload can retarget it
+    /// without tearing down the socket and losing in-flight queries.
+    upstream: RwLock<SocketAddr>,
     /// Pending queries: DNS transaction ID -> original TUN context.
     pending: Arc<Mutex<std::collections::HashMap<u16, DnsQueryContext>>>,
     /// Query domain names tracked so we can populate the DNS cache from responses.
@@ -129,7 +144,7 @@ impl DnsProxy {
         );
         Ok(Self {
             socket: Arc::new(socket),
-            upstream: upstream_addr,
+            upstream: RwLock::new(upstream_addr),
             pending: Arc::new(Mutex::new(std::collections::HashMap::new())),
             query_domains: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
@@ -147,7 +162,7 @@ impl DnsProxy {
         }
         self.pending.lock().await.insert(id, ctx);
         self.socket
-            .send_to(payload, self.upstream)
+            .send_to(payload, self.upstream())
             .await
             .map_err(|e| PhantomError::Io(e))?;
         Ok(id)
@@ -190,7 +205,21 @@ impl DnsProxy {
     }
 
     pub fn upstream(&self) -> SocketAddr {
-        self.upstream
+        *self.upstream.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Retarget the upstream resolver. Returns `true` when it actually changed.
+    ///
+    /// In-flight queries keep their pending entries, so responses that arrive
+    /// from the previous upstream after the swap are still delivered.
+    pub fn set_upstream(&self, addr: SocketAddr) -> bool {
+        let mut guard = self.upstream.write().unwrap_or_else(|e| e.into_inner());
+        if *guard == addr {
+            return false;
+        }
+        tracing::info!("DNS upstream changed: {} -> {}", *guard, addr);
+        *guard = addr;
+        true
     }
 }
 
@@ -349,6 +378,43 @@ pub fn build_dns_response_packet(payload: &[u8], ctx: &DnsQueryContext) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_dns_addr_accepts_tls_prefix() {
+        assert_eq!(
+            parse_dns_addr("tls://8.8.8.8:853"),
+            Some("8.8.8.8:853".parse().unwrap())
+        );
+        assert_eq!(
+            parse_dns_addr("https://1.1.1.1:443"),
+            Some("1.1.1.1:443".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn parse_dns_addr_defaults_to_port_53() {
+        assert_eq!(
+            parse_dns_addr("1.1.1.1"),
+            Some("1.1.1.1:53".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn parse_dns_addr_rejects_garbage() {
+        assert_eq!(parse_dns_addr("not-an-address"), None);
+    }
+
+    #[tokio::test]
+    async fn set_upstream_swaps_resolver_once() {
+        let proxy = DnsProxy::new("8.8.8.8:53".parse().unwrap()).await.unwrap();
+        assert_eq!(proxy.upstream(), "8.8.8.8:53".parse().unwrap());
+
+        assert!(proxy.set_upstream("1.1.1.1:53".parse().unwrap()));
+        assert_eq!(proxy.upstream(), "1.1.1.1:53".parse().unwrap());
+        // Re-applying the same address is reported as "no change" so the
+        // hot-reload watcher stays quiet on unrelated config edits.
+        assert!(!proxy.set_upstream("1.1.1.1:53".parse().unwrap()));
+    }
 
     #[test]
     fn decode_dns_header() {

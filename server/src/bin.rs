@@ -1,7 +1,7 @@
 use anyhow::Result;
 use phantom_core::ServerConfig;
 
-#[cfg(all(feature = "io-uring", target_os = "linux"))]
+#[cfg(all(feature = "io-uring", target_os = "linux", target_env = "gnu"))]
 fn main() -> Result<()> {
     let config_path = std::env::args()
         .nth(1)
@@ -18,7 +18,7 @@ fn main() -> Result<()> {
     tokio_uring::start(async { phantom_server::run(&config_path).await })
 }
 
-#[cfg(not(all(feature = "io-uring", target_os = "linux")))]
+#[cfg(not(all(feature = "io-uring", target_os = "linux", target_env = "gnu")))]
 fn main() -> Result<()> {
     let config_path = std::env::args()
         .nth(1)

@@ -14,6 +14,11 @@ fn phantom_bin() -> String {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".to_string());
     let workspace = Path::new(&manifest_dir).parent().unwrap();
     let bin_path = workspace.join("target").join("debug").join("phantom");
+    assert!(
+        bin_path.exists(),
+        "phantom CLI binary not found at {}; build it first with `cargo build -p phantom-cli`",
+        bin_path.display()
+    );
     bin_path.to_string_lossy().to_string()
 }
 
@@ -23,6 +28,21 @@ fn phantom_bin() -> String {
 fn pick_free_port() -> u16 {
     let l = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     l.local_addr().unwrap().port()
+}
+
+/// Pick a free port and shift it by `offset` so concurrent tests in this file
+/// do not collide.
+///
+/// The shift wraps into the ephemeral range instead of using `+`, which
+/// overflowed `u16` whenever the OS handed out a port above `65535 - offset`
+/// and made these tests fail at random.
+fn pick_free_port_offset(offset: u16) -> u16 {
+    const EPHEMERAL_BASE: u16 = 20_000;
+    let base = pick_free_port();
+    match base.checked_add(offset) {
+        Some(p) => p,
+        None => EPHEMERAL_BASE + (base % 1_000) + offset,
+    }
 }
 
 /// Spawn `phantom` with the given args, running it inside `cwd`. Stdout and
@@ -118,7 +138,7 @@ fn cli_server_auto_generates_key_and_uri() {
     let dir = workspace_tmp("phantom_cli_auto");
     fs::create_dir_all(&dir).unwrap();
     // Use a non-default port so we never conflict with other tests / 443.
-    let port = pick_free_port() + 1000;
+    let port = pick_free_port_offset(1000);
     let port_arg = port.to_string();
 
     let mut child = spawn_phantom_with_cwd(
@@ -126,11 +146,12 @@ fn cli_server_auto_generates_key_and_uri() {
         &dir,
     );
 
-    // Wait up to 5s for server.toml to appear.
+    // Wait up to 15s for server.toml to appear (spawning a real process under
+    // parallel test load can exceed a tight 5s budget).
     let toml_path = dir.join("server.toml");
     assert!(
-        wait_for_file(&toml_path, Duration::from_secs(5)),
-        "server.toml was not created within 5s",
+        wait_for_file(&toml_path, Duration::from_secs(15)),
+        "server.toml was not created within 15s",
     );
 
     // Stop the server.
@@ -239,8 +260,8 @@ fn cli_server_auto_port_fallback() {
 
     let toml_path = dir.join("server.toml");
     assert!(
-        wait_for_file(&toml_path, Duration::from_secs(5)),
-        "server.toml was not created within 5s",
+        wait_for_file(&toml_path, Duration::from_secs(15)),
+        "server.toml was not created within 15s",
     );
 
     let _ = child.kill();
@@ -296,7 +317,7 @@ fn cli_server_auto_reuses_existing_key() {
     fs::create_dir_all(&dir).unwrap();
 
     // First run: generate.
-    let port_a = pick_free_port() + 2000;
+    let port_a = pick_free_port_offset(2000);
     let port_a_str = port_a.to_string();
     let mut first = spawn_phantom_with_cwd(
         &[
@@ -322,7 +343,7 @@ fn cli_server_auto_reuses_existing_key() {
     thread::sleep(Duration::from_millis(200));
 
     // Second run: reuse.
-    let port_b = pick_free_port() + 3000;
+    let port_b = pick_free_port_offset(3000);
     let port_b_str = port_b.to_string();
     let mut second = spawn_phantom_with_cwd(
         &[
@@ -348,6 +369,129 @@ fn cli_server_auto_reuses_existing_key() {
     );
 
     let _ = fs::remove_dir_all(&dir);
+}
+
+/// A syntactically valid `phantom://` URI. Points at a closed port: every test
+/// using it asserts on argument validation, which happens before any I/O.
+fn dummy_server_uri() -> String {
+    let key = KeyPair::generate().unwrap().public_key_base64();
+    format!("phantom://{}@127.0.0.1:1/", key)
+}
+
+/// Run `phantom` and return the merged stdout+stderr plus the exit success flag.
+fn run_phantom(args: &[&str]) -> (bool, String) {
+    let result = Command::new(phantom_bin())
+        .args(args)
+        .output()
+        .expect("failed to execute phantom binary");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    (result.status.success(), combined)
+}
+
+/// `--gateway` is meaningless without `--tun`; clap must reject it.
+#[test]
+fn cli_client_gateway_requires_tun() {
+    let (ok, out) = run_phantom(&["client", "--gateway"]);
+    assert!(!ok, "`--gateway` alone should fail. output: {}", out);
+    assert!(
+        out.contains("--tun"),
+        "error should mention the missing --tun requirement, got: {}",
+        out
+    );
+}
+
+/// The LAN-side flags only make sense together with `--gateway`.
+#[test]
+fn cli_client_lan_flags_require_gateway() {
+    for args in [
+        vec!["client", "--tun", "--lan-interface", "br0"],
+        vec!["client", "--tun", "--table", "200"],
+        vec!["client", "--tun", "--no-lan-dns-hijack"],
+    ] {
+        let (ok, out) = run_phantom(&args);
+        assert!(!ok, "{:?} should fail without --gateway. output: {}", args, out);
+        assert!(
+            out.contains("--gateway"),
+            "error for {:?} should mention --gateway, got: {}",
+            args,
+            out
+        );
+    }
+}
+
+/// The TUN tuning flags only make sense together with `--tun`.
+#[test]
+fn cli_client_tun_flags_require_tun() {
+    for args in [
+        vec!["client", "--tun-name", "phantom0"],
+        vec!["client", "--tun-addr", "10.7.0.1/24"],
+        vec!["client", "--tun-mtu", "1400"],
+    ] {
+        let (ok, out) = run_phantom(&args);
+        assert!(!ok, "{:?} should fail without --tun. output: {}", args, out);
+    }
+}
+
+/// A malformed `--tun-addr` must be rejected before any network or device I/O.
+#[test]
+fn cli_client_rejects_malformed_tun_addr() {
+    let uri = dummy_server_uri();
+    for bad in ["not-an-ip/24", "10.7.0.1/33", "10.7.0.1/abc"] {
+        let (ok, out) = run_phantom(&["client", "--server", &uri, "--tun", "--tun-addr", bad]);
+        assert!(!ok, "--tun-addr {} should fail. output: {}", bad, out);
+        assert!(
+            out.contains("--tun-addr"),
+            "error for {} should name the offending flag, got: {}",
+            bad,
+            out
+        );
+    }
+}
+
+/// `--gateway` relies on iproute2 policy routing, so it is Linux-only. On other
+/// platforms it must fail fast with an explanation rather than silently doing
+/// nothing.
+#[test]
+#[cfg(not(target_os = "linux"))]
+fn cli_client_gateway_rejected_off_linux() {
+    let uri = dummy_server_uri();
+    let (ok, out) = run_phantom(&["client", "--server", &uri, "--tun", "--gateway"]);
+    assert!(!ok, "--gateway should fail off Linux. output: {}", out);
+    assert!(
+        out.contains("only supported on Linux"),
+        "expected a Linux-only explanation, got: {}",
+        out
+    );
+}
+
+/// `phantom client --help` must document the TUN / gateway surface so the
+/// router deployment path is discoverable from the CLI itself.
+#[test]
+fn cli_client_help_documents_tun_and_gateway() {
+    let (ok, out) = run_phantom(&["client", "--help"]);
+    assert!(ok, "`client --help` should succeed. output: {}", out);
+    for flag in [
+        "--tun",
+        "--tun-name",
+        "--tun-addr",
+        "--tun-mtu",
+        "--gateway",
+        "--lan-interface",
+        "--bypass",
+        "--table",
+        "--no-lan-dns-hijack",
+    ] {
+        assert!(
+            out.contains(flag),
+            "`client --help` should list {}, got:\n{}",
+            flag,
+            out
+        );
+    }
 }
 
 /// Extract the quick-link `phantom://` URI emitted by bootstrap as a

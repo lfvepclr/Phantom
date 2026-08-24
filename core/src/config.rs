@@ -19,6 +19,19 @@ impl Default for CipherPreference {
     }
 }
 
+impl CipherPreference {
+    /// Effective preference for a concrete server: the per-server value (from
+    /// the `cipher=` URI parameter) wins over the client-wide default whenever
+    /// it is explicitly set. `Auto` on both sides means "offer everything".
+    pub fn effective_for(server: CipherPreference, client_default: CipherPreference) -> Self {
+        if server != CipherPreference::Auto {
+            server
+        } else {
+            client_default
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum CongestionAlgorithm {
@@ -29,7 +42,10 @@ pub enum CongestionAlgorithm {
 
 impl Default for CongestionAlgorithm {
     fn default() -> Self {
-        Self::Cubic
+        // BBR performs strictly better on lossy/high-RTT paths (it does not
+        // collapse on packet loss the way Cubic does) and is no worse on
+        // clean links, so it is the default; Cubic/NewReno stay selectable.
+        Self::Bbr
     }
 }
 
@@ -59,6 +75,24 @@ pub struct ClientSettings {
     pub mode: ProxyMode,
     #[serde(default)]
     pub cipher: CipherPreference,
+    /// Prometheus metrics HTTP endpoint. Both the SOCKS5-only and TUN runtimes
+    /// serve it; bind failures are logged and ignored (metrics must never take
+    /// down the data plane).
+    #[serde(default = "default_metrics_listen")]
+    pub metrics_listen: String,
+    /// Optional authentication for the local proxy ingress (SOCKS5 RFC1929
+    /// username/password and HTTP Basic). Required when sharing the proxy on
+    /// a LAN (`listen = "0.0.0.0:..."`); absent by default so a loopback-only
+    /// proxy stays zero-config.
+    #[serde(default)]
+    pub proxy_auth: Option<ProxyAuthConfig>,
+}
+
+/// Username/password credentials for the local proxy ingress.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProxyAuthConfig {
+    pub username: String,
+    pub password: String,
 }
 
 fn default_listen() -> String {
@@ -73,6 +107,10 @@ fn default_proxy_mode() -> ProxyMode {
     ProxyMode::Smart
 }
 
+fn default_metrics_listen() -> String {
+    "127.0.0.1:9150".to_string()
+}
+
 impl Default for ClientSettings {
     fn default() -> Self {
         Self {
@@ -80,6 +118,8 @@ impl Default for ClientSettings {
             dns: default_dns(),
             mode: default_proxy_mode(),
             cipher: CipherPreference::Auto,
+            metrics_listen: default_metrics_listen(),
+            proxy_auth: None,
         }
     }
 }
@@ -204,10 +244,34 @@ pub struct ServerEntry {
     pub name: String,
     pub address: String,
     pub public_key: String,
+    /// Base64 pre-shared key mixed into the Noise handshake. Normally carried by
+    /// the `phantom://` URI (`psk=`); a value here overrides the URI.
+    ///
+    /// Empty means "not configured", which is rejected at connect time rather
+    /// than silently falling back to a PSK-less handshake.
+    #[serde(default)]
+    pub psk: String,
     #[serde(default)]
     pub cipher: CipherPreference,
     #[serde(default)]
     pub protocol: TransportProtocol,
+}
+
+impl ServerEntry {
+    /// Decode the configured PSK.
+    ///
+    /// Fails loudly when absent: a missing PSK must never degrade into a
+    /// handshake without one.
+    pub fn decode_psk(&self) -> Result<crate::crypto::Psk> {
+        if self.psk.trim().is_empty() {
+            return Err(PhantomError::Config(format!(
+                "server '{}' has no PSK; add `psk=<base64>` to the phantom:// URI \
+                 or set `psk` in the [[servers]] entry",
+                self.name
+            )));
+        }
+        crate::crypto::Psk::from_base64(&self.psk)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -223,7 +287,9 @@ pub struct FailoverConfig {
 }
 
 fn default_health_check_interval() -> u64 {
-    30
+    // 5s keeps worst-case failover detection at ~10s (interval x threshold);
+    // the previous 30s x 3 made outages linger for over a minute.
+    5
 }
 
 fn default_health_check_timeout() -> u64 {
@@ -231,7 +297,7 @@ fn default_health_check_timeout() -> u64 {
 }
 
 fn default_failover_threshold() -> u32 {
-    3
+    2
 }
 
 fn default_graceful_migration() -> bool {
@@ -343,8 +409,6 @@ pub struct TlsConfig {
     pub cert: Option<String>,
     #[serde(default)]
     pub key: Option<String>,
-    #[serde(default)]
-    pub disguise: bool,
 }
 
 impl Default for TlsConfig {
@@ -352,7 +416,6 @@ impl Default for TlsConfig {
         Self {
             cert: None,
             key: None,
-            disguise: false,
         }
     }
 }
@@ -361,8 +424,6 @@ impl Default for TlsConfig {
 pub struct PerformanceConfig {
     #[serde(default)]
     pub io_uring: bool,
-    #[serde(default)]
-    pub zero_copy: bool,
     #[serde(default = "default_workers")]
     pub workers: u32,
 }
@@ -375,7 +436,6 @@ impl Default for PerformanceConfig {
     fn default() -> Self {
         Self {
             io_uring: false,
-            zero_copy: false,
             workers: default_workers(),
         }
     }
@@ -520,15 +580,14 @@ io_uring = true
         assert_eq!(config.bind, "0.0.0.0:443");
         assert!(!config.quic.enable);
         assert!(config.performance.io_uring);
-        assert!(!config.tls.disguise);
     }
 
     #[test]
     fn default_failover_config() {
         let config = FailoverConfig::default();
-        assert_eq!(config.health_check_interval, 30);
+        assert_eq!(config.health_check_interval, 5);
         assert_eq!(config.health_check_timeout, 5);
-        assert_eq!(config.failover_threshold, 3);
+        assert_eq!(config.failover_threshold, 2);
         assert!(config.graceful_migration);
     }
 }

@@ -8,7 +8,7 @@ use phantom_core::protocol::TargetAddr;
 use phantom_e2e::echo::EchoMode;
 use phantom_e2e::fixture::TestFixture;
 use phantom_e2e::socks5::connect_tunnel;
-use phantom_e2e::throughput::{echo_data, generate_random_data, measure_echo_throughput};
+use phantom_e2e::throughput::{echo_data, measure_echo_throughput};
 use std::time::Instant;
 
 fn target_from_fixture(fixture: &TestFixture) -> TargetAddr {
@@ -28,6 +28,7 @@ async fn perf_tcp_throughput_aes256gcm() {
         fixture.server_addr,
         &fixture.server_key.public,
         &fixture.client_key.secret,
+        &fixture.psk,
         &target_from_fixture(&fixture),
         fixture.cipher_preference,
     )
@@ -51,6 +52,7 @@ async fn perf_tcp_throughput_ascon128() {
         fixture.server_addr,
         &fixture.server_key.public,
         &fixture.client_key.secret,
+        &fixture.psk,
         &target_from_fixture(&fixture),
         fixture.cipher_preference,
     )
@@ -75,6 +77,7 @@ async fn perf_tcp_throughput_chacha20poly1305() {
         fixture.server_addr,
         &fixture.server_key.public,
         &fixture.client_key.secret,
+        &fixture.psk,
         &target_from_fixture(&fixture),
         fixture.cipher_preference,
     )
@@ -101,6 +104,7 @@ async fn perf_handshake_latency_aes256gcm() {
         fixture.server_addr,
         &fixture.server_key.public,
         &fixture.client_key.secret,
+        &fixture.psk,
         &target_from_fixture(&fixture),
         fixture.cipher_preference,
     )
@@ -126,6 +130,7 @@ async fn perf_handshake_latency_ascon128() {
         fixture.server_addr,
         &fixture.server_key.public,
         &fixture.client_key.secret,
+        &fixture.psk,
         &target_from_fixture(&fixture),
         fixture.cipher_preference,
     )
@@ -151,6 +156,7 @@ async fn perf_handshake_latency_chacha20poly1305() {
         fixture.server_addr,
         &fixture.server_key.public,
         &fixture.client_key.secret,
+        &fixture.psk,
         &target_from_fixture(&fixture),
         fixture.cipher_preference,
     )
@@ -176,6 +182,7 @@ async fn perf_handshake_latency_aes128gcm() {
         fixture.server_addr,
         &fixture.server_key.public,
         &fixture.client_key.secret,
+        &fixture.psk,
         &target_from_fixture(&fixture),
         fixture.cipher_preference,
     )
@@ -208,11 +215,12 @@ async fn perf_concurrent_connections() {
         let server_addr = fixture.server_addr;
         let server_public = fixture.server_key.public;
         let client_secret = fixture.client_key.secret;
+        let psk = fixture.psk.clone();
         let target = target_from_fixture(&fixture);
         let cipher = fixture.cipher_preference;
         let handle = tokio::spawn(async move {
             let (mut reader, mut writer, stream_id) =
-                connect_tunnel(server_addr, &server_public, &client_secret, &target, cipher)
+                connect_tunnel(server_addr, &server_public, &client_secret, &psk, &target, cipher)
                     .await
                     .unwrap();
             let mut data = vec![0u8; payload_size];
@@ -266,6 +274,7 @@ async fn perf_cipher_comparison() {
             fixture.server_addr,
             &fixture.server_key.public,
             &fixture.client_key.secret,
+            &fixture.psk,
             &target_from_fixture(&fixture),
             fixture.cipher_preference,
         )

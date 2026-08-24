@@ -135,6 +135,7 @@ async fn stats_after_tunnel_echo() {
         fixture.server_addr,
         &fixture.server_key.public,
         &fixture.client_key.secret,
+        &fixture.psk,
         &target_from_fixture(&fixture),
         fixture.cipher_preference,
     )

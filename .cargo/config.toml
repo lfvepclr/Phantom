@@ -1,8 +1,8 @@
 [source.crates-io]
-replace-with = 'ustc'
+replace-with = 'rsproxy-sparse'
 
-[source.ustc]
-registry = "sparse+https://mirrors.ustc.edu.cn/crates.io-index/"
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
 
 [net]
 git-fetch-with-cli = true
@@ -11,13 +11,32 @@ git-fetch-with-cli = true
 [alias]
 xtask = "run -p xtask --"
 
+# Hardware crypto backends (RustCrypto cfg flags, stable since Rust 1.61):
+#   aes_armv8          — AES ARMv8 crypto intrinsics (aes 0.8.4)
+#   polyval_armv8      — GHASH PMULL intrinsics (polyval 0.6.2, via ghash)
+#   chacha20_force_neon — ChaCha20 NEON backend (chacha20 0.9.1)
+# Without these flags every cipher falls back to pure-software implementations
+# (measured: AES-256-GCM ~177 MiB/s on Apple Silicon instead of multi-GB/s).
+# Runtime CPU detection still applies on Linux/macOS (falls back on CPUs
+# without the crypto extensions); on ohos the intrinsics are used unconditionally
+# (all Kirin targets ship the ARMv8 crypto unit).
+[target.aarch64-apple-darwin]
+rustflags = ["--cfg=aes_armv8", "--cfg=polyval_armv8", "--cfg=chacha20_force_neon"]
+
 # HarmonyOS cross-compilation (aarch64-unknown-linux-ohos)
 [target.aarch64-unknown-linux-ohos]
 linker = "/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/native/llvm/bin/aarch64-unknown-linux-ohos-clang"
+rustflags = ["--cfg=aes_armv8", "--cfg=polyval_armv8", "--cfg=chacha20_force_neon"]
 
-# Environment overrides for ohos target builds
-[env]
-CC_aarch64-unknown-linux-ohos = "/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/native/llvm/bin/aarch64-unknown-linux-ohos-clang"
-CXX_aarch64-unknown-linux-ohos = "/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/native/llvm/bin/aarch64-unknown-linux-ohos-clang++"
-AR_aarch64-unknown-linux-ohos = "/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/native/llvm/bin/llvm-ar"
-RANLIB_aarch64-unknown-linux-ohos = "/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/native/llvm/bin/llvm-ranlib"
+# Router / Linux-ARM cross-compilation (statically linked musl targets).
+#
+# `rust-lld` ships with the Rust toolchain and the dependency tree is pure
+# Rust (no ring, no C shims), so neither musl-gcc nor a clang probe is needed.
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["--cfg=aes_armv8", "--cfg=polyval_armv8", "--cfg=chacha20_force_neon"]
+
+# Legacy 32-bit ARMv7 routers (hard-float). Same story: rust-lld links, the
+# pure-Rust dependency tree means no C cross toolchain is involved.
+[target.armv7-unknown-linux-musleabihf]
+linker = "rust-lld"

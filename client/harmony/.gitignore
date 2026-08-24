@@ -15,8 +15,11 @@ signing/
 # Rust cross-compile output
 rust/target/
 
-# Rust .so output (built by scripts/build-harmony.sh)
-entry/src/main/libs/
+# Rust .so output (copied by `cargo xtask build harmony`; hvigor pickup dir)
+entry/libs/
+
+# Signed HAP artifacts
+/*-signed.hap
 
 # Tool artifacts
 .codegenie/

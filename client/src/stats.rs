@@ -63,6 +63,36 @@ impl TrafficStats {
     }
 }
 
+/// Serve Prometheus metrics over HTTP.
+///
+/// Shared by the SOCKS5-only and TUN runtimes. A bind failure (port already
+/// in use, sandbox restrictions) is logged at debug level and the task simply
+/// returns: observability must never take down the data plane.
+pub async fn serve_metrics(stats: Arc<TrafficStats>, listen: std::net::SocketAddr) {
+    use tokio::io::AsyncWriteExt;
+    let listener = match tokio::net::TcpListener::bind(listen).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::debug!("Metrics server bind failed on {}: {}", listen, e);
+            return;
+        }
+    };
+    tracing::info!("Metrics endpoint: http://{}/metrics", listen);
+    loop {
+        let (mut stream, _) = match listener.accept().await {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let body = stats.render_prometheus();
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(resp.as_bytes()).await;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

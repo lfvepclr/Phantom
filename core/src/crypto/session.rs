@@ -136,33 +136,13 @@ impl SessionKeys {
     /// Derive session keys from Noise split keys.
     /// `k1` = initiator→responder key, `k2` = responder→initiator key.
     /// `is_initiator` determines which key is for writing vs reading.
+    ///
+    /// The `phantom-v2-` info prefix is part of the wire protocol: the TCP
+    /// path has derived keys with it since v2, so it must not change. (QUIC
+    /// does not use SessionKeys at all — Noise runs at the connection level
+    /// there and streams carry plaintext frames.)
     pub fn derive(k1: &[u8; 32], k2: &[u8; 32], cipher: CipherSuite, is_initiator: bool) -> Self {
-        Self::derive_internal(k1, k2, cipher, is_initiator, None)
-    }
-
-    /// Derive per-stream session keys from the parent connection's Noise split keys.
-    /// Uses stream_id in the HKDF info to guarantee key isolation between streams.
-    pub fn derive_stream(
-        k1: &[u8; 32],
-        k2: &[u8; 32],
-        cipher: CipherSuite,
-        is_initiator: bool,
-        stream_id: u32,
-    ) -> Self {
-        Self::derive_internal(k1, k2, cipher, is_initiator, Some(stream_id))
-    }
-
-    fn derive_internal(
-        k1: &[u8; 32],
-        k2: &[u8; 32],
-        cipher: CipherSuite,
-        is_initiator: bool,
-        stream_id: Option<u32>,
-    ) -> Self {
-        let info_prefix = match stream_id {
-            Some(id) => format!("phantom-v3-stream-{}-{}", id, cipher.name()),
-            None => format!("phantom-v2-{}", cipher.name()),
-        };
+        let info_prefix = format!("phantom-v2-{}", cipher.name());
 
         let c2s_key = hkdf_expand(k1, &format!("{}-c2s", info_prefix), cipher.key_len());
         let s2c_key = hkdf_expand(k2, &format!("{}-s2c", info_prefix), cipher.key_len());
@@ -214,47 +194,7 @@ pub fn split_after_handshake<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    split_stream(stream, split_keys, cipher, is_initiator, None)
-}
-
-/// Split a stream using per-stream derived keys for multiplexed connections.
-/// Does NOT perform a Noise handshake; keys are derived from the parent
-/// connection's split_keys via HKDF with stream_id.
-pub fn split_for_stream<S>(
-    stream: S,
-    split_keys: &([u8; 32], [u8; 32]),
-    cipher: CipherSuite,
-    is_initiator: bool,
-    stream_id: u32,
-) -> (
-    SessionReader<tokio::io::ReadHalf<S>>,
-    SessionWriter<tokio::io::WriteHalf<S>>,
-)
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    split_stream(stream, *split_keys, cipher, is_initiator, Some(stream_id))
-}
-
-fn split_stream<S>(
-    stream: S,
-    split_keys: ([u8; 32], [u8; 32]),
-    cipher: CipherSuite,
-    is_initiator: bool,
-    stream_id: Option<u32>,
-) -> (
-    SessionReader<tokio::io::ReadHalf<S>>,
-    SessionWriter<tokio::io::WriteHalf<S>>,
-)
-where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
-{
-    let session_keys = match stream_id {
-        Some(id) => {
-            SessionKeys::derive_stream(&split_keys.0, &split_keys.1, cipher, is_initiator, id)
-        }
-        None => SessionKeys::derive(&split_keys.0, &split_keys.1, cipher, is_initiator),
-    };
+    let session_keys = SessionKeys::derive(&split_keys.0, &split_keys.1, cipher, is_initiator);
     let (read_half, write_half) = tokio::io::split(stream);
 
     let read_state = AeadState::new(

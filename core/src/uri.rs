@@ -4,12 +4,16 @@
 //!   phantom://<base64_public_key>@<host>:<port>[?<query>][#<name>]
 //!
 //! Query params:
+//!   - psk=<base64>  pre-shared key mixed into the Noise handshake
 //!   - cipher=auto|aes-256-gcm|aes-128-gcm|ascon-128|chacha20-poly1305
 //!   - proto=tcp|quic
 //!   - congestion=cubic|bbr|new-reno
 //!
 //! Example:
-//!   phantom://dGVzdA==@example.com:443?cipher=auto&proto=quic#primary
+//!   phantom://dGVzdA==@example.com:443?psk=...&cipher=auto&proto=quic#primary
+//!
+//! Because the URI carries both the server public key and the PSK it is a
+//! complete credential: distribute it over a secure channel only.
 
 use crate::{CipherPreference, PhantomError, Result, ServerEntry, TransportProtocol};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -43,12 +47,18 @@ pub fn parse_phantom_uri(uri: &str) -> Result<ServerEntry> {
     // Parse query params.
     let mut cipher = CipherPreference::Auto;
     let mut protocol = TransportProtocol::Tcp;
+    let mut psk = String::new();
     if let Some(q) = query {
         for param in q.split('&') {
             if let Some((key, value)) = param.split_once('=') {
                 match key {
                     "cipher" => cipher = parse_cipher(value)?,
                     "proto" => protocol = parse_protocol(value)?,
+                    // Validate eagerly so a malformed PSK is caught here rather
+                    // than surfacing as an opaque handshake failure later.
+                    "psk" => {
+                        psk = crate::crypto::Psk::from_base64(value)?.to_base64();
+                    }
                     _ => {}
                 }
             }
@@ -59,6 +69,7 @@ pub fn parse_phantom_uri(uri: &str) -> Result<ServerEntry> {
         name: name.unwrap_or_else(|| "default".to_string()),
         address: addr_part.to_string(),
         public_key,
+        psk,
         cipher,
         protocol,
     })
@@ -129,23 +140,29 @@ fn protocol_to_str(protocol: TransportProtocol) -> &'static str {
 /// `server.toml` quick-link comment.
 ///
 /// Format:
-///   `phantom://<base64_public_key>@<host>:<port>?cipher=<c>&proto=<p>[#<name>]`
+///   `phantom://<base64_public_key>@<host>:<port>?psk=<k>&cipher=<c>&proto=<p>[#<name>]`
 ///
-/// When `name` is `None` or empty, no fragment is appended.
+/// When `name` is `None` or empty, no fragment is appended. `psk_base64` is
+/// omitted when empty, but every server the bootstrap emits has one.
 pub fn build_phantom_uri(
     public_key_base64: &str,
     address: &str,
+    psk_base64: &str,
     cipher: CipherPreference,
     protocol: TransportProtocol,
     name: Option<&str>,
 ) -> String {
-    let mut uri = format!(
-        "phantom://{}@{}?cipher={}&proto={}",
-        public_key_base64,
-        address,
+    let mut uri = format!("phantom://{}@{}?", public_key_base64, address);
+    if !psk_base64.is_empty() {
+        uri.push_str("psk=");
+        uri.push_str(psk_base64);
+        uri.push('&');
+    }
+    uri.push_str(&format!(
+        "cipher={}&proto={}",
         cipher_to_str(cipher),
         protocol_to_str(protocol),
-    );
+    ));
     if let Some(n) = name {
         if !n.is_empty() {
             uri.push('#');
@@ -159,6 +176,10 @@ pub fn build_phantom_uri(
 mod tests {
     use super::*;
 
+    /// 32 zero bytes, base64-encoded — a syntactically valid PSK.
+    const PSK_B64: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    const KEY_B64: &str = "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=";
+
     #[test]
     fn parse_minimal_uri() {
         // base64("abcdefghijklmnopqrstuvwxyz123456") = 32 bytes, valid key
@@ -166,26 +187,38 @@ mod tests {
         let entry = parse_phantom_uri(uri).unwrap();
         assert_eq!(entry.name, "default");
         assert_eq!(entry.address, "example.com:443");
-        assert_eq!(
-            entry.public_key,
-            "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY="
-        );
+        assert_eq!(entry.public_key, KEY_B64);
         assert_eq!(entry.cipher, CipherPreference::Auto);
         assert_eq!(entry.protocol, TransportProtocol::Tcp);
+        // No psk= in the URI leaves the field empty; decode_psk must then fail.
+        assert!(entry.psk.is_empty());
+        assert!(entry.decode_psk().is_err());
     }
 
     #[test]
     fn parse_full_uri() {
-        let uri = "phantom://YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=@example.com:443?cipher=aes-256-gcm&proto=quic#primary";
-        let entry = parse_phantom_uri(uri).unwrap();
+        let uri = format!(
+            "phantom://{}@example.com:443?psk={}&cipher=aes-256-gcm&proto=quic#primary",
+            KEY_B64, PSK_B64
+        );
+        let entry = parse_phantom_uri(&uri).unwrap();
         assert_eq!(entry.name, "primary");
         assert_eq!(entry.address, "example.com:443");
-        assert_eq!(
-            entry.public_key,
-            "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY="
-        );
+        assert_eq!(entry.public_key, KEY_B64);
+        assert_eq!(entry.psk, PSK_B64);
         assert_eq!(entry.cipher, CipherPreference::Aes256Gcm);
         assert_eq!(entry.protocol, TransportProtocol::Quic);
+        assert!(entry.decode_psk().is_ok());
+    }
+
+    #[test]
+    fn parse_rejects_malformed_psk() {
+        // "dGVzdA==" decodes to 4 bytes, not 32.
+        let short = format!("phantom://{}@example.com:443?psk=dGVzdA==", KEY_B64);
+        assert!(parse_phantom_uri(&short).is_err());
+
+        let garbage = format!("phantom://{}@example.com:443?psk=!!!", KEY_B64);
+        assert!(parse_phantom_uri(&garbage).is_err());
     }
 
     #[test]
@@ -217,38 +250,61 @@ mod tests {
     fn build_minimal_uri() {
         // No name → no fragment; cipher defaults to auto / proto tcp via call-site.
         let uri = build_phantom_uri(
-            "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=",
+            KEY_B64,
             "example.com:443",
+            PSK_B64,
             CipherPreference::Auto,
             TransportProtocol::Tcp,
             None,
         );
         assert_eq!(
             uri,
-            "phantom://YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=@example.com:443?cipher=auto&proto=tcp"
+            format!(
+                "phantom://{}@example.com:443?psk={}&cipher=auto&proto=tcp",
+                KEY_B64, PSK_B64
+            )
         );
+    }
+
+    #[test]
+    fn build_omits_empty_psk() {
+        let uri = build_phantom_uri(
+            KEY_B64,
+            "example.com:443",
+            "",
+            CipherPreference::Auto,
+            TransportProtocol::Tcp,
+            None,
+        );
+        assert!(!uri.contains("psk="));
+        assert!(uri.contains("?cipher=auto"));
     }
 
     #[test]
     fn build_full_uri() {
         let uri = build_phantom_uri(
-            "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=",
+            KEY_B64,
             "example.com:443",
+            PSK_B64,
             CipherPreference::Aes256Gcm,
             TransportProtocol::Quic,
             Some("primary"),
         );
         assert_eq!(
             uri,
-            "phantom://YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=@example.com:443?cipher=aes-256-gcm&proto=quic#primary"
+            format!(
+                "phantom://{}@example.com:443?psk={}&cipher=aes-256-gcm&proto=quic#primary",
+                KEY_B64, PSK_B64
+            )
         );
     }
 
     #[test]
     fn build_uri_no_name() {
         let uri = build_phantom_uri(
-            "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=",
+            KEY_B64,
             "1.2.3.4:443",
+            PSK_B64,
             CipherPreference::ChaCha20Poly1305,
             TransportProtocol::Tcp,
             None,
@@ -260,8 +316,9 @@ mod tests {
     #[test]
     fn build_uri_empty_name_omits_fragment() {
         let uri = build_phantom_uri(
-            "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=",
+            KEY_B64,
             "example.com:443",
+            PSK_B64,
             CipherPreference::Auto,
             TransportProtocol::Tcp,
             Some(""),
@@ -271,10 +328,11 @@ mod tests {
 
     #[test]
     fn build_uri_roundtrip() {
-        // Build then parse; all fields should agree.
+        // Build then parse; all fields including the PSK should agree.
         let original = build_phantom_uri(
-            "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY=",
+            KEY_B64,
             "example.com:443",
+            PSK_B64,
             CipherPreference::Ascon128,
             TransportProtocol::Quic,
             Some("primary"),
@@ -282,10 +340,8 @@ mod tests {
         let parsed = parse_phantom_uri(&original).expect("round-trip parse");
         assert_eq!(parsed.name, "primary");
         assert_eq!(parsed.address, "example.com:443");
-        assert_eq!(
-            parsed.public_key,
-            "YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXoxMjM0NTY="
-        );
+        assert_eq!(parsed.public_key, KEY_B64);
+        assert_eq!(parsed.psk, PSK_B64);
         assert_eq!(parsed.cipher, CipherPreference::Ascon128);
         assert_eq!(parsed.protocol, TransportProtocol::Quic);
     }

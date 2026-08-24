@@ -27,5 +27,9 @@ quinn = { workspace = true }
 qr2term = { workspace = true }
 serde_json = { workspace = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+# tokio-uring needs glibc's statx bindings, which the musl libc crate does
+# not provide — the io-uring feature is therefore limited to gnu targets.
+# On musl (e.g. the static server-arm64 build) enabling it is a no-op with a
+# compile-time warning, and the server falls back to the epoll runtime.
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
 tokio-uring = { version = "0.5", optional = true }

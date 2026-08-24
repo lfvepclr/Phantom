@@ -2,7 +2,7 @@ use phantom_core::CipherPreference;
 use phantom_core::protocol::TargetAddr;
 use phantom_e2e::mock_web::MockWebServer;
 use phantom_e2e::socks5::connect_tunnel;
-use phantom_e2e::throughput::echo_data;
+use phantom_e2e::throughput::{echo_data, exchange_data};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Helper: establish a Phantom tunnel to a specific IPv4 target address.
@@ -10,8 +10,12 @@ async fn tunnel_to_ipv4(
     fixture: &phantom_e2e::fixture::TestFixture,
     target_addr: std::net::SocketAddr,
 ) -> anyhow::Result<(
-    phantom_core::protocol::FrameReader<tokio::io::ReadHalf<tokio::net::TcpStream>>,
-    phantom_core::protocol::FrameWriter<tokio::io::WriteHalf<tokio::net::TcpStream>>,
+    phantom_core::protocol::FrameReader<
+        phantom_core::SessionReader<tokio::io::ReadHalf<tokio::net::TcpStream>>,
+    >,
+    phantom_core::protocol::FrameWriter<
+        phantom_core::SessionWriter<tokio::io::WriteHalf<tokio::net::TcpStream>>,
+    >,
     u32,
 )> {
     let ip_bytes = match target_addr.ip() {
@@ -23,6 +27,7 @@ async fn tunnel_to_ipv4(
         fixture.server_addr,
         &fixture.server_key.public,
         &fixture.client_key.secret,
+        &fixture.psk,
         &target,
         fixture.cipher_preference,
     )
@@ -49,7 +54,11 @@ async fn mock_baidu_through_proxy() {
         mock_server.addr
     );
     let data = request.into_bytes();
-    let response_bytes = echo_data(&mut reader, &mut writer, stream_id, &data).await;
+    // exchange_data (not echo_data): HTTP/1.1 `Connection: close` servers
+    // (axum/hyper) drop in-flight responses when they see a client half-close,
+    // so the request must be sent WITHOUT a trailing FIN and the response read
+    // until the server closes the stream. See throughput.rs for the rationale.
+    let response_bytes = exchange_data(&mut reader, &mut writer, stream_id, &data).await;
 
     let response = String::from_utf8_lossy(&response_bytes);
     assert!(
@@ -78,7 +87,8 @@ async fn mock_baidu_health_check() {
         mock_server.addr
     );
     let data = request.into_bytes();
-    let response_bytes = echo_data(&mut reader, &mut writer, stream_id, &data).await;
+    // Same as above: no client FIN before the response arrives.
+    let response_bytes = exchange_data(&mut reader, &mut writer, stream_id, &data).await;
 
     let response = String::from_utf8_lossy(&response_bytes);
     assert!(
@@ -101,6 +111,7 @@ async fn real_baidu_global_mode() {
         fixture.server_addr,
         &fixture.server_key.public,
         &fixture.client_key.secret,
+        &fixture.psk,
         &target,
         fixture.cipher_preference,
     )

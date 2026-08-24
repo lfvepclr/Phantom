@@ -21,6 +21,7 @@ async fn measure_cipher_throughput(
         fixture.server_addr,
         &fixture.server_key.public,
         &fixture.client_key.secret,
+        &fixture.psk,
         &target,
         fixture.cipher_preference,
     )
@@ -43,6 +44,7 @@ async fn measure_cipher_send_throughput(
         fixture.server_addr,
         &fixture.server_key.public,
         &fixture.client_key.secret,
+        &fixture.psk,
         &target,
         fixture.cipher_preference,
     )
@@ -118,6 +120,7 @@ async fn throughput_tcp_concurrent_10() {
         let server_addr = fixture.server_addr;
         let server_public = fixture.server_key.public;
         let client_secret = fixture.client_key.secret;
+        let psk = fixture.psk.clone();
         let target_clone = target.clone();
         let cipher = fixture.cipher_preference;
         let handle = tokio::spawn(async move {
@@ -125,6 +128,7 @@ async fn throughput_tcp_concurrent_10() {
                 server_addr,
                 &server_public,
                 &client_secret,
+                &psk,
                 &target_clone,
                 cipher,
             )

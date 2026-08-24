@@ -175,7 +175,6 @@ impl Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::constants::MAX_FRAME_PAYLOAD;
 
     #[test]
     fn frame_encode_decode_roundtrip() {

@@ -1,7 +1,7 @@
 //! Phantom xtask — unified build orchestrator.
 //!
 //! Usage:
-//!   cargo xtask build [all|server|cli|mac|android|harmony] [--release|--debug]
+//!   cargo xtask build [all|server|cli|router|mac|android|harmony] [--release|--debug]
 //!   cargo xtask check-deps
 //!   cargo xtask icons
 //!   cargo xtask clean
@@ -26,7 +26,7 @@ struct Cli {
 enum Commands {
     /// Build one or more targets
     Build {
-        /// Target(s) to build: all, server, cli, mac, android, harmony
+        /// Target(s) to build: all, server, server-arm64, cli, router, router-armv7, mac, android, harmony
         target: Vec<String>,
         /// Build in release mode (default)
         #[arg(long, default_value_t = true)]
@@ -34,6 +34,11 @@ enum Commands {
         /// Build in debug mode
         #[arg(long)]
         debug: bool,
+        /// Extra cargo features, currently only honoured by `server-arm64`
+        /// (e.g. `--features io-uring` enables the io_uring runtime; needs a
+        /// ≥5.10 kernel on the target host).
+        #[arg(long)]
+        features: Vec<String>,
     },
     /// Check dependencies and print status table
     CheckDeps,
@@ -51,6 +56,36 @@ fn project_root() -> PathBuf {
         .nth(1)
         .unwrap()
         .to_path_buf()
+}
+
+/// Rust target triple for the router client.
+///
+/// The ASUS RT-AX86U Pro is an ARMv8 (Broadcom BCM4912) box running Asuswrt /
+/// Asuswrt-Merlin. Its glibc is old and lacks dev headers, so the router build
+/// is statically linked against musl.
+const ROUTER_TARGET: &str = "aarch64-unknown-linux-musl";
+
+/// Rust target triple for legacy 32-bit ARM routers (ARMv7 hard-float,
+/// e.g. older Broadcom/Qualcomm boxes). Also statically linked via musl and
+/// linked with the toolchain's own rust-lld, so no C toolchain is needed.
+const ROUTER_ARMV7_TARGET: &str = "armv7-unknown-linux-musleabihf";
+
+// ── Probe helpers ───────────────────────────────────────────────────────
+
+fn rustup_target_installed(triple: &str) -> bool {
+    Command::new("rustup")
+        .args(["target", "list", "--installed"])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l.trim() == triple)
+        })
+        .unwrap_or(false)
+}
+
+fn router_target_installed() -> bool {
+    rustup_target_installed(ROUTER_TARGET)
 }
 
 // ── Dependency checking ─────────────────────────────────────────────────────
@@ -114,15 +149,7 @@ fn check_deps() -> Vec<DepStatus> {
     });
 
     // Android aarch64 target
-    let android_target_ok = Command::new("rustup")
-        .args(["target", "list", "--installed"])
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .any(|l| l.trim() == "aarch64-linux-android")
-        })
-        .unwrap_or(false);
+    let android_target_ok = rustup_target_installed("aarch64-linux-android");
     deps.push(DepStatus {
         name: "Rust aarch64-linux-android",
         installed: android_target_ok,
@@ -130,15 +157,7 @@ fn check_deps() -> Vec<DepStatus> {
     });
 
     // HarmonyOS target
-    let ohos_target_ok = Command::new("rustup")
-        .args(["target", "list", "--installed"])
-        .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .any(|l| l.trim() == "aarch64-unknown-linux-ohos")
-        })
-        .unwrap_or(false);
+    let ohos_target_ok = rustup_target_installed("aarch64-unknown-linux-ohos");
     deps.push(DepStatus {
         name: "Rust aarch64-unknown-linux-ohos",
         installed: ohos_target_ok,
@@ -190,6 +209,23 @@ fn check_deps() -> Vec<DepStatus> {
         hint: "Built-in on macOS",
     });
 
+    // Router targets: statically-linked musl builds.
+    //
+    // Linking uses `rust-lld` from the Rust toolchain and the dependency tree
+    // is pure Rust (no ring, no C shims), so no C cross toolchain is needed.
+    deps.push(DepStatus {
+        name: "Rust aarch64-unknown-linux-musl",
+        installed: router_target_installed(),
+        hint: "Install: rustup target add aarch64-unknown-linux-musl",
+    });
+
+    // Legacy 32-bit ARM routers (armv7hf), also fully static musl builds.
+    deps.push(DepStatus {
+        name: "Rust armv7-unknown-linux-musleabihf",
+        installed: rustup_target_installed(ROUTER_ARMV7_TARGET),
+        hint: "Install: rustup target add armv7-unknown-linux-musleabihf",
+    });
+
     deps
 }
 
@@ -226,6 +262,34 @@ fn is_available(target: &str) -> bool {
     match target {
         "cli" => deps.iter().find(|d| d.name == "Rust (rustc)").unwrap().installed,
         "server" => deps.iter().find(|d| d.name == "Rust (rustc)").unwrap().installed,
+        // The arm64 server is pure Rust (no C shims since ring was dropped),
+        // so rust-lld alone suffices — no clang probe needed here.
+        "server-arm64" => {
+            let rustc = deps.iter().find(|d| d.name == "Rust (rustc)").unwrap().installed;
+            let target = deps
+                .iter()
+                .find(|d| d.name == "Rust aarch64-unknown-linux-musl")
+                .unwrap()
+                .installed;
+            rustc && target
+        }
+        "router" => {
+            deps
+                .iter()
+                .find(|d| d.name == "Rust aarch64-unknown-linux-musl")
+                .unwrap()
+                .installed
+        }
+        // Pure-Rust dependency tree: rust-lld alone links the armv7 build.
+        "router-armv7" => {
+            let rustc = deps.iter().find(|d| d.name == "Rust (rustc)").unwrap().installed;
+            let target = deps
+                .iter()
+                .find(|d| d.name == "Rust armv7-unknown-linux-musleabihf")
+                .unwrap()
+                .installed;
+            rustc && target
+        }
         "mac" => deps
             .iter()
             .find(|d| d.name == "Xcode CLI (swift)")
@@ -296,6 +360,135 @@ fn build_server(release: bool) -> Result<()> {
     Ok(())
 }
 
+/// Build the statically-linked router client (ASUS RT-AX86U Pro and friends).
+///
+/// Plain host cross-compile: `rust-lld` ships with the Rust toolchain and the
+/// dependency tree is pure Rust (no ring, no C shims), so no musl-gcc, no
+/// clang probe and no container are needed (see `.cargo/config.toml`).
+fn build_router(release: bool) -> Result<()> {
+    let root = project_root();
+
+    if !router_target_installed() {
+        bail!(
+            "Router build prerequisite missing:\n  - rustup target add {}",
+            ROUTER_TARGET
+        );
+    }
+
+    let mut cmd = cargo_cmd();
+    cmd.arg("build")
+        .arg("-p")
+        .arg("phantom-cli")
+        .arg("--target")
+        .arg(ROUTER_TARGET);
+    if release {
+        cmd.arg("--release");
+    }
+    // Symbols roughly halve the binary; JFFS space on routers is tight.
+    cmd.env("CARGO_PROFILE_RELEASE_STRIP", "symbols");
+    cmd.current_dir(&root);
+    run_cmd(&mut cmd, "Build phantom (router, aarch64 musl static)")?;
+
+    let profile = if release { "release" } else { "debug" };
+    let bin_path = root
+        .join("target")
+        .join(ROUTER_TARGET)
+        .join(profile)
+        .join("phantom");
+    if !bin_path.exists() {
+        bail!("Router binary not found: {}", bin_path.display());
+    }
+
+    println!();
+    println!("  Binary: {}", bin_path.display());
+    if let Ok(meta) = fs::metadata(&bin_path) {
+        println!("  Size:   {:.1} MiB", meta.len() as f64 / (1024.0 * 1024.0));
+    }
+    println!("  Deploy: bash deploy/router/install.sh <router-host> \"<phantom:// URI>\"");
+    Ok(())
+}
+
+/// Build the statically-linked Linux ARM64 server (Ubuntu 24.04 LTS ARM,
+/// Ampere / RK3588-class boxes). Shares the `aarch64-unknown-linux-musl`
+/// triple with the router client, so the same rust-lld link setup applies;
+/// musl static linking also keeps the binary runnable on older glibc hosts.
+///
+/// `features` are passed through to cargo verbatim — notably `io-uring`,
+/// which enables the zero-copy io_uring runtime on ≥5.10 kernels.
+fn build_server_arm64(release: bool, features: &[String]) -> Result<()> {
+    let root = project_root();
+    let mut cmd = cargo_cmd();
+    cmd.arg("build")
+        .arg("-p")
+        .arg("phantom-server")
+        .arg("--target")
+        .arg(ROUTER_TARGET);
+    if release {
+        cmd.arg("--release");
+    }
+    if !features.is_empty() {
+        cmd.arg("--features").arg(features.join(","));
+    }
+    // Symbols roughly halve the binary; flash/SD space on ARM boxes is tight.
+    cmd.env("CARGO_PROFILE_RELEASE_STRIP", "symbols");
+    cmd.current_dir(&root);
+    run_cmd(&mut cmd, "Build phantom-server (linux arm64, musl static)")?;
+
+    let profile = if release { "release" } else { "debug" };
+    let bin_path = root
+        .join("target")
+        .join(ROUTER_TARGET)
+        .join(profile)
+        .join("phantom-server");
+    if !bin_path.exists() {
+        bail!("arm64 server binary not found: {}", bin_path.display());
+    }
+
+    println!();
+    println!("  Binary: {}", bin_path.display());
+    if let Ok(meta) = fs::metadata(&bin_path) {
+        println!("  Size:   {:.1} MiB", meta.len() as f64 / (1024.0 * 1024.0));
+    }
+    println!("  Deploy: see deploy/README.md (systemd unit in deploy/phantom.service)");
+    Ok(())
+}
+
+/// Build the statically-linked client for legacy 32-bit ARMv7 routers.
+/// Same pure-Rust story as `server-arm64`: rust-lld links, no clang probe.
+fn build_router_armv7(release: bool) -> Result<()> {
+    let root = project_root();
+    let mut cmd = cargo_cmd();
+    cmd.arg("build")
+        .arg("-p")
+        .arg("phantom-cli")
+        .arg("--target")
+        .arg(ROUTER_ARMV7_TARGET);
+    if release {
+        cmd.arg("--release");
+    }
+    cmd.env("CARGO_PROFILE_RELEASE_STRIP", "symbols");
+    cmd.current_dir(&root);
+    run_cmd(&mut cmd, "Build phantom (router, armv7 musl static)")?;
+
+    let profile = if release { "release" } else { "debug" };
+    let bin_path = root
+        .join("target")
+        .join(ROUTER_ARMV7_TARGET)
+        .join(profile)
+        .join("phantom");
+    if !bin_path.exists() {
+        bail!("armv7 router binary not found: {}", bin_path.display());
+    }
+
+    println!();
+    println!("  Binary: {}", bin_path.display());
+    if let Ok(meta) = fs::metadata(&bin_path) {
+        println!("  Size:   {:.1} MiB", meta.len() as f64 / (1024.0 * 1024.0));
+    }
+    println!("  Deploy: bash deploy/router/install.sh <router-host> \"<phantom:// URI>\"");
+    Ok(())
+}
+
 fn build_mac(release: bool) -> Result<()> {
     let root = project_root();
     let script = root.join("scripts/build-mac.sh");
@@ -345,7 +538,7 @@ fn build_harmony(release: bool) -> Result<()> {
     cmd.current_dir(&root);
     run_cmd(&mut cmd, "Build phantom-harmony .so")?;
 
-    // ── Step 2: Copy .so to entry/src/main/libs/arm64-v8a/ ──
+    // ── Step 2: Copy .so to entry/libs/arm64-v8a/ (hvigor native-lib pickup dir) ──
     let so_src = root
         .join("target")
         .join(target)
@@ -354,7 +547,7 @@ fn build_harmony(release: bool) -> Result<()> {
     if !so_src.exists() {
         bail!("Rust .so not found: {}. Build may have failed.", so_src.display());
     }
-    let libs_dir = harmony_dir.join("entry/src/main/libs/arm64-v8a");
+    let libs_dir = harmony_dir.join("entry/libs/arm64-v8a");
     fs::create_dir_all(&libs_dir)?;
     let so_dst = libs_dir.join("libphantom_harmony.so");
     fs::copy(&so_src, &so_dst)?;
@@ -612,8 +805,8 @@ fn clean_all() -> Result<()> {
         }
     }
 
-    // HarmonyOS entry libs (built .so)
-    let harmony_libs = root.join("client/harmony/entry/src/main/libs");
+    // HarmonyOS entry libs (built .so; hvigor pickup dir is module-root libs/)
+    let harmony_libs = root.join("client/harmony/entry/libs");
     if harmony_libs.exists() {
         println!("  Removing {} ...", harmony_libs.display());
         fs::remove_dir_all(&harmony_libs)?;
@@ -640,13 +833,16 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Build { target, debug, .. } => {
+        Commands::Build { target, debug, features, .. } => {
             let release = !debug;
             let targets = if target.is_empty() || target.contains(&"all".to_string()) {
-                vec!["server", "cli", "mac", "android", "harmony"]
+                vec!["server", "server-arm64", "cli", "router", "router-armv7", "mac", "android", "harmony"]
             } else {
                 target.iter().map(|s| s.as_str()).collect()
             };
+            if !features.is_empty() && !targets.iter().any(|t| *t == "server-arm64") {
+                println!("NOTE: --features is currently only honoured by the server-arm64 target");
+            }
 
             let deps = check_deps();
             print_dep_table(&deps);
@@ -663,10 +859,13 @@ fn main() -> Result<()> {
                 match *t {
                     "cli" => build_cli(release)?,
                     "server" => build_server(release)?,
+                    "server-arm64" => build_server_arm64(release, &features)?,
+                    "router" => build_router(release)?,
+                    "router-armv7" => build_router_armv7(release)?,
                     "mac" => build_mac(release)?,
                     "android" => build_android(release)?,
                     "harmony" => build_harmony(release)?,
-                    other => bail!("Unknown target: {}. Valid: all, server, cli, mac, android, harmony", other),
+                    other => bail!("Unknown target: {}. Valid: all, server, server-arm64, cli, router, router-armv7, mac, android, harmony", other),
                 }
                 built += 1;
             }
@@ -707,6 +906,20 @@ fn main() -> Result<()> {
                                 println!("    OK!");
                             } else {
                                 println!("    FAILED — install manually: rustup target add aarch64-unknown-linux-ohos");
+                            }
+                        }
+                        "Rust aarch64-unknown-linux-musl" => {
+                            println!("  Installing {} ...", dep.name);
+                            let status = Command::new("rustup")
+                                .args(["target", "add", ROUTER_TARGET])
+                                .status()?;
+                            if status.success() {
+                                println!("    OK!");
+                            } else {
+                                println!(
+                                    "    FAILED — install manually: rustup target add {}",
+                                    ROUTER_TARGET
+                                );
                             }
                         }
                         "Xcode CLI (swift)" => {

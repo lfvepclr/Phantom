@@ -1,0 +1,15 @@
+# 路由器 phantom 客户端配置：SOCKS5 监听 LAN（供局域网设备使用）
+[[servers]]
+name = "lan-server"
+address = "<内网主机IP>:8443"
+public_key = "<server-public-key-base64>="
+psk = "MLiTCSI2S0XXQNtJD1QcNtnfchv+mgeUPfp2AekATns="
+cipher = "aes256-gcm"
+protocol = "tcp"
+
+[client]
+listen = "0.0.0.0:1080"
+
+[client.proxy_auth]
+username = "router"
+password = "phantom-lan-2026"

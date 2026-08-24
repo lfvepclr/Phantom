@@ -7,18 +7,10 @@
 //! - DNS hijack (UDP:53 intercepted and forwarded to upstream DNS)
 //! - Rule-based routing (Smart mode)
 
-use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::{Bytes, BytesMut};
 use etherparse::IpNumber;
-use phantom_core::crypto::cipher::CipherSuite;
-use phantom_core::crypto::session::CipherOffer;
-use phantom_core::crypto::{NoiseInitiator, split_after_handshake};
-use phantom_core::protocol::codec::{FrameReader, FrameWriter};
-use phantom_core::protocol::frame::FrameFlags;
-use phantom_core::protocol::{Frame, TargetAddr};
-use phantom_core::transport::Transport;
-use phantom_core::transport::tcp::TcpTransport;
-use phantom_core::{CipherPreference, PhantomError, ProxyMode, Result, RuleAction, ServerEntry};
+use phantom_core::protocol::TargetAddr;
+use phantom_core::{PhantomError, ProxyMode, Result, RuleAction, ServerEntry};
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -28,12 +20,46 @@ use tokio::sync::Mutex;
 
 use crate::dns::{
     DnsCache, DnsProxy, DnsQueryContext, build_dns_response_packet, extract_a_records,
-    extract_query_domain,
+    extract_query_domain, parse_dns_addr,
 };
+use crate::failover::FailoverManager;
 use crate::rules::RuleEngine;
 use crate::stats::TrafficStats;
 
 const TUN_MTU: usize = 1500;
+
+/// Default TUN interface name per platform.
+///
+/// macOS requires the `utun<N>` naming convention; Linux (CLI / router) has no
+/// such constraint so a descriptive name is used instead.
+pub const DEFAULT_TUN_NAME: &str = if cfg!(target_os = "macos") {
+    "utun7"
+} else {
+    "phantom0"
+};
+
+/// Settings for a self-created TUN device (macOS / Linux).
+///
+/// Android and HarmonyOS hand the fd over from the OS VPN service instead and
+/// therefore ignore this struct entirely.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunSettings {
+    pub name: String,
+    pub address: std::net::Ipv4Addr,
+    pub netmask: std::net::Ipv4Addr,
+    pub mtu: u16,
+}
+
+impl Default for TunSettings {
+    fn default() -> Self {
+        Self {
+            name: DEFAULT_TUN_NAME.to_string(),
+            address: std::net::Ipv4Addr::new(10, 7, 0, 1),
+            netmask: std::net::Ipv4Addr::new(255, 255, 255, 0),
+            mtu: TUN_MTU as u16,
+        }
+    }
+}
 
 /// A TUN device wrapper that works on both macOS (self-created) and Android
 /// (fd passed from VpnService).
@@ -63,12 +89,16 @@ impl AsRawFd for FdWrapper {
 #[cfg(not(any(target_os = "android", target_env = "ohos")))]
 impl TunDevice {
     pub fn create() -> Result<Self> {
+        Self::create_with(&TunSettings::default())
+    }
+
+    pub fn create_with(settings: &TunSettings) -> Result<Self> {
         let mut config = tun::Configuration::default();
         config
-            .tun_name("utun7")
-            .address((10, 7, 0, 1))
-            .netmask((255, 255, 255, 0))
-            .mtu(TUN_MTU as u16)
+            .tun_name(&settings.name)
+            .address(settings.address)
+            .netmask(settings.netmask)
+            .mtu(settings.mtu)
             .up();
 
         let dev = tun::create_as_async(&config)
@@ -318,6 +348,65 @@ impl Clone for UdpProxyFlowTable {
 struct HotReloadState {
     proxy_mode: ProxyMode,
     rule_engine: Option<Arc<RuleEngine>>,
+    /// Server used for tunnelled UDP flows. Kept here rather than on
+    /// [`TunProxy`] so a config reload can retarget new UDP flows.
+    server: Option<ServerEntry>,
+}
+
+/// Apply a freshly parsed config to every hot-reloadable component.
+///
+/// Covers proxy mode, rule engine, DNS upstream and the server pool (both the
+/// tunnelled-UDP server and the SOCKS5 relay's failover pool). Established
+/// flows keep their original routing; only new flows see the update.
+async fn apply_reload(
+    hot: &Arc<Mutex<HotReloadState>>,
+    dns_proxy: Option<&DnsProxy>,
+    failover: Option<&FailoverManager>,
+    cfg: &phantom_core::ClientConfig,
+) {
+    {
+        let mut state = hot.lock().await;
+        if state.proxy_mode != cfg.client.mode {
+            tracing::info!(
+                "Config reloaded: mode {:?} -> {:?}",
+                state.proxy_mode,
+                cfg.client.mode
+            );
+            state.proxy_mode = cfg.client.mode;
+        }
+        match RuleEngine::from_config(&cfg.rules) {
+            Ok(engine) => {
+                state.rule_engine = Some(Arc::new(engine));
+                tracing::info!("Config reloaded: {} rule(s) active", cfg.rules.rules.len());
+            }
+            // Keep the previous engine rather than silently falling back to
+            // "proxy everything" when the new rule set is malformed.
+            Err(e) => tracing::warn!("Config reload: rule parse failed, keeping old rules: {}", e),
+        }
+        if let Some(server) = cfg.servers.first() {
+            if state.server.as_ref() != Some(server) {
+                tracing::info!("Config reloaded: UDP proxy server -> '{}'", server.name);
+                state.server = Some(server.clone());
+            }
+        }
+    }
+
+    if let Some(dns) = dns_proxy {
+        match parse_dns_addr(&cfg.client.dns) {
+            Some(addr) => {
+                dns.set_upstream(addr);
+            }
+            None => tracing::warn!(
+                "Config reload: invalid client.dns '{}', keeping upstream {}",
+                cfg.client.dns,
+                dns.upstream()
+            ),
+        }
+    }
+
+    if let Some(failover) = failover {
+        failover.reload(cfg);
+    }
 }
 
 /// Main TUN transparent proxy.
@@ -328,11 +417,11 @@ pub struct TunProxy {
     udp_proxy_flows: UdpProxyFlowTable,
     socks5_addr: SocketAddr,
     hot: Arc<Mutex<HotReloadState>>,
-    server: Option<ServerEntry>,
     local_secret: Option<[u8; 32]>,
     dns_proxy: Option<Arc<DnsProxy>>,
     dns_cache: DnsCache,
     config_path: Option<String>,
+    failover: Option<Arc<FailoverManager>>,
     stats: Arc<TrafficStats>,
 }
 
@@ -347,29 +436,42 @@ impl TunProxy {
             hot: Arc::new(Mutex::new(HotReloadState {
                 proxy_mode: ProxyMode::Smart,
                 rule_engine: None,
+                server: None,
             })),
-            server: None,
             local_secret: None,
             dns_proxy: None,
             dns_cache: DnsCache::new(),
             config_path: None,
+            failover: None,
             stats: TrafficStats::new(),
         }
     }
 
+    /// Lock the hot-reload state during construction.
+    ///
+    /// `try_lock` rather than `blocking_lock`: the builders are called from
+    /// inside async contexts (the platform bridges build the proxy in a spawned
+    /// task), and `blocking_lock` panics there. The lock is uncontended by
+    /// construction because the proxy has not been shared with any task yet.
+    fn hot_mut(&self) -> tokio::sync::MutexGuard<'_, HotReloadState> {
+        self.hot
+            .try_lock()
+            .expect("TunProxy builders run before the proxy is shared")
+    }
+
     pub fn with_mode(self, mode: ProxyMode) -> Self {
-        self.hot.blocking_lock().proxy_mode = mode;
+        self.hot_mut().proxy_mode = mode;
         self
     }
 
     pub fn with_server(mut self, server: ServerEntry, secret: [u8; 32]) -> Self {
-        self.server = Some(server);
+        self.hot_mut().server = Some(server);
         self.local_secret = Some(secret);
         self
     }
 
     pub fn with_rules(self, engine: RuleEngine) -> Self {
-        self.hot.blocking_lock().rule_engine = Some(Arc::new(engine));
+        self.hot_mut().rule_engine = Some(Arc::new(engine));
         self
     }
 
@@ -378,8 +480,22 @@ impl TunProxy {
         self
     }
 
+    /// Wire the shared failover manager in so a config reload can swap the
+    /// server pool used by the local SOCKS5 relay as well.
+    pub fn with_failover(mut self, failover: Arc<FailoverManager>) -> Self {
+        self.failover = Some(failover);
+        self
+    }
+
     pub fn with_dns(mut self, proxy: DnsProxy) -> Self {
         self.dns_proxy = Some(Arc::new(proxy));
+        self
+    }
+
+    /// Share the caller's stats instance so SOCKS5 and TUN traffic land in the
+    /// same counters (the metrics endpoint serves exactly one `TrafficStats`).
+    pub fn with_stats(mut self, stats: Arc<TrafficStats>) -> Self {
+        self.stats = stats;
         self
     }
 
@@ -418,6 +534,8 @@ impl TunProxy {
         if let Some(path) = &self.config_path {
             let path = path.clone();
             let hot = Arc::clone(&self.hot);
+            let dns_proxy = self.dns_proxy.clone();
+            let failover = self.failover.clone();
             let interval = std::time::Duration::from_secs(5);
             tokio::spawn(async move {
                 let mut last_mtime = std::time::SystemTime::UNIX_EPOCH;
@@ -428,59 +546,31 @@ impl TunProxy {
                         Ok(m) => m.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH),
                         Err(_) => continue,
                     };
-                    if mtime > last_mtime {
-                        last_mtime = mtime;
-                        match std::fs::read_to_string(&path) {
-                            Ok(content) => {
-                                match toml::from_str::<phantom_core::ClientConfig>(&content) {
-                                    Ok(cfg) => {
-                                        let mut hot = hot.lock().await;
-                                        hot.proxy_mode = cfg.client.mode;
-                                        if let Ok(engine) =
-                                            crate::rules::RuleEngine::from_config(&cfg.rules)
-                                        {
-                                            hot.rule_engine = Some(Arc::new(engine));
-                                            tracing::info!("Config reloaded: rules updated");
-                                        } else {
-                                            tracing::warn!("Config reload: rule parse failed");
-                                        }
-                                    }
-                                    Err(e) => tracing::warn!("Config reload parse error: {}", e),
-                                }
-                            }
-                            Err(e) => tracing::warn!("Config reload read error: {}", e),
-                        }
+                    if mtime <= last_mtime {
+                        continue;
                     }
+                    last_mtime = mtime;
+                    let content = match tokio::fs::read_to_string(&path).await {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!("Config reload read error: {}", e);
+                            continue;
+                        }
+                    };
+                    let cfg = match toml::from_str::<phantom_core::ClientConfig>(&content) {
+                        Ok(c) => c,
+                        Err(e) => {
+                            tracing::warn!("Config reload parse error: {}", e);
+                            continue;
+                        }
+                    };
+                    apply_reload(&hot, dns_proxy.as_deref(), failover.as_deref(), &cfg).await;
                 }
             });
         }
 
-        // Spawn metrics HTTP server.
-        {
-            let stats = Arc::clone(&self.stats);
-            tokio::spawn(async move {
-                let listener = match tokio::net::TcpListener::bind("127.0.0.1:9150").await {
-                    Ok(l) => l,
-                    Err(e) => {
-                        tracing::debug!("Metrics server bind failed: {}", e);
-                        return;
-                    }
-                };
-                loop {
-                    let (mut stream, _) = match listener.accept().await {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-                    let stats = stats.render_prometheus();
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\n\r\n{}",
-                        stats.len(),
-                        stats
-                    );
-                    let _ = stream.write_all(resp.as_bytes()).await;
-                }
-            });
-        }
+        // Metrics are served by the tunnel runtime (`PhantomClient::run` /
+        // `run_tun`) over the shared stats instance — nothing to spawn here.
 
         let mut buf = BytesMut::with_capacity(TUN_MTU);
         loop {
@@ -864,143 +954,70 @@ impl TunProxy {
         key: &FlowKey,
         dst_ip: IpAddr,
         dst_port: u16,
-        datagram: Vec<u8>,
+        mut datagram: Vec<u8>,
     ) -> Result<()> {
-        // Try sending to an existing flow.
+        // Try sending to an existing flow; a dead sender means the pump has
+        // ended, so fall through and re-establish instead of dropping data.
         {
             let map = self.udp_proxy_flows.flows.lock().await;
             if let Some(tx) = map.get(key) {
-                let _ = tx.send(datagram);
-                return Ok(());
+                match tx.send(datagram) {
+                    Ok(()) => return Ok(()),
+                    // Recover the datagram from the failed send.
+                    Err(e) => datagram = e.0,
+                }
             }
         }
+        self.udp_proxy_flows.flows.lock().await.remove(key);
 
         // Need server info to establish a direct tunnel.
-        let server = self.server.clone().ok_or_else(|| {
-            PhantomError::Config("No server configured for UDP proxy".to_string())
-        })?;
-        let local_secret = self
-            .local_secret
-            .ok_or_else(|| PhantomError::Config("No local secret for UDP proxy".to_string()))?;
+        let (server, local_secret) = {
+            let hot = self.hot.lock().await;
+            let server = hot.server.clone().ok_or_else(|| {
+                PhantomError::Config("No server configured for UDP proxy".to_string())
+            })?;
+            let secret = self.local_secret.ok_or_else(|| {
+                PhantomError::Config("No local secret for UDP proxy".to_string())
+            })?;
+            (server, secret)
+        };
 
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
-
-        // Build target address for the UDP SYN payload.
         let target = match dst_ip {
             IpAddr::V4(v4) => TargetAddr::IPv4(v4.octets(), dst_port),
             IpAddr::V6(v6) => TargetAddr::IPv6(v6.octets(), dst_port),
         };
-        let mut syn_payload = target.encode().to_vec();
-        syn_payload.extend_from_slice(&datagram);
 
-        // Establish Noise tunnel to server.
-        let addr: SocketAddr = server
-            .address
-            .parse()
-            .map_err(|e| PhantomError::Config(format!("Invalid server address: {}", e)))?;
-        let transport = TcpTransport::new(std::time::Duration::from_secs(10));
-        let stream = transport.connect(&addr).await?;
+        // Shared tunnel plumbing (also used by SOCKS5 UDP ASSOCIATE).
+        let flow =
+            crate::udp_relay::establish_udp_flow_tcp(&server, &local_secret, target, datagram)
+                .await?;
 
-        let remote_public = decode_public_key_for_udp(&server.public_key)?;
-        let initiator = NoiseInitiator::new(&local_secret, &remote_public);
-        let offer = match server.cipher {
-            CipherPreference::Auto => CipherOffer::default_offer(),
-            CipherPreference::Aes256Gcm => CipherOffer::new(vec![CipherSuite::Aes256Gcm]),
-            CipherPreference::Aes128Gcm => CipherOffer::new(vec![CipherSuite::Aes128Gcm]),
-            CipherPreference::Ascon128 => CipherOffer::new(vec![CipherSuite::Ascon128]),
-            CipherPreference::ChaCha20Poly1305 => CipherOffer::new(vec![CipherSuite::ChaCha20Poly]),
-        };
-        let result = initiator.handshake(stream, &offer).await?;
-        let (session_reader, session_writer) = split_after_handshake(
-            result.stream,
-            result.split_keys,
-            result.chosen_cipher,
-            result.is_initiator,
-        );
-        let mut frame_reader = FrameReader::new(session_reader);
-        let mut frame_writer = FrameWriter::new(session_writer);
+        // Store the outbound channel; the frame pump lives inside udp_relay.
+        self.udp_proxy_flows
+            .flows
+            .lock()
+            .await
+            .insert(*key, flow.outbound);
 
-        // Send UDP SYN frame.
-        let stream_id: u32 = 1;
-        let syn_frame = Frame {
-            version: phantom_core::constants::PROTOCOL_VERSION,
-            stream_id,
-            flags: FrameFlags::SYN | FrameFlags::UDP | FrameFlags::DATA,
-            payload: Bytes::from(syn_payload),
-        };
-        frame_writer.write_frame(&syn_frame).await?;
-        frame_writer.flush().await?;
-
-        // Wait for ACK.
-        let ack = frame_reader.read_frame().await?;
-        if !ack.flags.contains(FrameFlags::ACK) {
-            return Err(PhantomError::Protocol("UDP SYN rejected".to_string()));
-        }
-
-        // Store the sender channel.
-        self.udp_proxy_flows.flows.lock().await.insert(*key, tx);
-
-        // Spawn relay task.
+        // TUN-side inbound pump: tunnel datagrams → UDP packets → TUN device.
         let device = Arc::clone(&self.device);
         let udp_proxy_flows = self.udp_proxy_flows.clone();
         let key_clone = *key;
         let src_ip = key.src_ip;
         let src_port = key.src_port;
+        let mut inbound = flow.inbound;
 
         tokio::spawn(async move {
-            // Writer: receives datagrams from TUN, sends as UDP|DATA frames.
-            let writer = async {
-                while let Some(data) = rx.recv().await {
-                    let frame = Frame {
-                        version: phantom_core::constants::PROTOCOL_VERSION,
-                        stream_id,
-                        flags: FrameFlags::UDP | FrameFlags::DATA,
-                        payload: Bytes::from(data),
-                    };
-                    if frame_writer.write_frame(&frame).await.is_err() {
-                        break;
-                    }
-                    if frame_writer.flush().await.is_err() {
-                        break;
-                    }
+            while let Some(data) = inbound.recv().await {
+                let pkt = match build_udp_packet(dst_ip, dst_port, src_ip, src_port, &data) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                let mut dev = device.lock().await;
+                if dev.write_packet(&pkt).await.is_err() {
+                    break;
                 }
-                let _ = frame_writer.write_frame(&Frame::fin(stream_id)).await;
-                let _ = frame_writer.flush().await;
-                Ok::<_, PhantomError>(())
-            };
-
-            // Reader: receives UDP|DATA frames, builds packets, writes to TUN.
-            let reader = async {
-                loop {
-                    let frame = match frame_reader.read_frame().await {
-                        Ok(f) => f,
-                        Err(_) => break,
-                    };
-                    if frame.flags.contains(FrameFlags::DATA)
-                        && frame.flags.contains(FrameFlags::UDP)
-                    {
-                        let pkt = match build_udp_packet(
-                            dst_ip,
-                            dst_port,
-                            src_ip,
-                            src_port,
-                            &frame.payload,
-                        ) {
-                            Ok(p) => p,
-                            Err(_) => continue,
-                        };
-                        let mut dev = device.lock().await;
-                        let _ = dev.write_packet(&pkt).await;
-                    } else if frame.flags.contains(FrameFlags::FIN)
-                        || frame.flags.contains(FrameFlags::RST)
-                    {
-                        break;
-                    }
-                }
-                Ok::<_, PhantomError>(())
-            };
-
-            let _ = tokio::try_join!(writer, reader);
+            }
             udp_proxy_flows.flows.lock().await.remove(&key_clone);
         });
 
@@ -1383,17 +1400,175 @@ fn build_udp_packet(
     Ok(pkt)
 }
 
-fn decode_public_key_for_udp(b64: &str) -> Result<[u8; 32]> {
-    let decoded = STANDARD
-        .decode(b64.trim())
-        .map_err(|e| PhantomError::Crypto(format!("Base64 decode failed: {}", e)))?;
-    if decoded.len() != 32 {
-        return Err(PhantomError::Crypto(format!(
-            "Public key must be 32 bytes, got {}",
-            decoded.len()
-        )));
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use phantom_core::{
+        CipherPreference, ClientRule, ClientSettings, RulePattern, RulesConfig, TransportProtocol,
+    };
+
+    fn hot_state(mode: ProxyMode) -> Arc<Mutex<HotReloadState>> {
+        Arc::new(Mutex::new(HotReloadState {
+            proxy_mode: mode,
+            rule_engine: None,
+            server: None,
+        }))
     }
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&decoded);
-    Ok(key)
+
+    fn server(name: &str) -> ServerEntry {
+        ServerEntry {
+            name: name.to_string(),
+            address: "127.0.0.1:443".to_string(),
+            public_key: "dGVzdA==".to_string(),
+            psk: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string(),
+            cipher: CipherPreference::Auto,
+            protocol: TransportProtocol::Tcp,
+        }
+    }
+
+    fn config(mode: ProxyMode, dns: &str, rules: RulesConfig) -> phantom_core::ClientConfig {
+        phantom_core::ClientConfig {
+            servers: vec![server("primary")],
+            client: ClientSettings {
+                mode,
+                dns: dns.to_string(),
+                ..ClientSettings::default()
+            },
+            rules,
+            ..phantom_core::ClientConfig::default()
+        }
+    }
+
+    fn rules_with(pattern: RulePattern) -> RulesConfig {
+        RulesConfig {
+            rules: vec![ClientRule {
+                pattern,
+                action: RuleAction::Direct,
+            }],
+            final_action: RuleAction::Proxy,
+        }
+    }
+
+    /// The `TunProxy` builders are invoked from async contexts, where
+    /// `Mutex::blocking_lock` panics. This guards the `try_lock` invariant that
+    /// `hot_mut` relies on.
+    #[tokio::test]
+    async fn hot_state_is_lockable_from_an_async_context() {
+        let hot = hot_state(ProxyMode::Smart);
+        assert!(
+            hot.try_lock().is_ok(),
+            "builders must not need to block on the hot-reload lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_reload_updates_mode_rules_and_server() {
+        let hot = hot_state(ProxyMode::Direct);
+        let cfg = config(
+            ProxyMode::Smart,
+            "1.1.1.1:53",
+            rules_with(RulePattern::IpCidr {
+                value: "10.0.0.0/8".to_string(),
+            }),
+        );
+
+        apply_reload(&hot, None, None, &cfg).await;
+
+        let state = hot.lock().await;
+        assert_eq!(state.proxy_mode, ProxyMode::Smart);
+        assert!(state.rule_engine.is_some());
+        assert_eq!(state.server.as_ref().unwrap().name, "primary");
+    }
+
+    /// A malformed rule set must not silently downgrade routing to "proxy
+    /// everything"; the previously loaded engine stays in place.
+    #[tokio::test]
+    async fn apply_reload_keeps_previous_rules_when_new_set_is_invalid() {
+        let hot = hot_state(ProxyMode::Smart);
+        let good = config(
+            ProxyMode::Smart,
+            "1.1.1.1:53",
+            rules_with(RulePattern::IpCidr {
+                value: "10.0.0.0/8".to_string(),
+            }),
+        );
+        apply_reload(&hot, None, None, &good).await;
+        let engine_before = hot.lock().await.rule_engine.clone().unwrap();
+
+        let bad = config(
+            ProxyMode::Smart,
+            "1.1.1.1:53",
+            rules_with(RulePattern::IpCidr {
+                value: "not-a-cidr".to_string(),
+            }),
+        );
+        apply_reload(&hot, None, None, &bad).await;
+
+        let engine_after = hot.lock().await.rule_engine.clone().unwrap();
+        assert!(
+            Arc::ptr_eq(&engine_before, &engine_after),
+            "invalid rules must leave the previous engine untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_reload_retargets_the_dns_upstream() {
+        let hot = hot_state(ProxyMode::Smart);
+        let dns = DnsProxy::new("8.8.8.8:53".parse().unwrap()).await.unwrap();
+        let cfg = config(ProxyMode::Smart, "tls://1.1.1.1:853", RulesConfig::default());
+
+        apply_reload(&hot, Some(&dns), None, &cfg).await;
+
+        assert_eq!(dns.upstream(), "1.1.1.1:853".parse().unwrap());
+    }
+
+    /// An unparseable `client.dns` must not drop DNS hijacking on the floor.
+    #[tokio::test]
+    async fn apply_reload_keeps_dns_upstream_when_new_value_is_invalid() {
+        let hot = hot_state(ProxyMode::Smart);
+        let dns = DnsProxy::new("8.8.8.8:53".parse().unwrap()).await.unwrap();
+        let cfg = config(ProxyMode::Smart, "not-an-address", RulesConfig::default());
+
+        apply_reload(&hot, Some(&dns), None, &cfg).await;
+
+        assert_eq!(dns.upstream(), "8.8.8.8:53".parse().unwrap());
+    }
+
+    #[tokio::test]
+    async fn apply_reload_swaps_the_failover_pool() {
+        let hot = hot_state(ProxyMode::Smart);
+        let initial = config(ProxyMode::Smart, "1.1.1.1:53", RulesConfig::default());
+        let failover = FailoverManager::new(&initial).unwrap();
+
+        let mut next = initial.clone();
+        next.servers = vec![server("backup")];
+        apply_reload(&hot, None, Some(&failover), &next).await;
+
+        assert_eq!(failover.select_server().unwrap().name, "backup");
+        assert_eq!(hot.lock().await.server.as_ref().unwrap().name, "backup");
+    }
+
+    #[tokio::test]
+    async fn apply_reload_tolerates_missing_optional_components() {
+        // The SOCKS5-only path has neither a DNS proxy nor a failover manager
+        // wired in; reloading must still update the mode.
+        let hot = hot_state(ProxyMode::Direct);
+        let cfg = config(ProxyMode::Proxy, "1.1.1.1:53", RulesConfig::default());
+        apply_reload(&hot, None, None, &cfg).await;
+        assert_eq!(hot.lock().await.proxy_mode, ProxyMode::Proxy);
+    }
+
+    #[test]
+    fn default_tun_settings_match_the_platform_convention() {
+        let settings = TunSettings::default();
+        assert_eq!(settings.mtu, TUN_MTU as u16);
+        assert_eq!(settings.address, std::net::Ipv4Addr::new(10, 7, 0, 1));
+        assert_eq!(settings.netmask, std::net::Ipv4Addr::new(255, 255, 255, 0));
+        // macOS only accepts `utun<N>`; Linux has no such constraint.
+        if cfg!(target_os = "macos") {
+            assert!(settings.name.starts_with("utun"));
+        } else {
+            assert_eq!(settings.name, "phantom0");
+        }
+    }
 }

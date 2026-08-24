@@ -45,6 +45,7 @@ async fn debug_echo_via_tunnel_no_fin() {
         fixture.server_addr,
         &fixture.server_key.public,
         &fixture.client_key.secret,
+        &fixture.psk,
         &target,
         fixture.cipher_preference,
     )

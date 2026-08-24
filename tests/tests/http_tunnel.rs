@@ -3,13 +3,17 @@ use phantom_core::protocol::TargetAddr;
 use phantom_core::transport::TransportListener;
 use phantom_e2e::echo::start_http_echo_server;
 use phantom_e2e::socks5::connect_tunnel;
-use phantom_e2e::throughput::echo_data;
+use phantom_e2e::throughput::exchange_data;
 
 async fn setup_http_tunnel(
     fixture: &HttpTestFixture,
 ) -> anyhow::Result<(
-    phantom_core::protocol::FrameReader<tokio::io::ReadHalf<tokio::net::TcpStream>>,
-    phantom_core::protocol::FrameWriter<tokio::io::WriteHalf<tokio::net::TcpStream>>,
+    phantom_core::protocol::FrameReader<
+        phantom_core::SessionReader<tokio::io::ReadHalf<tokio::net::TcpStream>>,
+    >,
+    phantom_core::protocol::FrameWriter<
+        phantom_core::SessionWriter<tokio::io::WriteHalf<tokio::net::TcpStream>>,
+    >,
     u32,
 )> {
     let ip_bytes = match fixture.http_addr.ip() {
@@ -21,6 +25,7 @@ async fn setup_http_tunnel(
         fixture.server_addr,
         &fixture.server_key.public,
         &fixture.client_key.secret,
+        &fixture.psk,
         &target,
         fixture.cipher_preference,
     )
@@ -32,6 +37,7 @@ struct HttpTestFixture {
     pub server_addr: std::net::SocketAddr,
     pub client_key: phantom_core::crypto::KeyPair,
     pub server_key: phantom_core::crypto::KeyPair,
+    pub psk: phantom_core::crypto::Psk,
     pub cipher_preference: CipherPreference,
     _http_server: phantom_e2e::echo::HttpEchoServer,
     _server_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
@@ -43,6 +49,7 @@ impl HttpTestFixture {
             phantom_core::crypto::KeyPair::generate().expect("Failed to generate server key");
         let client_key =
             phantom_core::crypto::KeyPair::generate().expect("Failed to generate client key");
+        let psk = phantom_core::crypto::Psk::generate();
 
         let http_server = start_http_echo_server().await;
         let http_addr = http_server.addr;
@@ -54,6 +61,7 @@ impl HttpTestFixture {
         let server_addr = server_listener.local_addr().unwrap();
         let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let server_secret = server_key.secret;
+        let server_psk = psk.clone();
         tokio::spawn(async move {
             tokio::pin!(server_shutdown_rx);
             loop {
@@ -63,8 +71,9 @@ impl HttpTestFixture {
                             Ok((stream, _peer)) => {
                                 let sk = server_secret;
                                 let cp = cipher;
+                                let conn_psk = server_psk.clone();
                                 tokio::spawn(async move {
-                                    phantom_server::handler::handle_connection(stream, sk, &[], cp, None).await;
+                                    phantom_server::handler::handle_connection(stream, sk, conn_psk, &[], cp, None).await;
                                 });
                             }
                             Err(e) => { tracing::error!("Server accept error: {}", e); }
@@ -80,6 +89,7 @@ impl HttpTestFixture {
             server_addr,
             client_key,
             server_key,
+            psk,
             cipher_preference: cipher,
             _http_server: http_server,
             _server_shutdown: Some(server_shutdown_tx),
@@ -92,9 +102,11 @@ async fn http_get_ip_through_tunnel() {
     let fixture = HttpTestFixture::new(CipherPreference::Aes256Gcm).await;
     let (mut reader, mut writer, stream_id) = setup_http_tunnel(&fixture).await.unwrap();
 
+    // No client FIN: the HTTP server owns teardown via `Connection: close`.
+    // A FIN right after the request races with hyper's response flush.
     let request = b"GET /ip HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
     let data = request.to_vec();
-    let echoed = echo_data(&mut reader, &mut writer, stream_id, &data).await;
+    let echoed = exchange_data(&mut reader, &mut writer, stream_id, &data).await;
 
     let response = String::from_utf8_lossy(&echoed);
     assert!(
@@ -116,7 +128,7 @@ async fn http_post_echo_through_tunnel() {
         body
     );
     let data = request.into_bytes();
-    let echoed = echo_data(&mut reader, &mut writer, stream_id, &data).await;
+    let echoed = exchange_data(&mut reader, &mut writer, stream_id, &data).await;
 
     let response = String::from_utf8_lossy(&echoed);
     assert!(

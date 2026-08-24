@@ -94,6 +94,8 @@ fn build_config_from_uri(uri: &str, mode: &str) -> Result<ClientConfig, i32> {
             dns: "tls://8.8.8.8:853".to_string(),
             mode: proxy_mode,
             cipher: Default::default(),
+            metrics_listen: "127.0.0.1:9150".to_string(),
+            proxy_auth: None,
         },
         failover: FailoverConfig::default(),
         rules: Default::default(),
@@ -295,14 +297,25 @@ fn start_with_config(fd: RawFd, config: ClientConfig) -> i32 {
         }
 
         // 1. Wrap the VpnService fd into a TunDevice.
-        let device = match crate::tun::TunDevice::from_fd(fd) {
-            Ok(d) => d,
-            Err(e) => {
-                let msg = format!("TUN fd wrap failed: {}", e);
-                tracing::error!("{}", msg);
-                set_error(msg);
-                return;
+        //
+        // fd < 0 selects the SOCKS5-only mode: no TUN device exists (e.g.
+        // environments where the OS VPN dialog is unavailable, such as the
+        // HarmonyOS emulator which lacks the com.huawei.hmos.vpndialog
+        // system bundle). The local SOCKS5 listener still proxies traffic
+        // through the tunnel, which keeps the datapath verifiable.
+        let device = if fd >= 0 {
+            match crate::tun::TunDevice::from_fd(fd) {
+                Ok(d) => Some(d),
+                Err(e) => {
+                    let msg = format!("TUN fd wrap failed: {}", e);
+                    tracing::error!("{}", msg);
+                    set_error(msg);
+                    return;
+                }
             }
+        } else {
+            tracing::info!("No TUN fd (fd < 0): running in SOCKS5-only mode");
+            None
         };
 
         let failover = match crate::failover::FailoverManager::new(&config) {
@@ -321,6 +334,9 @@ fn start_with_config(fd: RawFd, config: ClientConfig) -> i32 {
             failover_health.run_health_check_loop().await;
         });
 
+        // Shared counters: SOCKS5 and TUN traffic land in the same instance.
+        let stats = crate::stats::TrafficStats::new();
+
         // 2. Start local SOCKS5 proxy (listens on loopback).
         let socks5_addr = match config.client.listen.parse() {
             Ok(a) => a,
@@ -334,6 +350,7 @@ fn start_with_config(fd: RawFd, config: ClientConfig) -> i32 {
 
         let config_clone = config.clone();
         let failover_socks5 = std::sync::Arc::clone(&failover);
+        let stats_socks5 = std::sync::Arc::clone(&stats);
         let socks5_task = tokio::spawn(async move {
             let listener = match tokio::net::TcpListener::bind(&config_clone.client.listen).await {
                 Ok(l) => l,
@@ -348,6 +365,8 @@ fn start_with_config(fd: RawFd, config: ClientConfig) -> i32 {
             // SOCKS5 is up and accepting connections -> tunnel is operational.
             set_status(2); // running
 
+            let quic_pool = std::sync::Arc::new(crate::quic_pool::QuicPool::new());
+            let stats = stats_socks5;
             loop {
                 let (stream, peer) = match listener.accept().await {
                     Ok(x) => x,
@@ -358,14 +377,22 @@ fn start_with_config(fd: RawFd, config: ClientConfig) -> i32 {
                 };
                 let cfg = config_clone.clone();
                 let fo = std::sync::Arc::clone(&failover_socks5);
+                let qp = std::sync::Arc::clone(&quic_pool);
+                let st = std::sync::Arc::clone(&stats);
                 tokio::spawn(async move {
                     let local_secret = match phantom_core::crypto::KeyPair::generate() {
                         Ok(kp) => kp.secret,
                         Err(_) => return,
                     };
-                    if let Err(e) =
-                        crate::socks5::handle_socks5_connection(stream, &cfg, &fo, local_secret)
-                            .await
+                    if let Err(e) = crate::http_proxy::handle_inbound(
+                        stream,
+                        &cfg,
+                        &fo,
+                        &qp,
+                        local_secret,
+                        &st,
+                    )
+                    .await
                     {
                         tracing::debug!("SOCKS5 connection error from {}: {}", peer, e);
                     }
@@ -373,33 +400,38 @@ fn start_with_config(fd: RawFd, config: ClientConfig) -> i32 {
             }
         });
 
-        // 3. Start TUN transparent proxy.
-        let tun_task = tokio::spawn(async move {
-            let tun_secret = match phantom_core::crypto::KeyPair::generate() {
-                Ok(kp) => kp.secret,
-                Err(e) => {
-                    let msg = format!("TUN key generation failed: {}", e);
-                    tracing::error!("{}", msg);
-                    set_error(msg);
-                    return;
+        // 3. Start TUN transparent proxy (skipped in SOCKS5-only mode).
+        let tun_task = device.map(|device| {
+            let config_tun = config.clone();
+            let stats_tun = stats.clone();
+            tokio::spawn(async move {
+                let tun_secret = match phantom_core::crypto::KeyPair::generate() {
+                    Ok(kp) => kp.secret,
+                    Err(e) => {
+                        let msg = format!("TUN key generation failed: {}", e);
+                        tracing::error!("{}", msg);
+                        set_error(msg);
+                        return;
                 }
             };
             let mut proxy =
-                crate::tun::TunProxy::new(device, socks5_addr).with_mode(config.client.mode);
+                crate::tun::TunProxy::new(device, socks5_addr)
+                    .with_mode(config_tun.client.mode)
+                    .with_stats(stats_tun);
 
-            if let Some(server) = config.servers.first() {
+            if let Some(server) = config_tun.servers.first() {
                 proxy = proxy.with_server(server.clone(), tun_secret);
             }
 
-            if let Ok(engine) = crate::rules::RuleEngine::from_config(&config.rules) {
+            if let Ok(engine) = crate::rules::RuleEngine::from_config(&config_tun.rules) {
                 proxy = proxy.with_rules(engine);
                 tracing::info!(
                     "Smart routing enabled with {} rules",
-                    config.rules.rules.len()
+                    config_tun.rules.rules.len()
                 );
             }
 
-            if let Some(dns_addr) = parse_dns_addr(&config.client.dns) {
+            if let Some(dns_addr) = crate::dns::parse_dns_addr(&config_tun.client.dns) {
                 match crate::dns::DnsProxy::new(dns_addr).await {
                     Ok(dns) => {
                         proxy = proxy.with_dns(dns);
@@ -417,9 +449,18 @@ fn start_with_config(fd: RawFd, config: ClientConfig) -> i32 {
                 tracing::error!("{}", msg);
                 set_error(msg);
             }
+            })
         });
 
-        let _ = tokio::try_join!(socks5_task, tun_task);
+        // In SOCKS5-only mode there is no TUN task; just await the SOCKS5 side.
+        match tun_task {
+            Some(t) => {
+                let _ = tokio::try_join!(socks5_task, t);
+            }
+            None => {
+                let _ = socks5_task.await;
+            }
+        }
         // If either long-running task returns, the tunnel is no longer operational.
         if TUNNEL_STATUS.load(Ordering::SeqCst) == 2 {
             set_error("Tunnel task exited unexpectedly".to_string());
@@ -490,15 +531,6 @@ pub unsafe extern "C" fn phantom_android_free_string(ptr: *mut std::ffi::c_char)
             let _ = std::ffi::CString::from_raw(ptr);
         }
     }
-}
-
-fn parse_dns_addr(dns: &str) -> Option<std::net::SocketAddr> {
-    let stripped = dns.strip_prefix("tls://").unwrap_or(dns);
-    let stripped = stripped.strip_prefix("https://").unwrap_or(stripped);
-    stripped
-        .parse()
-        .ok()
-        .or_else(|| format!("{}:53", stripped).parse().ok())
 }
 
 /// A `std::io::Write` implementation that appends each line to `LOG_BUFFER`.
@@ -650,18 +682,6 @@ mod tests {
             buf.last()
                 .unwrap()
                 .contains(&format!("log {}", LOG_BUFFER_CAPACITY + 9))
-        );
-    }
-
-    #[test]
-    fn parse_dns_addr_accepts_tls_prefix() {
-        assert_eq!(
-            parse_dns_addr("tls://8.8.8.8:853"),
-            Some("8.8.8.8:853".parse().unwrap())
-        );
-        assert_eq!(
-            parse_dns_addr("1.1.1.1"),
-            Some("1.1.1.1:53".parse().unwrap())
         );
     }
 }

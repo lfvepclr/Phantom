@@ -53,11 +53,16 @@ pub async fn connect_tunnel(
     server_addr: SocketAddr,
     server_public_key: &[u8; 32],
     client_secret: &[u8; 32],
+    psk: &phantom_core::crypto::Psk,
     target: &TargetAddr,
     cipher_preference: phantom_core::CipherPreference,
 ) -> anyhow::Result<(
-    phantom_core::protocol::FrameReader<tokio::io::ReadHalf<TcpStream>>,
-    phantom_core::protocol::FrameWriter<tokio::io::WriteHalf<TcpStream>>,
+    phantom_core::protocol::FrameReader<
+        phantom_core::SessionReader<tokio::io::ReadHalf<TcpStream>>,
+    >,
+    phantom_core::protocol::FrameWriter<
+        phantom_core::SessionWriter<tokio::io::WriteHalf<TcpStream>>,
+    >,
     u32,
 )> {
     use phantom_core::crypto::cipher::CipherSuite;
@@ -79,7 +84,7 @@ pub async fn connect_tunnel(
             CipherOffer::new(vec![CipherSuite::ChaCha20Poly])
         }
     };
-    let initiator = NoiseInitiator::new(client_secret, server_public_key);
+    let initiator = NoiseInitiator::new(client_secret, server_public_key, psk.clone());
     let result = initiator.handshake(stream, &offer).await?;
     let (session_reader, session_writer) = split_after_handshake(
         result.stream,

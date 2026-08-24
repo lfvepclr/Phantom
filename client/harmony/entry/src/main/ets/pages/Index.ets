@@ -1,5 +1,6 @@
 import { promptAction } from '@kit.ArkUI';
 import phantomLib from 'libphantom_harmony.so';
+import { ServerPage } from './ServerPage';
 
 @Entry
 @Component
@@ -60,7 +61,9 @@ struct Index {
   }
 
   build() {
-    Column({ space: 16 }) {
+    Tabs({ barPosition: BarPosition.End }) {
+      TabContent() {
+        Column({ space: 16 }) {
       Text('Phantom')
         .fontSize(28)
         .fontWeight(FontWeight.Bold)
@@ -106,11 +109,13 @@ struct Index {
               promptAction.showToast({ message: 'Please enter a server URI' });
               return;
             }
-            // HarmonyOS: request VPN permission and obtain fd via VpnExtensionAbility.
-            // This is a placeholder for the native fd that would come from the system.
-            const placeholderFd = -1;
+            // fd = -1 selects the Rust-side SOCKS5-only mode: the emulator
+            // image lacks the com.huawei.hmos.vpndialog system bundle, so the
+            // VpnExtensionAbility grant flow cannot complete here. On real
+            // devices PhantomVpnExtensionAbility supplies a genuine TUN fd.
+            const socksOnlyFd = -1;
             try {
-              const rc: number = phantomLib.phantomHarmonyStart(placeholderFd, this.serverUri, this.proxyMode);
+              const rc: number = phantomLib.phantomHarmonyStart(socksOnlyFd, this.serverUri, this.proxyMode);
               if (rc !== 0) {
                 promptAction.showToast({ message: 'Tunnel start failed: ' + rc });
               } else {
@@ -139,9 +144,19 @@ struct Index {
       .layoutWeight(1)
       .backgroundColor('#F5F5F5')
       .padding(12)
+        }
+        .width('100%')
+        .height('100%')
+        .backgroundColor('#FFFFFF')
+      }
+      .tabBar('VPN')
+
+      TabContent() {
+        ServerPage()
+      }
+      .tabBar('Server')
     }
     .width('100%')
     .height('100%')
-    .backgroundColor('#FFFFFF')
   }
 }

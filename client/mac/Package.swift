@@ -1,4 +1,4 @@
-// swift-tools-version: 5.9
+// swift-tools-version: 6.2
 import PackageDescription
 
 // Phantom macOS SwiftUI menu-bar client.
@@ -11,7 +11,7 @@ import PackageDescription
 // a Swift bundler target, and scripts/build-mac.sh to orchestrate cargo + swift build.
 let package = Package(
     name: "PhantomMac",
-    platforms: [.macOS(.v13)],
+    platforms: [.macOS(.v26)],
     products: [
         .executable(name: "PhantomMac", targets: ["PhantomMac"]),
         .executable(name: "PhantomMacBuilder", targets: ["PhantomMacBuilder"]),

@@ -107,6 +107,8 @@ pub unsafe extern "C" fn phantom_macos_start_with_uri(input: *const u8, input_le
             dns: "tls://8.8.8.8:853".to_string(),
             mode,
             cipher: Default::default(),
+            metrics_listen: "127.0.0.1:9150".to_string(),
+            proxy_auth: None,
         },
         failover: FailoverConfig::default(),
         rules: Default::default(),
@@ -234,9 +236,13 @@ fn start_with_config(config: ClientConfig) -> i32 {
 
         let tun_secret = local_secret;
 
+        // Shared counters: SOCKS5 and TUN traffic land in the same instance.
+        let stats = crate::stats::TrafficStats::new();
+
         // 1. Start local SOCKS5 proxy.
         let config_clone = config.clone();
         let failover_socks5 = std::sync::Arc::clone(&failover);
+        let stats_socks5 = std::sync::Arc::clone(&stats);
         let ready_tx2 = ready_tx.clone();
         let socks5_task = tokio::spawn(async move {
             let listener = match tokio::net::TcpListener::bind(&config_clone.client.listen).await {
@@ -254,6 +260,8 @@ fn start_with_config(config: ClientConfig) -> i32 {
             set_status(2); // running
             let _ = ready_tx2.send(Ok(()));
 
+            let quic_pool = std::sync::Arc::new(crate::quic_pool::QuicPool::new());
+            let stats = stats_socks5;
             loop {
                 let (stream, peer) = match listener.accept().await {
                     Ok(x) => x,
@@ -265,9 +273,13 @@ fn start_with_config(config: ClientConfig) -> i32 {
                 let cfg = config_clone.clone();
                 let fo = std::sync::Arc::clone(&failover_socks5);
                 let secret = local_secret;
+                let qp = std::sync::Arc::clone(&quic_pool);
+                let st = std::sync::Arc::clone(&stats);
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        crate::socks5::handle_socks5_connection(stream, &cfg, &fo, secret).await
+                    if let Err(e) = crate::http_proxy::handle_inbound(
+                        stream, &cfg, &fo, &qp, secret, &st,
+                    )
+                    .await
                     {
                         tracing::debug!("SOCKS5 connection error from {}: {}", peer, e);
                     }
@@ -297,7 +309,9 @@ fn start_with_config(config: ClientConfig) -> i32 {
                 }
             };
             let mut proxy =
-                crate::tun::TunProxy::new(device, socks5_addr).with_mode(config.client.mode);
+                crate::tun::TunProxy::new(device, socks5_addr)
+                    .with_mode(config.client.mode)
+                    .with_stats(stats);
 
             if let Some(server) = config.servers.first() {
                 proxy = proxy.with_server(server.clone(), tun_secret);
@@ -311,7 +325,7 @@ fn start_with_config(config: ClientConfig) -> i32 {
                 );
             }
 
-            if let Some(dns_addr) = parse_dns_addr(&config.client.dns) {
+            if let Some(dns_addr) = crate::dns::parse_dns_addr(&config.client.dns) {
                 match crate::dns::DnsProxy::new(dns_addr).await {
                     Ok(dns) => {
                         proxy = proxy.with_dns(dns);
@@ -368,15 +382,6 @@ pub extern "C" fn phantom_macos_stop() -> i32 {
     clear_error();
     tracing::info!("macOS tunnel stopped");
     0
-}
-
-fn parse_dns_addr(dns: &str) -> Option<std::net::SocketAddr> {
-    let stripped = dns.strip_prefix("tls://").unwrap_or(dns);
-    let stripped = stripped.strip_prefix("https://").unwrap_or(stripped);
-    stripped.parse().ok().or_else(|| {
-        // Fallback: if no port, append :53.
-        format!("{}:53", stripped).parse().ok()
-    })
 }
 
 /// A `std::io::Write` implementation that appends each line to `LOG_BUFFER`.

@@ -1,0 +1,12 @@
+# Phantom 服务端容器（musl 静态二进制 → scratch，零系统依赖）
+# 构建时 context 指向二进制所在目录，避免传输整个 target/：
+#   podman build -f deploy/Containerfile -t localhost/phantom-server \
+#     target/aarch64-unknown-linux-musl/release
+# 运行（I/O 型低配）：
+#   podman run -d --name phantom-server --network phantom-net \
+#     -p 443:443/tcp -p 443:443/udp --cpus 1 --memory 256m \
+#     -v "$PWD/.e2e-data:/data:Z" localhost/phantom-server
+FROM scratch
+COPY phantom-server /usr/local/bin/phantom-server
+WORKDIR /data
+ENTRYPOINT ["/usr/local/bin/phantom-server", "/data/server.toml"]

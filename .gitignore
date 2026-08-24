@@ -26,6 +26,16 @@ Cargo.lock
 *.swo
 *~
 
+
+# === E2E runtime artifacts (bench logs, compiled test binaries, generated keys) ===
+/.e2e-boot/
+/.e2e-ctx/
+/.e2e-data/
+/.e2e-web/
+
+# === One-off POC experiments ===
+/.poc/
+
 # === Build artifacts (root level) ===
 test_lock
 server.toml
@@ -57,6 +67,10 @@ client/harmony/entry/build/
 client/harmony/entry/src/main/libs/
 client/harmony/rust/target/
 client/harmony/.codegenie/
+# Stale .so copy (real build output goes to entry/libs/arm64-v8a/)
+client/harmony/entry/src/main/resources/rawfile/
+# Compiled HAP bundles (signed or unsigned)
+*.hap
 
 # === Test / Bench ===
 /tests/target

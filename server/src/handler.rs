@@ -4,8 +4,10 @@ use bytes::{Bytes, BytesMut};
 use phantom_core::CipherPreference;
 use phantom_core::constants::{HANDSHAKE_TIMEOUT_SECS, MAX_FRAME_PAYLOAD};
 use phantom_core::crypto::cipher::CipherSuite;
-use phantom_core::crypto::{NoiseResponder, split_after_handshake, split_for_stream};
-use phantom_core::protocol::codec::{FrameReader, FrameWriter};
+use phantom_core::crypto::{NoiseResponder, split_after_handshake};
+use phantom_core::protocol::codec::{
+    FrameReader, FrameWriter, MessageRead, MessageWrite, PlainMessageReader, PlainMessageWriter,
+};
 use phantom_core::protocol::frame::FrameFlags;
 use phantom_core::protocol::{Frame, TargetAddr};
 use phantom_core::{PhantomError, Result};
@@ -17,6 +19,7 @@ use tokio::net::{TcpStream, UdpSocket};
 pub async fn handle_connection<S>(
     stream: S,
     secret_key: [u8; 32],
+    psk: phantom_core::Psk,
     allowed_clients: &[[u8; 32]],
     cipher_preference: CipherPreference,
     verification_url: Option<&str>,
@@ -26,11 +29,12 @@ pub async fn handle_connection<S>(
     let supported = resolve_supported_ciphers(cipher_preference);
     let result = match tokio::time::timeout(
         std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
-        NoiseResponder::new(&secret_key).handshake(stream, &supported),
+        NoiseResponder::new(&secret_key, psk).handshake(stream, &supported),
     )
     .await
     {
         Ok(Ok(r)) => r,
+        // Silently drop: a peer without the right PSK or key gets no signal.
         _ => return,
     };
 
@@ -55,24 +59,32 @@ pub async fn handle_connection<S>(
 
 /// Handle a multiplexed QUIC connection.
 ///
-/// The first bi-stream performs the Noise IK handshake.  All subsequent
-/// bi-streams derive their session keys from the parent connection keys
-/// using HKDF with the implicit stream counter (1, 2, 3 …).
+/// Authentication has already happened at connection level: the Noise
+/// handshake inside QUIC bound the PSK and the server's static key before the
+/// first stream could be opened. What remains is the whitelist check — the
+/// client's static public key is recovered from the connection's peer
+/// identity — and then every bi-stream runs the bare frame protocol. Each
+/// stream gets its own task so a long-lived relay never head-of-line blocks
+/// fresh streams on the same connection.
 pub async fn handle_quic_connection(
     conn: quinn::Connection,
-    secret_key: [u8; 32],
     allowed_clients: &[[u8; 32]],
-    cipher_preference: CipherPreference,
-    verification_url: Option<&str>,
+    verification_url: Option<String>,
 ) {
-    use phantom_core::transport::quic::QuicStream;
+    use phantom_core::transport::quic::{QuicStream, peer_static_key};
 
-    let supported = resolve_supported_ciphers(cipher_preference);
-    let mut handshake_done = false;
-    let mut conn_keys: Option<([u8; 32], [u8; 32])> = None;
-    let mut conn_cipher: Option<CipherSuite> = None;
-    let mut stream_counter: u32 = 0;
+    if !allowed_clients.is_empty() {
+        let allowed = peer_static_key(&conn)
+            .map(|key| allowed_clients.contains(&key))
+            .unwrap_or(false);
+        if !allowed {
+            tracing::info!("Rejected unauthorized QUIC client");
+            conn.close(0u32.into(), b"unauthorized");
+            return;
+        }
+    }
 
+    tracing::info!("QUIC client connected");
     loop {
         let (send, recv) = match conn.accept_bi().await {
             Ok(s) => s,
@@ -81,68 +93,30 @@ pub async fn handle_quic_connection(
                 break;
             }
         };
-        stream_counter += 1;
-        let stream = QuicStream::new(send, recv);
-
-        if !handshake_done {
-            let result = match tokio::time::timeout(
-                std::time::Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
-                NoiseResponder::new(&secret_key).handshake(stream, &supported),
-            )
-            .await
-            {
-                Ok(Ok(r)) => r,
-                _ => continue,
-            };
-
-            if !allowed_clients.is_empty() && !allowed_clients.contains(&result.remote_static_key) {
-                continue;
-            }
-
-            conn_keys = Some(result.split_keys);
-            conn_cipher = Some(result.chosen_cipher);
-            handshake_done = true;
-
-            let (session_reader, session_writer) = split_after_handshake(
-                result.stream,
-                result.split_keys,
-                result.chosen_cipher,
-                result.is_initiator,
-            );
-            let frame_reader = FrameReader::new(session_reader);
-            let frame_writer = FrameWriter::new(session_writer);
-
-            let _ = handle_frame_stream(frame_reader, frame_writer, verification_url).await;
-        } else {
-            let keys = match conn_keys {
-                Some(k) => k,
-                None => continue,
-            };
-            let cipher = match conn_cipher {
-                Some(c) => c,
-                None => continue,
-            };
-
-            let (session_reader, session_writer) =
-                split_for_stream(stream, &keys, cipher, false, stream_counter);
-            let frame_reader = FrameReader::new(session_reader);
-            let frame_writer = FrameWriter::new(session_writer);
-
-            let _ = handle_frame_stream(frame_reader, frame_writer, verification_url).await;
-        }
+        let vurl = verification_url.clone();
+        tokio::spawn(async move {
+            let stream = QuicStream::new(send, recv);
+            let (read_half, write_half) = tokio::io::split(stream);
+            // QUIC streams carry plaintext frames: the Noise handshake inside
+            // QUIC already encrypted the connection, so only length-prefix
+            // framing remains.
+            let frame_reader = FrameReader::new(PlainMessageReader::new(read_half));
+            let frame_writer = FrameWriter::new(PlainMessageWriter::new(write_half));
+            let _ = handle_frame_stream(frame_reader, frame_writer, vurl.as_deref()).await;
+        });
     }
 }
 
 /// Common post-handshake logic: read SYN, connect target, relay.
 /// Supports both TCP and UDP streams (UDP flagged via FrameFlags::UDP).
-async fn handle_frame_stream<R, W>(
-    mut frame_reader: FrameReader<R>,
-    mut frame_writer: FrameWriter<W>,
+async fn handle_frame_stream<M, N>(
+    mut frame_reader: FrameReader<M>,
+    mut frame_writer: FrameWriter<N>,
     verification_url: Option<&str>,
 ) -> Result<()>
 where
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send + 'static,
+    M: MessageRead + Send + 'static,
+    N: MessageWrite + Send + 'static,
 {
     let first_frame = match frame_reader.read_frame().await {
         Ok(f) => f,
@@ -226,14 +200,14 @@ where
 
 /// UDP relay: SYN payload contains the first datagram target address + data.
 /// Wire format for UDP SYN payload: [TargetAddr encoded][datagram bytes]
-async fn udp_relay<R, W>(
+async fn udp_relay<M, N>(
     syn_frame: Frame,
-    mut frame_reader: FrameReader<R>,
-    mut frame_writer: FrameWriter<W>,
+    mut frame_reader: FrameReader<M>,
+    mut frame_writer: FrameWriter<N>,
 ) -> Result<()>
 where
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send + 'static,
+    M: MessageRead + Send + 'static,
+    N: MessageWrite + Send + 'static,
 {
     let stream_id = syn_frame.stream_id;
 
@@ -356,16 +330,16 @@ fn resolve_supported_ciphers(pref: CipherPreference) -> Vec<CipherSuite> {
     }
 }
 
-async fn relay<R, W>(
+async fn relay<M, N>(
     target: TcpStream,
-    mut frame_reader: FrameReader<R>,
-    mut frame_writer: FrameWriter<W>,
+    mut frame_reader: FrameReader<M>,
+    mut frame_writer: FrameWriter<N>,
     stream_id: u32,
     target_addr: &TargetAddr,
 ) -> Result<()>
 where
-    R: AsyncRead + Unpin,
-    W: AsyncWrite + Unpin,
+    M: MessageRead,
+    N: MessageWrite,
 {
     let (mut target_read, mut target_write) = tokio::io::split(target);
 
@@ -423,18 +397,26 @@ where
 
 /// Handle a Hello verification frame: probe the public internet and echo the
 /// result back to the client inside an encrypted Hello-ACK frame.
-async fn handle_hello<W>(
-    _frame: Frame,
-    mut frame_writer: FrameWriter<W>,
+async fn handle_hello<N>(
+    frame: Frame,
+    mut frame_writer: FrameWriter<N>,
     verification_url: Option<&str>,
 ) -> Result<()>
 where
-    W: AsyncWrite + Unpin + Send + 'static,
+    N: MessageWrite + Send + 'static,
 {
     use phantom_core::constants::{DEFAULT_HELLO_TARGETS, HELLO_ACK_MAGIC};
 
-    let targets: Vec<&str> = verification_url
-        .into_iter()
+    // Probe-target precedence: client-supplied `hello.targets` (they ride in
+    // the Hello payload) > server `verification_url` > built-in list. The
+    // client is fully authenticated by this point and could open the same
+    // connections through the relay anyway, so parsing its URLs adds no
+    // attack surface; the count/length caps only keep the probe loop bounded.
+    let client_targets = parse_hello_targets(&frame.payload);
+    let targets: Vec<&str> = client_targets
+        .iter()
+        .map(String::as_str)
+        .chain(verification_url.into_iter())
         .chain(DEFAULT_HELLO_TARGETS.iter().copied())
         .collect();
 
@@ -478,6 +460,34 @@ where
         if success { "passed" } else { "failed" }
     );
     Ok(())
+}
+
+/// Extract the optional `targets` array from a Hello frame payload.
+/// Malformed JSON or a missing field simply yields an empty list, which
+/// falls back to the server-side defaults.
+fn parse_hello_targets(payload: &[u8]) -> Vec<String> {
+    use phantom_core::constants::HELLO_MAGIC;
+
+    const MAX_TARGETS: usize = 4;
+    const MAX_URL_LEN: usize = 256;
+
+    let Some(json) = payload.strip_prefix(HELLO_MAGIC) else {
+        return Vec::new();
+    };
+    let Ok(body) = serde_json::from_slice::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    body.get("targets")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .filter(|s| s.starts_with("http://") && s.len() <= MAX_URL_LEN)
+                .take(MAX_TARGETS)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Tiny HTTP/1.0 GET probe. Returns a short body snippet on 200 OK.
@@ -592,5 +602,58 @@ mod tests {
         let (target, datagram) = decode_udp_syn(&payload).unwrap();
         assert!(matches!(target, TargetAddr::Domain(_, 443)));
         assert_eq!(datagram, b"data");
+    }
+
+    fn hello_payload(body: &serde_json::Value) -> Vec<u8> {
+        let mut buf = phantom_core::constants::HELLO_MAGIC.to_vec();
+        buf.extend_from_slice(body.to_string().as_bytes());
+        buf
+    }
+
+    #[test]
+    fn hello_targets_parsed_from_payload() {
+        let payload = hello_payload(&serde_json::json!({
+            "nonce": "1",
+            "targets": ["http://a.example/", "http://b.example/health"],
+        }));
+        assert_eq!(
+            parse_hello_targets(&payload),
+            vec![
+                "http://a.example/".to_string(),
+                "http://b.example/health".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn hello_targets_absent_or_malformed_yields_empty() {
+        // No targets field.
+        assert!(parse_hello_targets(&hello_payload(&serde_json::json!({"nonce": "1"}))).is_empty());
+        // Garbage JSON after the magic.
+        let mut buf = phantom_core::constants::HELLO_MAGIC.to_vec();
+        buf.extend_from_slice(b"not json");
+        assert!(parse_hello_targets(&buf).is_empty());
+        // Wrong magic entirely.
+        assert!(parse_hello_targets(b"whatever").is_empty());
+    }
+
+    #[test]
+    fn hello_targets_filtered_and_capped() {
+        let long_url = format!("http://{}/", "x".repeat(300));
+        let payload = hello_payload(&serde_json::json!({
+            "targets": [
+                "https://skip.example/", // https is not probeable: filtered
+                long_url,                 // over-long: filtered
+                "http://1.example/",
+                "http://2.example/",
+                "http://3.example/",
+                "http://4.example/",
+                "http://5.example/", // beyond the cap: dropped
+            ],
+        }));
+        let targets = parse_hello_targets(&payload);
+        assert_eq!(targets.len(), 4);
+        assert!(targets.iter().all(|t| t.starts_with("http://")));
+        assert!(targets.iter().all(|t| !t.contains('5')));
     }
 }

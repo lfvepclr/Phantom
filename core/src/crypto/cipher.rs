@@ -3,20 +3,35 @@ use cfg_if::cfg_if;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CipherSuite {
-    /// Primary: HW AES-NI / ARM CE, 5-12 GB/s
+    /// HW-accelerated AES (AES-NI / ARMv8 CE with the `aes_armv8` build flag):
+    /// ~1.6-3 GB/s with intrinsics; pure-software fallback is only ~177 MiB/s
     Aes256Gcm = 0x01,
     /// Balanced: mid-range ARM with AES CE
     Aes128Gcm = 0x02,
-    /// Fallback: no HW AES, NIST SP 800-232, ~1-2 GB/s
+    /// NIST lightweight AEAD, software-only, ~540-640 MiB/s
     Ascon128 = 0x03,
-    /// Last resort: software ChaCha20, ~1-2 GB/s
+    /// NEON-accelerated software cipher (`chacha20_force_neon` build flag):
+    /// ~650-730 MiB/s; fastest option without hardware AES
     ChaCha20Poly = 0x04,
 }
 
 impl CipherSuite {
+    /// Auto-select the best cipher for this build + CPU.
+    ///
+    /// Requires BOTH compile-time and runtime evidence of hardware AES:
+    /// the `aes` crate only ships its ARMv8 intrinsics backend when built
+    /// with `RUSTFLAGS="--cfg=aes_armv8"` (see .cargo/config.toml) — without
+    /// the flag the runtime CPU probe alone would select AES-256-GCM and then
+    /// run the software fixslice backend (~177 MiB/s, slower than ChaCha).
+    ///
+    /// Fallback order (no usable hardware AES): ChaCha20-Poly1305 — with the
+    /// `chacha20_force_neon` build flag its NEON backend is the fastest
+    /// software path (measured ~650-730 MiB/s vs ASCON ~540-640 MiB/s).
     pub fn auto_detect() -> Self {
         cfg_if! {
             if #[cfg(any(target_arch = "x86_64", target_arch = "x86"))] {
+                // The aes crate's x86 AES-NI backend is enabled by default
+                // (runtime-detected), so the CPU probe alone is sufficient.
                 if is_x86_feature_detected!("aes") {
                     return CipherSuite::Aes256Gcm;
                 }
@@ -24,13 +39,12 @@ impl CipherSuite {
         }
         cfg_if! {
             if #[cfg(target_arch = "aarch64")] {
-                if std::arch::is_aarch64_feature_detected!("aes") {
+                if cfg!(aes_armv8) && std::arch::is_aarch64_feature_detected!("aes") {
                     return CipherSuite::Aes256Gcm;
                 }
             }
         }
-        // No hardware AES acceleration — ASCON beats software AES by 5-10x
-        CipherSuite::Ascon128
+        CipherSuite::ChaCha20Poly
     }
 
     pub fn key_len(self) -> usize {

@@ -17,8 +17,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use phantom_core::transport::{try_bind_quic_with_fallback, try_bind_tcp_with_fallback};
 
 use phantom_core::{
-    CipherPreference, CongestionAlgorithm, KeyPair, ServerConfig, ServerEntry, TransportProtocol,
-    build_phantom_uri, parse_phantom_uri,
+    CipherPreference, KeyPair, Psk, QuicConfig, ServerConfig, ServerEntry, ServerIdentity,
+    TransportProtocol, build_phantom_uri, parse_phantom_uri,
 };
 use std::io::{IsTerminal, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -53,6 +53,11 @@ pub struct AutoOptions {
     pub protocol: Option<TransportProtocol>,
     /// Number of consecutive ports to try before giving up. Defaults to 10.
     pub max_port_tries: Option<u16>,
+    /// Working directory that `server.key` / `server.toml` live in.
+    /// `None` keeps the historical behaviour of using the process CWD;
+    /// embedded launchers (e.g. the HarmonyOS app) pass their sandbox
+    /// files directory here so generated state lands in app-private storage.
+    pub work_dir: Option<PathBuf>,
 }
 
 impl AutoOptions {
@@ -73,10 +78,31 @@ impl AutoOptions {
     }
 }
 
-/// Auto-bootstrap the server in CWD. See module docs for the full flow.
-pub async fn run_auto(opts: AutoOptions) -> Result<()> {
-    let paths = BootstrapPaths::resolve()?;
-    let kp = load_or_generate_key(&paths.key_path)?;
+/// The result of a successful bootstrap preparation, before the listener
+/// starts. Returned by [`prepare_auto`] so embedders (e.g. the HarmonyOS
+/// app) can read the generated URI programmatically instead of scraping
+/// stdout.
+pub struct PreparedServer {
+    /// Fully-resolved runtime options, ready for [`run_with_options`].
+    pub options: BootstrapOptions,
+    /// The `phantom://` quick-link URI (contains the PSK) to distribute
+    /// to clients.
+    pub uri: String,
+    /// Path of the key file that was loaded or generated.
+    pub key_path: PathBuf,
+    /// Path of the `server.toml` that was (re)written.
+    pub toml_path: PathBuf,
+}
+
+/// Run the full bootstrap flow — load or generate the key, probe a free
+/// port, detect the public host, write `server.toml` — but do NOT start
+/// the listener. CLI entry points follow up with [`print_summary`] +
+/// [`run_with_options`]; embedded callers spawn the runtime themselves
+/// and return [`PreparedServer::uri`] to their UI.
+pub async fn prepare_auto(opts: &AutoOptions) -> Result<PreparedServer> {
+    let paths = BootstrapPaths::resolve_at(opts.work_dir.as_deref())?;
+    let identity = load_or_generate_key(&paths.key_path)?;
+    let kp = &identity.keys;
     // Pre-existing server.toml (if any) may carry an inline whitelist; pick
     // that up so re-running auto mode preserves user edits.
     let allowed = load_allowed_clients_from_toml(&paths.toml_path);
@@ -86,11 +112,9 @@ pub async fn run_auto(opts: AutoOptions) -> Result<()> {
     let start_port = opts.start_port();
     let max_tries = opts.max_tries();
 
-    let (bound_port, _proto_ctx) = probe_port(protocol, start_port, max_tries)
+    let (bound_port, _proto_ctx) = probe_port(protocol, start_port, max_tries, &identity, cipher)
         .await
-        .with_context(|| {
-            format!("auto-bootstrap failed to find a free port starting at {start_port}")
-        })?;
+        .with_context(|| format!("failed to find a free port starting at {start_port}"))?;
 
     let public_host = resolve_public_host(opts.public_host.as_deref());
     let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), bound_port);
@@ -98,6 +122,7 @@ pub async fn run_auto(opts: AutoOptions) -> Result<()> {
     let uri = build_phantom_uri(
         &kp.public_key_base64(),
         &format!("{public_host}:{bound_port}"),
+        &identity.psk.to_base64(),
         cipher,
         protocol,
         Some(DEFAULT_URI_NAME),
@@ -115,26 +140,40 @@ pub async fn run_auto(opts: AutoOptions) -> Result<()> {
         },
     )?;
 
+    Ok(PreparedServer {
+        options: BootstrapOptions {
+            bind,
+            secret_key: kp.secret,
+            psk: identity.psk.clone(),
+            allowed_clients: allowed,
+            cipher,
+            protocol,
+            quic_config: QuicConfig::default(),
+            io_uring: false,
+            verification_url: None,
+        },
+        uri,
+        key_path: paths.key_path,
+        toml_path: paths.toml_path,
+    })
+}
+
+fn print_prepared(prepared: &PreparedServer) {
     print_summary(SummaryInfo {
-        key_path: &paths.key_path,
-        toml_path: &paths.toml_path,
-        bind,
-        uri: &uri,
-        allowed_count: allowed.len(),
+        key_path: &prepared.key_path,
+        toml_path: &prepared.toml_path,
+        bind: prepared.options.bind,
+        uri: &prepared.uri,
+        allowed_count: prepared.options.allowed_clients.len(),
     });
+}
 
-    let opts = BootstrapOptions {
-        bind,
-        secret_key: kp.secret,
-        allowed_clients: allowed,
-        cipher,
-        protocol,
-        quic_congestion: CongestionAlgorithm::default(),
-        io_uring: false,
-        verification_url: None,
-    };
-
-    run_with_options(opts).await
+/// Auto-bootstrap the server in `opts.work_dir` (or CWD when unset).
+/// See module docs for the full flow.
+pub async fn run_auto(opts: AutoOptions) -> Result<()> {
+    let prepared = prepare_auto(&opts).await?;
+    print_prepared(&prepared);
+    run_with_options(prepared.options).await
 }
 
 /// Interactive bootstrap: ask the user for port / IP / cipher / protocol on
@@ -147,8 +186,6 @@ pub async fn run_interactive(mut opts: AutoOptions) -> Result<()> {
              Use `phantom server` (auto) or `phantom server -c <file>` instead."
         );
     }
-
-    let paths = BootstrapPaths::resolve()?;
 
     // Port prompt (loops on fallback failure).
     let start_port = loop {
@@ -186,70 +223,24 @@ pub async fn run_interactive(mut opts: AutoOptions) -> Result<()> {
 
     opts.max_port_tries = Some(DEFAULT_MAX_PORT_TRIES);
 
-    let kp = load_or_generate_key(&paths.key_path)?;
-    let allowed = load_allowed_clients_from_toml(&paths.toml_path);
-
-    let cipher = opts.cipher();
-    let protocol = opts.protocol();
-    let max_tries = opts.max_tries();
-
-    let (bound_port, _) = match probe_port(protocol, start_port, max_tries).await {
-        Ok(v) => v,
+    let prepared = match prepare_auto(&opts).await {
+        Ok(p) => p,
         Err(e) => {
-            eprintln!("{e}");
-            bail!("No free port found — please re-run and choose another port.");
+            eprintln!("{e:#}");
+            bail!("Bootstrap failed — please re-run and adjust the parameters.");
         }
     };
+    print_prepared(&prepared);
 
-    let public_host = resolve_public_host(opts.public_host.as_deref());
-    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), bound_port);
-
-    let uri = build_phantom_uri(
-        &kp.public_key_base64(),
-        &format!("{public_host}:{bound_port}"),
-        cipher,
-        protocol,
-        Some(DEFAULT_URI_NAME),
-    );
-
-    write_server_toml(
-        &paths.toml_path,
-        &paths.key_path,
-        TomlSnapshot {
-            bind,
-            cipher,
-            protocol,
-            uri: &uri,
-            allowed: &allowed,
-        },
-    )?;
-    print_summary(SummaryInfo {
-        key_path: &paths.key_path,
-        toml_path: &paths.toml_path,
-        bind,
-        uri: &uri,
-        allowed_count: allowed.len(),
-    });
-
-    let opts = BootstrapOptions {
-        bind,
-        secret_key: kp.secret,
-        allowed_clients: allowed,
-        cipher,
-        protocol,
-        quic_congestion: CongestionAlgorithm::default(),
-        io_uring: false,
-        verification_url: None,
-    };
-
-    run_with_options(opts).await
+    run_with_options(prepared.options).await
 }
 
 /// Self-bootstrap helper: thin wrapper around [`crate::run_from_uri`] that
 /// resolves the CWD-relative key path. The whitelist is read from
 /// `server.toml` (if present) by the underlying `run_from_uri_impl`.
 pub async fn run_from_uri(uri: &str) -> Result<()> {
-    let paths = BootstrapPaths::resolve()?;
+    // No AutoOptions here: URI bootstrap keeps the CWD-relative behaviour.
+    let paths = BootstrapPaths::resolve_at(None)?;
     let key_path_str = paths
         .key_path
         .to_str()
@@ -273,7 +264,6 @@ pub async fn run_from_uri(uri: &str) -> Result<()> {
         );
     }
     tracing::info!("URI public key matches local key — bootstrapping");
-
     run_from_uri_impl(uri, key_path_str).await
 }
 
@@ -285,33 +275,54 @@ struct BootstrapPaths {
 }
 
 impl BootstrapPaths {
-    fn resolve() -> Result<Self> {
-        let cwd = std::env::current_dir().context("failed to read current directory")?;
+    /// Resolve `server.key` / `server.toml` under `work_dir`, falling back to
+    /// the process CWD when `None`. An explicit work dir is created if
+    /// missing so embedded launchers can hand us a fresh sandbox path.
+    fn resolve_at(work_dir: Option<&Path>) -> Result<Self> {
+        let base = match work_dir {
+            Some(dir) => {
+                std::fs::create_dir_all(dir).with_context(|| {
+                    format!("failed to create work directory {}", dir.display())
+                })?;
+                dir.to_path_buf()
+            }
+            None => std::env::current_dir().context("failed to read current directory")?,
+        };
         Ok(Self {
-            key_path: cwd.join("server.key"),
-            toml_path: cwd.join("server.toml"),
+            key_path: base.join("server.key"),
+            toml_path: base.join("server.toml"),
         })
     }
 }
 
-fn load_or_generate_key(path: &Path) -> Result<KeyPair> {
+fn load_or_generate_key(path: &Path) -> Result<ServerIdentity> {
+    let p = path
+        .to_str()
+        .ok_or_else(|| anyhow!("non-UTF8 key path: {}", path.display()))?;
     if path.exists() {
-        let p = path
-            .to_str()
-            .ok_or_else(|| anyhow!("non-UTF8 key path: {}", path.display()))?;
-        let kp = KeyPair::load_secret_from_file(p)
+        let identity = KeyPair::load_server_identity(p)
             .with_context(|| format!("failed to load existing key {}", path.display()))?;
         tracing::info!("Reusing existing key from {}", path.display());
-        Ok(kp)
+        if identity.psk_generated {
+            tracing::warn!(
+                "{} predated PSK support; a PSK has been generated and appended. \
+                 The public key is unchanged, but previously distributed URIs no \
+                 longer work — re-distribute the URI below.",
+                path.display()
+            );
+        }
+        Ok(identity)
     } else {
-        let kp = KeyPair::generate().context("failed to generate key pair")?;
-        let p = path
-            .to_str()
-            .ok_or_else(|| anyhow!("non-UTF8 key path: {}", path.display()))?;
-        kp.save_secret_to_file(p)
+        let keys = KeyPair::generate().context("failed to generate key pair")?;
+        let psk = Psk::generate();
+        keys.save_secret_with_psk_to_file(p, &psk)
             .with_context(|| format!("failed to write key to {}", path.display()))?;
-        tracing::info!("Generated new key pair: {}", path.display());
-        Ok(kp)
+        tracing::info!("Generated new key pair and PSK: {}", path.display());
+        Ok(ServerIdentity {
+            keys,
+            psk,
+            psk_generated: false,
+        })
     }
 }
 
@@ -371,6 +382,8 @@ async fn probe_port(
     protocol: TransportProtocol,
     start_port: u16,
     max_tries: u16,
+    identity: &ServerIdentity,
+    cipher: CipherPreference,
 ) -> Result<(u16, ProtocolContext)> {
     let start = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), start_port);
     match protocol {
@@ -384,8 +397,18 @@ async fn probe_port(
             Ok((bound.port(), ProtocolContext::Tcp))
         }
         TransportProtocol::Quic => {
+            // The probe binds a real Noise-authenticated endpoint, so it needs
+            // real key material; the listener is dropped right after the port
+            // check and the runtime rebinds with the same identity. An ASCON +
+            // QUIC combination surfaces here as a clear config error at
+            // bootstrap instead of at first connect.
+            let auth = phantom_core::QuicAuth::server(
+                identity.keys.secret,
+                identity.psk.clone(),
+                cipher,
+            );
             let (_listener, bound) =
-                try_bind_quic_with_fallback(start, max_tries, CongestionAlgorithm::default())
+                try_bind_quic_with_fallback(start, max_tries, &auth, &QuicConfig::default())
                     .await
                     .map_err(|e| anyhow!("{e}"))?;
             Ok((bound.port(), ProtocolContext::Quic))
@@ -630,6 +653,7 @@ mod tests {
             cipher: Some(CipherPreference::Aes256Gcm),
             protocol: Some(TransportProtocol::Quic),
             public_host: Some("example.com".to_string()),
+            work_dir: None,
         };
         assert_eq!(o.start_port(), 9000);
         assert_eq!(o.max_tries(), 3);
@@ -698,9 +722,23 @@ name = "alice"
     fn bootstrap_paths_use_cwd() {
         // We can't change CWD safely in a test, but we can at least
         // confirm the returned paths have the right file names.
-        let p = BootstrapPaths::resolve().unwrap();
+        let p = BootstrapPaths::resolve_at(None).unwrap();
         assert_eq!(p.key_path.file_name().unwrap(), "server.key");
         assert_eq!(p.toml_path.file_name().unwrap(), "server.toml");
+    }
+
+    #[test]
+    fn bootstrap_paths_use_explicit_work_dir() {
+        // An explicit work dir must be honoured exactly (and created if
+        // missing) so embedded launchers can point at sandbox storage.
+        let dir = std::env::temp_dir()
+            .join(format!("phantom_bootstrap_workdir_{}", std::process::id()))
+            .join("nested"); // does not exist yet; resolve_at must create it
+        let p = BootstrapPaths::resolve_at(Some(&dir)).unwrap();
+        assert_eq!(p.key_path, dir.join("server.key"));
+        assert_eq!(p.toml_path, dir.join("server.toml"));
+        assert!(dir.exists(), "resolve_at must create a missing work dir");
+        let _ = std::fs::remove_dir_all(dir.parent().unwrap());
     }
 
     #[test]

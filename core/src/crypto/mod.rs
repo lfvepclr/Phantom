@@ -7,8 +7,8 @@ pub mod session;
 pub mod writer;
 
 pub use cipher::CipherSuite;
-pub use keys::KeyPair;
+pub use keys::{KeyPair, Psk, ServerIdentity};
 pub use noise::{HandshakeResult, NoiseInitiator, NoiseResponder};
 pub use reader::SessionReader;
-pub use session::{split_after_handshake, split_for_stream};
+pub use session::split_after_handshake;
 pub use writer::SessionWriter;

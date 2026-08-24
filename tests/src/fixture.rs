@@ -1,6 +1,6 @@
 use crate::echo::{EchoMode, EchoServer, start_echo_server};
 use phantom_core::CipherPreference;
-use phantom_core::crypto::KeyPair;
+use phantom_core::crypto::{KeyPair, Psk};
 use phantom_core::transport::TransportListener;
 use phantom_core::transport::tcp::TcpListener;
 use phantom_server::handler::handle_connection;
@@ -12,6 +12,8 @@ pub struct TestFixture {
     pub server_addr: SocketAddr,
     pub client_key: KeyPair,
     pub server_key: KeyPair,
+    /// PSK the fixture's server enforces. Clients must present the same value.
+    pub psk: Psk,
     pub cipher_preference: CipherPreference,
     pub allowed_clients: Vec<[u8; 32]>,
     pub echo_server: EchoServer,
@@ -44,6 +46,7 @@ pub struct TestFixtureBuilder {
     echo_mode: EchoMode,
     allowed_clients: Vec<[u8; 32]>,
     client_key: Option<KeyPair>,
+    psk: Option<Psk>,
 }
 
 impl TestFixtureBuilder {
@@ -53,6 +56,7 @@ impl TestFixtureBuilder {
             echo_mode: EchoMode::Echo,
             allowed_clients: Vec::new(),
             client_key: None,
+            psk: None,
         }
     }
     pub fn cipher(mut self, cipher: CipherPreference) -> Self {
@@ -71,12 +75,18 @@ impl TestFixtureBuilder {
         self.client_key = Some(key);
         self
     }
+    /// Pin the server's PSK, for tests that need a deliberate mismatch.
+    pub fn psk(mut self, psk: Psk) -> Self {
+        self.psk = Some(psk);
+        self
+    }
 
     pub async fn build(self) -> TestFixture {
         let server_key = KeyPair::generate().expect("Failed to generate server key");
         let client_key = self
             .client_key
             .unwrap_or_else(|| KeyPair::generate().expect("Failed to generate client key"));
+        let psk = self.psk.unwrap_or_else(Psk::generate);
         let echo_server = start_echo_server(self.echo_mode).await;
         let target_addr = echo_server.addr;
         let server_listener = TcpListener::bind(&"127.0.0.1:0".parse().unwrap())
@@ -87,6 +97,7 @@ impl TestFixtureBuilder {
         let server_secret = server_key.secret;
         let allowed = self.allowed_clients.clone();
         let cipher_pref = self.cipher;
+        let server_psk = psk.clone();
         tokio::spawn(async move {
             tokio::pin!(server_shutdown_rx);
             loop {
@@ -97,8 +108,9 @@ impl TestFixtureBuilder {
                                 let sk = server_secret;
                                 let allowed_clone = allowed.clone();
                                 let cp = cipher_pref;
+                                let conn_psk = server_psk.clone();
                                 tokio::spawn(async move {
-                                    handle_connection(stream, sk, &allowed_clone, cp, None).await;
+                                    handle_connection(stream, sk, conn_psk, &allowed_clone, cp, None).await;
                                 });
                             }
                             Err(e) => { tracing::error!("Server accept error: {}", e); }
@@ -113,6 +125,7 @@ impl TestFixtureBuilder {
             server_addr,
             client_key,
             server_key,
+            psk,
             cipher_preference: self.cipher,
             allowed_clients: self.allowed_clients,
             echo_server,

@@ -5,45 +5,69 @@ use phantom_core::TransportProtocol;
 use phantom_core::constants::MAX_FRAME_PAYLOAD;
 use phantom_core::crypto::cipher::CipherSuite;
 use phantom_core::crypto::session::CipherOffer;
-use phantom_core::crypto::{NoiseInitiator, split_after_handshake};
-use phantom_core::protocol::codec::{FrameReader, FrameWriter};
+use phantom_core::crypto::{NoiseInitiator, SessionReader, SessionWriter, split_after_handshake};
+use phantom_core::protocol::codec::{
+    FrameReader, FrameWriter, MessageRead, MessageWrite, PlainMessageReader, PlainMessageWriter,
+};
 use phantom_core::protocol::frame::FrameFlags;
 use phantom_core::protocol::{Frame, TargetAddr};
 use phantom_core::transport::Transport;
+use phantom_core::transport::quic::QuicStream;
 use phantom_core::transport::tcp::TcpTransport;
-use phantom_core::{ClientConfig, PhantomError, Result, ServerEntry};
+use phantom_core::{ClientConfig, PhantomError, ProxyAuthConfig, Result, ServerEntry};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::failover::FailoverManager;
+use crate::quic_pool::QuicPool;
+use crate::stats::TrafficStats;
+use crate::udp_relay::{UdpFlowChannels, establish_udp_flow_quic, establish_udp_flow_tcp};
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+use tokio::net::UdpSocket;
+use tokio::sync::mpsc::UnboundedSender;
 
 pub async fn handle_socks5_connection(
     mut socks5: TcpStream,
     config: &ClientConfig,
     failover: &FailoverManager,
+    quic_pool: &QuicPool,
     local_secret: [u8; 32],
+    stats: &Arc<TrafficStats>,
 ) -> Result<()> {
-    // 1. SOCKS5 method negotiation
-    negotiate_method(&mut socks5).await?;
+    // 1. SOCKS5 method negotiation (RFC1929 username/password when the
+    //    inbound is shared on a LAN with `client.proxy_auth` configured).
+    negotiate_method(&mut socks5, config.client.proxy_auth.as_ref()).await?;
 
     // 2. SOCKS5 request
-    let target = read_request(&mut socks5).await?;
-    tracing::info!("SOCKS5 target: {}", target);
+    let (cmd, target) = read_request(&mut socks5).await?;
+    tracing::info!("SOCKS5 target: {} (cmd={:#x})", target, cmd);
 
-    // 3. Select server via failover manager
-    let server = failover.select_server()?;
+    if cmd == SOCKS5_CMD_UDP_ASSOCIATE {
+        return handle_udp_associate(socks5, config, failover, quic_pool, local_secret, stats)
+            .await;
+    }
+
+    // 3. Select server via failover manager (owned snapshot: the pool is
+    // hot-reloadable, so we must not hold its lock across the relay). The
+    // migration watcher is subscribed atomically with the selection so a
+    // hard failover (`graceful_migration = false`) always reaches this relay.
+    let (server, migration_rx) = failover.select_server_with_migration()?;
 
     // 4. Establish encrypted tunnel via selected transport protocol
+    // Per-server cipher (URI `cipher=`) wins over the client-wide default.
+    let effective_cipher = CipherPreference::effective_for(server.cipher, config.client.cipher);
     tracing::info!("Connecting to server {} ({})", server.name, server.address);
     match server.protocol {
         TransportProtocol::Tcp => {
             let transport = TcpTransport::new(std::time::Duration::from_secs(10));
             match establish_tunnel(
                 &transport,
-                server,
+                &server,
                 &local_secret,
                 &target,
-                config.client.cipher,
+                effective_cipher,
             )
             .await
             {
@@ -51,31 +75,49 @@ pub async fn handle_socks5_connection(
                     tracing::info!(
                         "Tunnel established → {} (cipher={:?})",
                         target,
-                        config.client.cipher
+                        effective_cipher
                     );
+                    stats.record_tcp_connect();
                     send_reply(&mut socks5, 0x00).await?;
-                    relay_socks5_tunnel(socks5, frame_reader, frame_writer, stream_id, &target)
-                        .await
+                    relay_socks5_tunnel(
+                        socks5,
+                        frame_reader,
+                        frame_writer,
+                        stream_id,
+                        &target,
+                        stats,
+                        migration_rx,
+                    )
+                    .await
                 }
                 Err(e) => {
                     tracing::info!("Tunnel failed → {}: {}", target, e);
+                    // Datapath evidence: transport/handshake failures (Io,
+                    // Timeout) mean the server itself is unreachable — feed
+                    // failover immediately instead of waiting for the next
+                    // health-probe tick. Protocol refusals (the server is up
+                    // but rejected the target) must not count.
+                    if matches!(
+                        e,
+                        phantom_core::PhantomError::Io(_) | phantom_core::PhantomError::Timeout
+                    ) {
+                        failover.report_datapath_failure(&server.name);
+                    }
                     let _ = send_reply(&mut socks5, 0x05).await;
                     Err(e)
                 }
             }
         }
         TransportProtocol::Quic => {
-            let server_name = server.address.split(':').next().unwrap_or("").to_string();
-            let transport = phantom_core::transport::quic::QuicTransport::new(
-                std::time::Duration::from_secs(10),
-                &server_name,
-            );
-            match establish_tunnel(
-                &transport,
-                server,
+            // QUIC is authenticated at connection level (Noise inside QUIC),
+            // so streams run the bare frame protocol over the pooled
+            // connection — one stream per SOCKS5 tunnel.
+            match establish_quic_tunnel(
+                quic_pool,
+                &server,
                 &local_secret,
                 &target,
-                config.client.cipher,
+                effective_cipher,
             )
             .await
             {
@@ -83,14 +125,30 @@ pub async fn handle_socks5_connection(
                     tracing::info!(
                         "Tunnel established → {} (cipher={:?})",
                         target,
-                        config.client.cipher
+                        effective_cipher
                     );
+                    stats.record_tcp_connect();
                     send_reply(&mut socks5, 0x00).await?;
-                    relay_socks5_tunnel(socks5, frame_reader, frame_writer, stream_id, &target)
-                        .await
+                    relay_socks5_tunnel(
+                        socks5,
+                        frame_reader,
+                        frame_writer,
+                        stream_id,
+                        &target,
+                        stats,
+                        migration_rx,
+                    )
+                    .await
                 }
                 Err(e) => {
                     tracing::info!("Tunnel failed → {}: {}", target, e);
+                    // Same datapath evidence as the TCP branch above.
+                    if matches!(
+                        e,
+                        phantom_core::PhantomError::Io(_) | phantom_core::PhantomError::Timeout
+                    ) {
+                        failover.report_datapath_failure(&server.name);
+                    }
                     let _ = send_reply(&mut socks5, 0x05).await;
                     Err(e)
                 }
@@ -99,7 +157,11 @@ pub async fn handle_socks5_connection(
     }
 }
 
-async fn negotiate_method(stream: &mut TcpStream) -> Result<()> {
+const SOCKS5_METHOD_NONE: u8 = 0x00;
+const SOCKS5_METHOD_USERPASS: u8 = 0x02;
+const SOCKS5_METHOD_NO_ACCEPTABLE: u8 = 0xFF;
+
+async fn negotiate_method(stream: &mut TcpStream, auth: Option<&ProxyAuthConfig>) -> Result<()> {
     let mut buf = [0u8; 2];
     stream
         .read_exact(&mut buf)
@@ -120,22 +182,95 @@ async fn negotiate_method(stream: &mut TcpStream) -> Result<()> {
         .await
         .map_err(|e| PhantomError::Protocol(format!("SOCKS5 methods read failed: {}", e)))?;
 
-    if !methods.contains(&0x00) {
-        let _ = stream.write_all(&[0x05, 0xFF]).await;
+    // With credentials configured, only username/password is acceptable;
+    // without, only no-auth is. Never downgrade across the two policies.
+    let required = if auth.is_some() {
+        SOCKS5_METHOD_USERPASS
+    } else {
+        SOCKS5_METHOD_NONE
+    };
+    if !methods.contains(&required) {
+        let _ = stream.write_all(&[0x05, SOCKS5_METHOD_NO_ACCEPTABLE]).await;
         return Err(PhantomError::Protocol(
             "No acceptable SOCKS5 auth method".to_string(),
         ));
     }
 
     stream
-        .write_all(&[0x05, 0x00])
+        .write_all(&[0x05, required])
         .await
         .map_err(|e| PhantomError::Protocol(format!("SOCKS5 negotiation reply failed: {}", e)))?;
+
+    if required == SOCKS5_METHOD_USERPASS {
+        let auth = auth.expect("userpass method implies configured credentials");
+        rfc1929_authenticate(stream, auth).await?;
+    }
 
     Ok(())
 }
 
-async fn read_request(stream: &mut TcpStream) -> Result<TargetAddr> {
+/// RFC 1929 username/password sub-negotiation: VER(1) ULEN UNAME PLEN PASSWD.
+async fn rfc1929_authenticate(stream: &mut TcpStream, expected: &ProxyAuthConfig) -> Result<()> {
+    let mut hdr = [0u8; 2];
+    stream
+        .read_exact(&mut hdr)
+        .await
+        .map_err(|e| PhantomError::Protocol(format!("SOCKS5 auth read failed: {}", e)))?;
+    if hdr[0] != 0x01 {
+        return Err(PhantomError::Protocol(format!(
+            "Bad SOCKS5 auth version: {}",
+            hdr[0]
+        )));
+    }
+    // ULEN/PLEN are one byte each, so both fields are naturally ≤255 bytes.
+    let mut uname = vec![0u8; hdr[1] as usize];
+    stream
+        .read_exact(&mut uname)
+        .await
+        .map_err(|e| PhantomError::Protocol(format!("SOCKS5 auth read failed: {}", e)))?;
+    let mut plen = [0u8; 1];
+    stream
+        .read_exact(&mut plen)
+        .await
+        .map_err(|e| PhantomError::Protocol(format!("SOCKS5 auth read failed: {}", e)))?;
+    let mut passwd = vec![0u8; plen[0] as usize];
+    stream
+        .read_exact(&mut passwd)
+        .await
+        .map_err(|e| PhantomError::Protocol(format!("SOCKS5 auth read failed: {}", e)))?;
+
+    let ok = constant_time_eq(&uname, expected.username.as_bytes())
+        && constant_time_eq(&passwd, expected.password.as_bytes());
+    let status = if ok { 0x00 } else { 0x01 };
+    stream
+        .write_all(&[0x01, status])
+        .await
+        .map_err(|e| PhantomError::Protocol(format!("SOCKS5 auth reply failed: {}", e)))?;
+    if !ok {
+        return Err(PhantomError::Protocol(
+            "SOCKS5 username/password mismatch".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Length-and-content comparison without early exit, so credential checks do
+/// not leak a timing oracle to local-network attackers.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+const SOCKS5_CMD_CONNECT: u8 = 0x01;
+const SOCKS5_CMD_UDP_ASSOCIATE: u8 = 0x03;
+
+async fn read_request(stream: &mut TcpStream) -> Result<(u8, TargetAddr)> {
     let mut header = [0u8; 4];
     stream
         .read_exact(&mut header)
@@ -149,13 +284,15 @@ async fn read_request(stream: &mut TcpStream) -> Result<TargetAddr> {
         )));
     }
 
-    if header[1] != 0x01 {
+    // CONNECT (0x01) and UDP ASSOCIATE (0x03); BIND (0x02) is not supported.
+    if header[1] != SOCKS5_CMD_CONNECT && header[1] != SOCKS5_CMD_UDP_ASSOCIATE {
         let _ = send_reply(stream, 0x07).await;
         return Err(PhantomError::Protocol(format!(
             "Unsupported SOCKS5 command: {}",
             header[1]
         )));
     }
+    let cmd = header[1];
 
     let atyp = header[3];
     let target = match atyp {
@@ -217,7 +354,7 @@ async fn read_request(stream: &mut TcpStream) -> Result<TargetAddr> {
         }
     };
 
-    Ok(target)
+    Ok((cmd, target))
 }
 
 async fn send_reply(stream: &mut TcpStream, reply: u8) -> Result<()> {
@@ -233,6 +370,193 @@ async fn send_reply(stream: &mut TcpStream, reply: u8) -> Result<()> {
     Ok(())
 }
 
+/// SOCKS5 reply carrying a concrete BND.ADDR/BND.PORT. UDP ASSOCIATE must
+/// tell the client where to send datagrams, so the hardcoded 0.0.0.0:0 of
+/// `send_reply` does not apply here.
+async fn send_reply_addr(stream: &mut TcpStream, reply: u8, addr: &SocketAddr) -> Result<()> {
+    let mut buf = vec![0x05, reply, 0x00];
+    match addr.ip() {
+        IpAddr::V4(v4) => {
+            buf.push(0x01);
+            buf.extend_from_slice(&v4.octets());
+        }
+        IpAddr::V6(v6) => {
+            buf.push(0x04);
+            buf.extend_from_slice(&v6.octets());
+        }
+    }
+    buf.extend_from_slice(&addr.port().to_be_bytes());
+    stream.write_all(&buf).await.map_err(PhantomError::Io)?;
+    stream.flush().await.map_err(PhantomError::Io)?;
+    Ok(())
+}
+
+/// Parse a SOCKS5 UDP request header: RSV(2) FRAG(1) ATYP+ADDR+PORT DATA.
+/// Returns the target and the DATA slice. Fragments (FRAG != 0) and
+/// malformed packets are dropped per RFC 1928 §7.
+fn parse_udp_request(pkt: &[u8]) -> Option<(TargetAddr, &[u8])> {
+    if pkt.len() < 4 || pkt[0] != 0 || pkt[1] != 0 || pkt[2] != 0 {
+        return None;
+    }
+    let addr_len = match pkt[3] {
+        0x01 => 1 + 4 + 2,
+        0x03 => {
+            if pkt.len() < 5 {
+                return None;
+            }
+            2 + pkt[4] as usize + 2
+        }
+        0x04 => 1 + 16 + 2,
+        _ => return None,
+    };
+    if pkt.len() < 3 + addr_len {
+        return None;
+    }
+    let target = TargetAddr::decode(&pkt[3..3 + addr_len]).ok()?;
+    Some((target, &pkt[3 + addr_len..]))
+}
+
+/// Wrap a datagram from the tunnel back into a SOCKS5 UDP request header
+/// (RSV FRAG ATYP+ADDR+PORT DATA) for delivery to the local client.
+fn wrap_udp_request(target: &TargetAddr, data: &[u8]) -> Vec<u8> {
+    let addr = target.encode();
+    let mut pkt = Vec::with_capacity(3 + addr.len() + data.len());
+    pkt.extend_from_slice(&[0, 0, 0]);
+    pkt.extend_from_slice(&addr);
+    pkt.extend_from_slice(data);
+    pkt
+}
+
+/// SOCKS5 UDP ASSOCIATE handler.
+///
+/// Binds a UDP socket on the TCP control connection's local IP, replies with
+/// the bound address, then relays datagrams through per-target tunnel flows
+/// (shared plumbing in `udp_relay`). Per RFC 1928: only datagrams from the
+/// first-seen client address are accepted, and the association ends when the
+/// control connection hits EOF.
+async fn handle_udp_associate(
+    mut socks5: TcpStream,
+    config: &ClientConfig,
+    failover: &FailoverManager,
+    quic_pool: &QuicPool,
+    local_secret: [u8; 32],
+    stats: &Arc<TrafficStats>,
+) -> Result<()> {
+    let local_ip = socks5.local_addr().map_err(PhantomError::Io)?.ip();
+    let udp = UdpSocket::bind(SocketAddr::new(local_ip, 0))
+        .await
+        .map_err(PhantomError::Io)?;
+    let udp_addr = udp.local_addr().map_err(PhantomError::Io)?;
+    let udp = Arc::new(udp);
+    tracing::info!("UDP ASSOCIATE relay at {}", udp_addr);
+
+    send_reply_addr(&mut socks5, 0x00, &udp_addr).await?;
+
+    // Keyed by `TargetAddr::encode()` — TargetAddr has no Eq/Hash.
+    let mut flows: HashMap<Vec<u8>, (TargetAddr, UnboundedSender<Vec<u8>>)> = HashMap::new();
+    let mut client_addr: Option<SocketAddr> = None;
+    let mut buf = vec![0u8; 65536];
+    let mut ctl = [0u8; 16];
+
+    loop {
+        tokio::select! {
+            res = socks5.read(&mut ctl) => {
+                // Any EOF or error on the control connection ends the
+                // association; payload bytes (there should be none) are ignored.
+                match res {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+            res = udp.recv_from(&mut buf) => {
+                let (n, src) = match res {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::debug!("UDP relay recv error: {}", e);
+                        break;
+                    }
+                };
+                match client_addr {
+                    None => client_addr = Some(src),
+                    Some(addr) if addr != src => continue,
+                    _ => {}
+                }
+                let (target, data) = match parse_udp_request(&buf[..n]) {
+                    Some(v) => v,
+                    None => continue,
+                };
+                stats.record_udp_up(data.len() as u64);
+
+                let key = target.encode().to_vec();
+                let mut established = false;
+                if let Some((_, tx)) = flows.get(&key) {
+                    if tx.send(data.to_vec()).is_ok() {
+                        continue;
+                    }
+                    // Dead sender: the pump ended, re-establish below.
+                    flows.remove(&key);
+                    established = true;
+                }
+
+                let server = match failover.select_server() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::debug!("UDP flow → {}: no server: {}", target, e);
+                        continue;
+                    }
+                };
+                let flow = match server.protocol {
+                    TransportProtocol::Tcp => {
+                        establish_udp_flow_tcp(&server, &local_secret, target.clone(), data.to_vec())
+                            .await
+                    }
+                    TransportProtocol::Quic => {
+                        establish_udp_flow_quic(
+                            quic_pool,
+                            &server,
+                            &local_secret,
+                            CipherPreference::effective_for(server.cipher, config.client.cipher),
+                            target.clone(),
+                            data.to_vec(),
+                        )
+                        .await
+                    }
+                };
+                let UdpFlowChannels { outbound, inbound } = match flow {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::debug!("UDP flow → {}: establish failed: {}", target, e);
+                        continue;
+                    }
+                };
+                if established {
+                    tracing::debug!("UDP flow → {} re-established", target);
+                }
+                flows.insert(key, (target.clone(), outbound));
+
+                // Inbound pump: tunnel datagrams → SOCKS5 UDP header → client.
+                if let Some(ca) = client_addr {
+                    let udp_in = Arc::clone(&udp);
+                    let stats_in = Arc::clone(stats);
+                    let mut inbound = inbound;
+                    tokio::spawn(async move {
+                        while let Some(d) = inbound.recv().await {
+                            stats_in.record_udp_down(d.len() as u64);
+                            let pkt = wrap_udp_request(&target, &d);
+                            if udp_in.send_to(&pkt, ca).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    }
+
+    tracing::debug!("UDP ASSOCIATE closed (control connection EOF)");
+    Ok(())
+}
+
 pub(crate) fn resolve_offer(cipher_preference: CipherPreference) -> CipherOffer {
     match cipher_preference {
         CipherPreference::Auto => CipherOffer::default_offer(),
@@ -243,15 +567,15 @@ pub(crate) fn resolve_offer(cipher_preference: CipherPreference) -> CipherOffer 
     }
 }
 
-async fn establish_tunnel<T: Transport>(
+pub(crate) async fn establish_tunnel<T: Transport>(
     transport: &T,
     server: &ServerEntry,
     local_secret: &[u8; 32],
     target: &TargetAddr,
     cipher_preference: CipherPreference,
 ) -> Result<(
-    FrameReader<tokio::io::ReadHalf<T::Stream>>,
-    FrameWriter<tokio::io::WriteHalf<T::Stream>>,
+    FrameReader<SessionReader<tokio::io::ReadHalf<T::Stream>>>,
+    FrameWriter<SessionWriter<tokio::io::WriteHalf<T::Stream>>>,
     u32,
 )> {
     let addr: std::net::SocketAddr = server
@@ -262,7 +586,7 @@ async fn establish_tunnel<T: Transport>(
     let stream = transport.connect(&addr).await?;
 
     let remote_public = decode_public_key(&server.public_key)?;
-    let initiator = NoiseInitiator::new(local_secret, &remote_public);
+    let initiator = NoiseInitiator::new(local_secret, &remote_public, server.decode_psk()?);
     let offer = resolve_offer(cipher_preference);
     let result = initiator.handshake(stream, &offer).await?;
 
@@ -277,6 +601,49 @@ async fn establish_tunnel<T: Transport>(
     let mut frame_reader = FrameReader::new(session_reader);
     let mut frame_writer = FrameWriter::new(session_writer);
 
+    let stream_id = syn_handshake(&mut frame_reader, &mut frame_writer, server, target).await?;
+    Ok((frame_reader, frame_writer, stream_id))
+}
+
+/// QUIC variant: the connection from the pool is already Noise-authenticated,
+/// so the stream goes straight to the frame protocol with plaintext
+/// length-prefix framing.
+pub(crate) async fn establish_quic_tunnel(
+    pool: &QuicPool,
+    server: &ServerEntry,
+    local_secret: &[u8; 32],
+    target: &TargetAddr,
+    cipher_preference: CipherPreference,
+) -> Result<(
+    FrameReader<PlainMessageReader<tokio::io::ReadHalf<QuicStream>>>,
+    FrameWriter<PlainMessageWriter<tokio::io::WriteHalf<QuicStream>>>,
+    u32,
+)> {
+    let (send, recv) = pool
+        .open_bi(
+            server,
+            local_secret,
+            cipher_preference,
+            std::time::Duration::from_secs(10),
+        )
+        .await?;
+    let stream = QuicStream::new(send, recv);
+    let (read_half, write_half) = tokio::io::split(stream);
+    let mut frame_reader = FrameReader::new(PlainMessageReader::new(read_half));
+    let mut frame_writer = FrameWriter::new(PlainMessageWriter::new(write_half));
+
+    let stream_id = syn_handshake(&mut frame_reader, &mut frame_writer, server, target).await?;
+    Ok((frame_reader, frame_writer, stream_id))
+}
+
+/// Shared tunnel bootstrap: send SYN, expect ACK/RST. Identical on both
+/// transports — only the message framing underneath differs.
+pub(crate) async fn syn_handshake<M: MessageRead, N: MessageWrite>(
+    frame_reader: &mut FrameReader<M>,
+    frame_writer: &mut FrameWriter<N>,
+    server: &ServerEntry,
+    target: &TargetAddr,
+) -> Result<u32> {
     let stream_id: u32 = 1;
     frame_writer
         .write_frame(&Frame::syn(stream_id, target.encode()))
@@ -293,7 +660,7 @@ async fn establish_tunnel<T: Transport>(
         return Err(PhantomError::Protocol("Expected ACK".to_string()));
     }
 
-    Ok((frame_reader, frame_writer, stream_id))
+    Ok(stream_id)
 }
 
 fn decode_public_key(b64: &str) -> Result<[u8; 32]> {
@@ -311,16 +678,18 @@ fn decode_public_key(b64: &str) -> Result<[u8; 32]> {
     Ok(key)
 }
 
-pub async fn relay_socks5_tunnel<R, W>(
+pub async fn relay_socks5_tunnel<M, N>(
     socks5: TcpStream,
-    mut frame_reader: FrameReader<R>,
-    mut frame_writer: FrameWriter<W>,
+    mut frame_reader: FrameReader<M>,
+    mut frame_writer: FrameWriter<N>,
     stream_id: u32,
     target: &TargetAddr,
+    stats: &Arc<TrafficStats>,
+    mut migration_rx: tokio::sync::watch::Receiver<u64>,
 ) -> Result<()>
 where
-    R: tokio::io::AsyncRead + Unpin,
-    W: tokio::io::AsyncWrite + Unpin,
+    M: MessageRead,
+    N: MessageWrite,
 {
     let (mut s5_read, mut s5_write) = tokio::io::split(socks5);
 
@@ -335,6 +704,7 @@ where
                 break;
             }
             total_up += n as u64;
+            stats.record_tcp_up(n as u64);
             let data = buf.split().freeze();
             frame_writer
                 .write_frame(&Frame::data(stream_id, data))
@@ -353,6 +723,7 @@ where
             let frame = frame_reader.read_frame().await?;
             if frame.flags.contains(FrameFlags::DATA) {
                 total_down += frame.payload.len() as u64;
+                stats.record_tcp_down(frame.payload.len() as u64);
                 s5_write
                     .write_all(&frame.payload)
                     .await
@@ -367,6 +738,24 @@ where
         Ok::<_, PhantomError>(())
     };
 
-    tokio::try_join!(to_tunnel, from_tunnel)?;
+    let relay = async {
+        tokio::try_join!(to_tunnel, from_tunnel)?;
+        Ok::<(), PhantomError>(())
+    };
+
+    // With `failover.graceful_migration = false`, an active-server switch
+    // bumps the migration epoch and in-flight tunnels must drop instead of
+    // draining on the old server. Under the default graceful policy the
+    // epoch never moves and this branch is inert.
+    tokio::select! {
+        res = relay => res?,
+        _ = migration_rx.changed() => {
+            tracing::info!("Tunnel → {} cut over: server migration", target);
+            return Err(PhantomError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "server migration",
+            )));
+        }
+    }
     Ok(())
 }

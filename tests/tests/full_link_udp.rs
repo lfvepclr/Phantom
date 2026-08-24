@@ -15,6 +15,7 @@ struct UdpTestFixture {
     pub server_addr: std::net::SocketAddr,
     pub client_key: KeyPair,
     pub server_key: KeyPair,
+    pub psk: phantom_core::crypto::Psk,
     pub cipher_preference: CipherPreference,
     _udp_echo: UdpEchoServer,
     _server_shutdown: Option<tokio::sync::oneshot::Sender<()>>,
@@ -24,6 +25,7 @@ impl UdpTestFixture {
     pub async fn new(cipher: CipherPreference) -> Self {
         let server_key = KeyPair::generate().expect("Failed to generate server key");
         let client_key = KeyPair::generate().expect("Failed to generate client key");
+        let psk = phantom_core::crypto::Psk::generate();
 
         let udp_echo = UdpEchoServer::start().await;
         let udp_echo_addr = udp_echo.addr;
@@ -34,6 +36,7 @@ impl UdpTestFixture {
         let server_addr = server_listener.local_addr().unwrap();
         let (server_shutdown_tx, server_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let server_secret = server_key.secret;
+        let server_psk = psk.clone();
 
         tokio::spawn(async move {
             tokio::pin!(server_shutdown_rx);
@@ -44,8 +47,9 @@ impl UdpTestFixture {
                             Ok((stream, _peer)) => {
                                 let sk = server_secret;
                                 let cp = cipher;
+                                let conn_psk = server_psk.clone();
                                 tokio::spawn(async move {
-                                    handle_connection(stream, sk, &[], cp, None).await;
+                                    handle_connection(stream, sk, conn_psk, &[], cp, None).await;
                                 });
                             }
                             Err(e) => { tracing::error!("Server accept error: {}", e); }
@@ -61,6 +65,7 @@ impl UdpTestFixture {
             server_addr,
             client_key,
             server_key,
+            psk,
             cipher_preference: cipher,
             _udp_echo: udp_echo,
             _server_shutdown: Some(server_shutdown_tx),
@@ -74,10 +79,15 @@ async fn handshake_only(
     server_addr: std::net::SocketAddr,
     server_public_key: &[u8; 32],
     client_secret: &[u8; 32],
+    psk: &phantom_core::crypto::Psk,
     cipher_preference: CipherPreference,
 ) -> anyhow::Result<(
-    phantom_core::protocol::FrameReader<tokio::io::ReadHalf<tokio::net::TcpStream>>,
-    phantom_core::protocol::FrameWriter<tokio::io::WriteHalf<tokio::net::TcpStream>>,
+    phantom_core::protocol::FrameReader<
+        phantom_core::SessionReader<tokio::io::ReadHalf<tokio::net::TcpStream>>,
+    >,
+    phantom_core::protocol::FrameWriter<
+        phantom_core::SessionWriter<tokio::io::WriteHalf<tokio::net::TcpStream>>,
+    >,
 )> {
     use phantom_core::crypto::cipher::CipherSuite;
     use phantom_core::crypto::session::CipherOffer;
@@ -94,7 +104,7 @@ async fn handshake_only(
         CipherPreference::Ascon128 => CipherOffer::new(vec![CipherSuite::Ascon128]),
         CipherPreference::ChaCha20Poly1305 => CipherOffer::new(vec![CipherSuite::ChaCha20Poly]),
     };
-    let initiator = NoiseInitiator::new(client_secret, server_public_key);
+    let initiator = NoiseInitiator::new(client_secret, server_public_key, psk.clone());
     let result = initiator.handshake(stream, &offer).await?;
     let (session_reader, session_writer) = split_after_handshake(
         result.stream,
@@ -118,6 +128,7 @@ async fn udp_relay_echo() {
         fixture.server_addr,
         &fixture.server_key.public,
         &fixture.client_key.secret,
+        &fixture.psk,
         fixture.cipher_preference,
     )
     .await

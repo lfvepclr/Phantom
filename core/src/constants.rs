@@ -1,6 +1,21 @@
-pub const PROTOCOL_VERSION: u8 = 2;
+/// Wire protocol version.
+///
+/// v3: `MAX_FRAME_PAYLOAD` raised 16 KiB → 64 KiB (fewer AEAD calls and
+/// syscalls per byte). Both ends must be built from the same version —
+/// `Frame::decode` rejects mismatched versions with a clear error, so a
+/// v2 client connecting to a v3 server (or vice versa) fails fast instead
+/// of silently misframing.
+pub const PROTOCOL_VERSION: u8 = 3;
 pub const CIPHER_NEGOTIATION_VERSION: u8 = 2;
-pub const MAX_FRAME_PAYLOAD: usize = 16384;
+
+/// Maximum DATA-frame payload.
+///
+/// Bounded by BOTH u16 wire length prefixes:
+/// - frame header `payload_len` field (u16)
+/// - message length prefix covering header + payload + AEAD tag (u16):
+///   8 + MAX_FRAME_PAYLOAD + 16 ≤ 65535 → MAX_FRAME_PAYLOAD ≤ 65511;
+///   65504 is the largest 16-byte-aligned value that fits.
+pub const MAX_FRAME_PAYLOAD: usize = 65504;
 pub const FRAME_HEADER_SIZE: usize = 8;
 pub const NOISE_TAG_LEN: usize = 16;
 pub const HANDSHAKE_TIMEOUT_SECS: u64 = 10;

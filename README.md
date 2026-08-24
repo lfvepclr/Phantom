@@ -1,18 +1,20 @@
 # Phantom 幽灵 — 高性能加密代理隧道
 
-Phantom 是一个基于 Rust 的加密代理隧道，使用 Noise IK 协议认证，支持自适应加密套件选择，在 Apple Silicon 上可达 5+ GB/s 吞吐量。支持 SOCKS5 代理和 TUN 透明代理两种模式，提供 macOS / Android / HarmonyOS NEXT / CLI 多平台客户端。
+Phantom 是一个基于 Rust 的加密代理隧道，使用 Noise IK 协议认证，支持自适应加密套件选择，在 Apple Silicon 上可达 5+ GB/s 吞吐量。支持 SOCKS5 代理和 TUN 透明代理两种模式，提供 macOS / Android / HarmonyOS NEXT / 路由器 / CLI 多平台客户端。
 
 ## 特性
 
 - **自适应加密**: 自动检测 CPU 能力，选择最优加密算法（AES-256-GCM / AES-128-GCM / ASCON-128 / ChaCha20-Poly1305）
-- **零额外往返**: 密码协商嵌入 Noise IK 握手消息
-- **透明代理**: macOS / Android TUN 模式，无需手动配置应用代理
+- **抗主动探测**: 线下 PSK 绑定在第一条握手消息，无 PSK 的扫描者得不到任何回应
+- **零额外往返**: 密码协商嵌入 Noise 握手消息
+- **透明代理**: macOS / Android / Linux TUN 模式，无需手动配置应用代理
+- **路由器网关**: 华硕 RT-AX86U Pro 等 ARMv8 路由器上作为透明网关，LAN 全屋设备零配置
 - **智能分流**: 域名/IP/端口/GeoIP 规则引擎，全局/自动/直连三种模式
 - **DNS 劫持**: TUN 模式自动拦截 DNS 查询，防止 DNS 泄露
 - **UDP Relay**: TUN 模式 UDP 流量通过帧协议隧道转发
 - **系统代理自启**: macOS 启动后自动设置系统 SOCKS5 代理
 - **单串配置**: `phantom://` URI 格式，一行配置包含服务器信息
-- **配置热重载**: 运行中修改配置文件，规则和模式自动更新
+- **配置热重载**: 运行中修改配置文件，规则 / 模式 / DNS 上游 / 服务器列表自动更新
 - **流量统计**: Prometheus `/metrics` 端点，实时监控流量
 - **Failover**: 多服务器自动切换，支持优雅迁移
 - **QUIC 支持**: 可选 QUIC 传输层，内置 BBR/CUBIC 拥塞控制
@@ -27,6 +29,7 @@ Phantom 是一个基于 Rust 的加密代理隧道，使用 Noise IK 协议认�
 cargo xtask build          # 构建所有可用目标
 cargo xtask build server   # 仅构建服务端
 cargo xtask build cli      # 仅构建 CLI 客户端
+cargo xtask build router   # 仅构建路由器客户端（aarch64 musl 静态）
 cargo xtask build mac      # 仅构建 macOS 客户端
 cargo xtask build android  # 仅构建 Android 客户端
 cargo xtask build harmony  # 仅构建 HarmonyOS 客户端
@@ -83,6 +86,20 @@ TUN 需要 root，请用 `sudo open client/mac/.build/Phantom.app` 启动。完�
 
 macOS 原生客户端启动后，系统代理自动生效，无需手动配置。
 
+### 路由器客户端（华硕 RT-AX86U Pro 等）
+
+把路由器变成透明网关，LAN 内所有设备无需任何配置：
+
+```bash
+# 1. 交叉编译静态二进制（aarch64-unknown-linux-musl）
+cargo xtask build router
+
+# 2. 推送到路由器并配置开机自启
+bash deploy/router/install.sh <路由器IP> "phantom://KEY@vpn.example.com:443"
+```
+
+完整说明（前置条件、路由原理、DNS 取舍、故障排查）见 [deploy/router/README.md](file:///Users/<user>/workspace/qoder/phantom/deploy/router/README.md)。
+
 ---
 
 ## 部署手册
@@ -115,7 +132,7 @@ cargo xtask build server   # 服务端
 cargo xtask build all      # 所有可用目标
 ```
 
-> 国内用户：项目已配置 USTC 镜像源（`.cargo/config.toml`），无需额外设置。
+> 国内用户：项目已配置字节跳动 rsproxy 镜像源（`.cargo/config.toml`），无需额外设置。
 
 ### 2. 服务端部署
 
@@ -123,16 +140,18 @@ cargo xtask build all      # 所有可用目标
 
 首次运行 `phantom server`（无 `-c`）即进入**自举模式**：
 
-1. 读取 CWD 下的 `./server.key`；不存在则生成 X25519 密钥对并写入（权限 600）
+1. 读取 CWD 下的 `./server.key`；不存在则生成 X25519 密钥对 **与 32 字节握手 PSK** 并写入（权限 600）
 2. 读取 CWD 下的 `./server.toml` 内联 `[[allowed_clients]]` 白名单；空则开放模式（info 级日志提示）
 3. 默认从 0.0.0.0:443 开始探测，端口占用时自动 +1（最多 10 次）
 4. 自动探测本机公网 IP（UDP socket 探测），写入 `server.toml` URI 注释的 host 段
-5. 拼接 `phantom://...` URI，以 `#   phantom://...` 注释形式写入 `./server.toml` 顶部
+5. 拼接 `phantom://...` URI（**含 `psk=`**），以 `#   phantom://...` 注释形式写入 `./server.toml` 顶部
 6. 打印启动摘要（监听地址、URI、白名单条目数），然后启动服务
+
+> **从旧版升级**：若 `server.key` 只有两行（PSK 支持之前生成），启动时会自动生成 PSK 并追加到第 3 行，**公钥保持不变**，但已分发的旧 URI 全部失效 —— 需重新分发日志中打印的新 URI。
 
 | 文件 | 内容 | 权限 |
 |------|------|------|
-| `./server.key` | 第 1 行 base64 公钥，第 2 行 base64 私钥 | 600 |
+| `./server.key` | 第 1 行 base64 公钥，第 2 行 base64 私钥，第 3 行 base64 握手 PSK | 600 |
 | `./server.toml` | bind / cipher / protocol + 顶部 URI 注释 + `[[allowed_clients]]` 白名单 | 644 |
 
 **典型自举文件**（`./server.toml`，前若干行）：
@@ -203,18 +222,15 @@ name = "bob-phone"
 bind = "0.0.0.0:443"
 private_key = "/etc/phantom/server_private"   # 由 auto 模式的 server.key 复制得到；load 模式必填
 cipher = "auto"                                # auto / aes-256-gcm / aes-128-gcm / ascon-128 / chacha20-poly1305
+                                               # 注意：proto=quic 时不支持 ascon-128（QUIC 的 Noise 后端仅 AESGCM/ChaChaPoly）
 
 [quic]
 max_streams = 100
 keep_alive_interval = 45
 congestion = "cubic"          # cubic / bbr / new-reno
 
-[tls]
-disguise = false              # stub，未实现
-
 [performance]
 io_uring = false              # Linux 5.1+
-zero_copy = false
 workers = 0                   # 0 = CPU 核心数
 ```
 
@@ -225,7 +241,6 @@ workers = 0                   # 0 = CPU 核心数
 | `clients` | — | 客户端公钥白名单文件路径（空=开放） |
 | `cipher` | `auto` | 加密套件 |
 | `quic.congestion` | `cubic` | 拥塞控制: cubic / bbr / new-reno |
-| `tls.disguise` | false | TLS 伪装（stub，未完整实现） |
 | `performance.workers` | 0 | 工作线程数，0 = CPU 核心数 |
 
 #### 2.4 使用 systemd 管理
@@ -257,9 +272,12 @@ phantom://<base64公钥>@<host>:<port>[?<query>][#<name>]
 |------|------|------|
 | `base64公钥` | 服务端 X25519 公钥（标准 base64，44字符） | `dGVzdA==...` |
 | `host:port` | 服务器地址和端口 | `example.com:443` |
+| `psk=` | 握手预共享密钥（base64，**必须**） | `psk=AAAA...` |
 | `cipher=` | 密码套件 | `auto`, `aes-256-gcm`, `ascon-128`, `chacha20-poly1305` |
-| `proto=` | 传输协议 | `tcp`（默认）, `quic` |
+| `proto=` | 传输协议 | `tcp`（默认）, `quic`（不支持 cipher=ascon-128） |
 | `#name` | 服务器名称 | `#primary` |
+
+> **URI 是完整凭据**：它同时包含服务端公钥和 PSK，泄露即等于交出访问权。请通过安全渠道传递（勿贴到公开仓库 / 聊天群 / 截图）。
 
 **示例：**
 
@@ -290,16 +308,26 @@ public_key = "服务端公钥Base64"
 # protocol = "tcp"      # tcp (默认) 或 quic
 
 [client]
-listen = "127.0.0.1:1080"
+listen = "127.0.0.1:1080"             # SOCKS5+HTTP 同端口（首字节嗅探）；0.0.0.0 即局域网共享
 dns = "tls://8.8.8.8:853"
 mode = "smart"
 cipher = "auto"
+# metrics_listen = "127.0.0.1:9150"   # Prometheus /metrics 端点
+
+# 局域网共享时强烈建议开启认证（SOCKS5 RFC1929 / HTTP Basic）：
+# [client.proxy_auth]
+# username = "your-name"
+# password = "your-secret"
 
 [failover]
 health_check_interval = 30
 health_check_timeout = 5
 failover_threshold = 3
-graceful_migration = true
+graceful_migration = true             # false = 切服时主动断开旧服在飞隧道
+
+# [hello]
+# timeout = 10                        # Hello-ACK 等待超时（秒）
+# targets = ["http://example.com/health"]  # 服务端优先探测的外网 URL
 
 [[rules]]
 type = "domain-suffix"
@@ -323,6 +351,28 @@ final_action = "proxy"
 > **快速上手**：如果只需连接单台服务器，推荐使用 [3.1 URI 快捷链接](#31-uri-快捷链接推荐)，无需编写 TOML 文件。
 
 ### 4. 代理模式与路由
+
+#### 4.0 客户端运行形态
+
+| 命令 | 入口 | 适用场景 |
+|---|---|---|
+| `phantom client --server "$URI"` | 本地 SOCKS5（默认 `127.0.0.1:1080`） | 浏览器 / 单应用代理 |
+| `sudo phantom client --server "$URI" --tun` | SOCKS5 + TUN 透明代理 | 本机全局代理（macOS / Linux） |
+| `sudo phantom client --server "$URI" --tun --gateway` | TUN + 策略路由 | Linux 路由器，代理整个 LAN |
+
+TUN 相关参数：
+
+| 参数 | 默认值 | 说明 |
+|---|---|---|
+| `--tun-name` | `utun7`（macOS）/ `phantom0`（Linux） | TUN 接口名 |
+| `--tun-addr` | `10.7.0.1/24` | TUN 地址，不得与 LAN 网段重叠 |
+| `--tun-mtu` | `1500` | MTU |
+| `--lan-interface` | `br0` | 需代理的 LAN 接口，可重复传入 |
+| `--bypass` | RFC1918 + 回环 + 组播 | 继续走主路由表的目标网段，传入则覆盖默认集 |
+| `--table` | `200` | 隧道默认路由所在路由表 |
+| `--no-lan-dns-hijack` | 关闭（默认劫持） | 不把 LAN 的 53 端口导入隧道 |
+
+`--gateway` 为 Linux 专属，依赖 iproute2 策略路由；进程退出时自动回滚全部路由与防火墙改动。
 
 #### 4.1 代理模式
 
@@ -349,11 +399,17 @@ macOS 客户端菜单栏提供 Global / Auto / Direct 三种模式切换，实�
 
 #### 4.3 配置热重载
 
-客户端运行中修改 TOML 配置文件，5 秒内自动生效：
-- 规则变更
-- 模式切换（smart ↔ proxy ↔ direct）
+客户端运行中修改 TOML 配置文件（5 秒内自动生效，仅 TUN 模式下生效）：
 
-已有连接不受影响，仅新连接走新规则。
+| 变更项 | 行为 |
+|---|---|
+| `[[rules]]` / `rules.final_action` | 重建规则引擎；新规则集解析失败时保留旧规则并告警 |
+| `client.mode` | smart ↔ proxy ↔ direct 切换 |
+| `client.dns` | DNS 上游重定向；不重建 socket，飞行中的查询不丢 |
+| `[[servers]]` | 替换服务器池；**当前活跃服务器若仍在新列表中则保持不动**，避免无必要的切换 |
+| `[failover]` | 健康检查间隔 / 超时 / 阀值即时生效 |
+
+已有连接不受影响，仅新连接走新配置。
 
 ### 5. 加密套件选择
 
@@ -417,9 +473,13 @@ RUST_LOG=debug phantom client -c /path/to/your/client.toml
 
 ### 9. 安全注意事项
 
-- **私钥保护**: 自举模式的 `server.key`、加载模式的 `server_private`，文件权限必须为 600
-- **开放模式**: 白名单为空时任何知道服务端公钥的客户端均可连接
-- **前向保密**: 每次会话派生独立密钥
+- **握手**: `Noise_IKpsk1_25519_ChaChaPoly_SHA256` —— 双向静态公钥认证 + 线下 PSK 叠加在 ephemeral DH 之上
+- **抗主动探测**: PSK 绑定在**第一条**握手消息（`psk1`），无 PSK 的扫描者连第一条消息都无法构造，服务端直接断开且不回应任何数据（表现与端口无服务一致）
+- **私钥保护**: `server.key`（三行：公钥/私钥/PSK）权限必须为 600
+- **URI 是完整凭据**: 含公钥 + PSK，需通过安全渠道传递
+- **开放模式**: 白名单为空时，任何**同时**知道服务端公钥与 PSK 的客户端均可连接
+- **前向保密**: 每次会话派生独立密钥；即使 PSK 与静态私钥同时泄露，已录制的历史流量仍不可解
+- **抗量子过渡**: 对称 PSK 本身抗量子，即使未来 X25519 被量子计算机突破，无 PSK 仍无法解密
 - **黑洞行为**: 服务端静默丢弃未认证连接
 - **systemd 加固**: NoNewPrivileges、ProtectSystem=strict
 
@@ -469,24 +529,30 @@ cargo bench -p phantom-bench
 
 | 层级 | 测试文件 | 测试数 | 覆盖范围 |
 |------|---------|--------|---------|
-| L0 单元测试 | 各 crate #[cfg(test)] | ~80 | 帧协议、URI 构建/解析、规则引擎、DNS、stats、handler、bootstrap (密钥/白名单/端口探测) |
+| L0 单元测试 | 各 crate #[cfg(test)] | 109 | 帧协议、URI 构建/解析、规则引擎、DNS（上游解析/热切换）、failover（池热重载/探测切换）、stats、handler、bootstrap |
+| L0 CLI 单测 | client/cli 内联 | 6 | `--tun-addr` CIDR 解析、clap 参数依赖关系 |
+| L0 网关单测（Linux） | client/src/gateway.rs | 12 | ip rule / iptables 指令集、优先级排序、回滚对称性、保留路由表校验 |
 | L1 配置生效 | config_effect, cipher_matrix | 9 | 白名单、密码协商、echo 模式 |
 | L1 模块交互 | rule_engine, dns_hijack, stats_metrics | 15 | DNS→规则、规则→路由、stats→Prometheus |
 | L1 全链路 | full_link_tcp, full_link_udp, http_tunnel | 7 | TCP echo/大数据/并发、UDP relay |
 | L1 真实场景 | real_world | 4 (2 ignored) | Mock 百度、真百度 |
 | L1 性能 | performance, throughput | 17 (10 ignored) | 吞吐量、延迟、并发 |
-| L2 系统 | cli_system | 5 | CLI 自举（auto 生成 key/URI）、端口递增 fallback、keygen 子命令已删除、version、复用已有 key |
+| L2 系统 | cli_system | 11 | CLI 自举、端口递增 fallback、keygen 已删除、TUN/网关参数校验与平台限制 |
+
+> 网关单测为 Linux 专属，在 macOS 开发机上不参与运行；可用
+> `cargo test -p phantom-client --target aarch64-unknown-linux-musl` 验证编译。
 
 ### 项目结构
 
 ```
 core/               共享类型、配置、密码套件、帧协议、传输抽象、URI 解析、错误、常量
 server/             服务端连接处理、TCP relay、UDP relay
-client/             SOCKS5 代理、TUN 透明代理、规则引擎、DNS 劫持、流量统计
+client/             SOCKS5 代理、TUN 透明代理、规则引擎、DNS 劫持、流量统计、Linux 网关
 client/cli/         命令行入口（client / server，支持 auto / interactive / load 三种启动方式）
 client/mac/         macOS SwiftUI 菜单栏客户端（SPM + PhantomMacBuilder）
 client/android/     Android VPN 客户端（Jetpack Compose + VpnService）
 client/harmony/     HarmonyOS NEXT VPN 客户端（ArkUI + VpnExtensionAbility）
+deploy/router/      路由器部署（Asuswrt-Merlin 安装脚本 + 开关包装脚本）
 xtask/              统一构建编排器（cargo xtask）
 tests/              端到端集成测试、Mock 服务器、UDP echo
 tests/bench/         性能基准测试
@@ -494,11 +560,11 @@ tests/bench/         性能基准测试
 
 ### 协议设计
 
-1. **Noise IK 握手** (ChaCha20-Poly1305): 认证 + 密钥交换 + 密码协商（零额外 RTT）
+1. **Noise IKpsk1 握手** (ChaCha20-Poly1305): 双向认证 + 密钥交换 + PSK 叠加 + 密码协商（零额外 RTT）
 2. **HKDF 密钥派生**: 从 Noise split keys 派生双向会话密钥
 3. **帧协议**: 8 字节头 + 可变 payload，支持 SYN/FIN/RST/ACK/DATA/PING/PONG/UDP
 4. **UDP relay**: SYN|UDP 帧携带 [TargetAddr + datagram]，服务端 UdpSocket 转发
-5. **QUIC 多路复用**: Noise IK 握手一次，后续 stream 通过 HKDF 派生子密钥
+5. **QUIC 多路复用**: Noise-over-QUIC（quinn-hyphae，100% Rust），连接级 Noise IK 握手一次（PSK 经 prologue 绑定），后续 stream 复用 QUIC 原生多路复用，不再叠加会话层加密
 
 ## License
 

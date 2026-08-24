@@ -16,10 +16,11 @@ use std::net::SocketAddr;
 ///
 /// This function is called from `server/src/lib.rs` when
 /// `config.performance.io_uring` is true on a Linux host.
-#[cfg(all(feature = "io-uring", target_os = "linux"))]
+#[cfg(all(feature = "io-uring", target_os = "linux", target_env = "gnu"))]
 pub async fn run_uring_server(
     addr: SocketAddr,
     secret_key: [u8; 32],
+    psk: phantom_core::Psk,
     allowed_clients: Vec<[u8; 32]>,
     cipher_preference: phantom_core::CipherPreference,
     verification_url: Option<String>,
@@ -34,11 +35,13 @@ pub async fn run_uring_server(
         match listener.accept().await {
             Ok((stream, _peer)) => {
                 let sk = secret_key;
+                let peer_psk = psk.clone();
                 let allowed = allowed_clients.clone();
                 let cipher = cipher_preference;
                 let vurl = verification_url.clone();
                 tokio::spawn(async move {
-                    handle_uring_stream(stream, sk, &allowed, cipher, vurl.as_deref()).await;
+                    handle_uring_stream(stream, sk, peer_psk, &allowed, cipher, vurl.as_deref())
+                        .await;
                 });
             }
             Err(e) => {
@@ -48,10 +51,11 @@ pub async fn run_uring_server(
     }
 }
 
-#[cfg(all(feature = "io-uring", target_os = "linux"))]
+#[cfg(all(feature = "io-uring", target_os = "linux", target_env = "gnu"))]
 async fn handle_uring_stream(
     stream: tokio_uring::net::TcpStream,
     secret_key: [u8; 32],
+    psk: phantom_core::Psk,
     allowed_clients: &[[u8; 32]],
     cipher_preference: phantom_core::CipherPreference,
     verification_url: Option<&str>,
@@ -61,6 +65,7 @@ async fn handle_uring_stream(
     crate::handler::handle_connection(
         stream,
         secret_key,
+        psk,
         allowed_clients,
         cipher_preference,
         verification_url,

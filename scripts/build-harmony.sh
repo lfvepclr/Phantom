@@ -26,16 +26,19 @@ fi
 echo "[build-harmony] Building phantom-harmony for ${TARGET} (${BUILD_MODE})"
 cargo build --target "${TARGET}" "${CARGO_ARGS[@]}"
 
-OUTPUT_DIR="${HARMONY_DIR}/entry/src/main/resources/rawfile"
+# ArkTS imports the NAPI module as `libphantom_harmony.so` from the
+# standard native-libs location: entry/libs/arm64-v8a/. (rawfile is NOT
+# on the NAPI search path — copying there silently ships a stale .so.)
+OUTPUT_DIR="${HARMONY_DIR}/entry/libs/arm64-v8a"
 mkdir -p "$OUTPUT_DIR"
 
 if [[ "$BUILD_MODE" == "release" ]]; then
     cp "${PROJECT_ROOT}/target/${TARGET}/release/libphantom_harmony.so" \
-       "${OUTPUT_DIR}/libphantom.so"
+       "${OUTPUT_DIR}/libphantom_harmony.so"
 else
     cp "${PROJECT_ROOT}/target/${TARGET}/debug/libphantom_harmony.so" \
-       "${OUTPUT_DIR}/libphantom.so"
+       "${OUTPUT_DIR}/libphantom_harmony.so"
 fi
 
-echo "[build-harmony] Copied libphantom.so to ${OUTPUT_DIR}"
+echo "[build-harmony] Copied libphantom_harmony.so to ${OUTPUT_DIR}"
 echo "[build-harmony] Next: open ${HARMONY_DIR} in DevEco Studio and run."

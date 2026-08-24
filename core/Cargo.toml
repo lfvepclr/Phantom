@@ -33,7 +33,10 @@ bitflags = { workspace = true }
 # Merged from phantom-transport
 async-trait = { workspace = true }
 quinn = { workspace = true }
-rcgen = { workspace = true }
+quinn-hyphae = { workspace = true }
+hyphae-handshake = { workspace = true }
+socket2 = { workspace = true }
+libc = { workspace = true }
 
 [features]
 default = []
@@ -42,3 +45,14 @@ geoip = ["maxminddb"]
 [dependencies.maxminddb]
 version = "0.24"
 optional = true
+
+# `aes_armv8` / `polyval_armv8` / `chacha20_force_neon` are RustCrypto build
+# cfg flags passed via RUSTFLAGS in .cargo/config.toml (hardware crypto
+# backends). Declaring them here silences the unexpected_cfgs lint for the
+# `cfg!(aes_armv8)` compile-time backend probe in crypto/cipher.rs.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(aes_armv8)',
+    'cfg(polyval_armv8)',
+    'cfg(chacha20_force_neon)',
+] }

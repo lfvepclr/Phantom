@@ -142,6 +142,7 @@ enum PhantomState: Equatable {
     case running
     case error(String)
 
+    @MainActor
     init(tunnel: PhantomTunnel) {
         if tunnel.isRunning {
             self = .running
@@ -469,7 +470,7 @@ private struct LogSection: View {
             )
             .padding(.horizontal, 12)
             .padding(.bottom, 8)
-            .onChange(of: logs.count) { _ in
+            .onChange(of: logs.count) {
                 withAnimation(.easeOut(duration: 0.15)) {
                     proxy.scrollTo(logs.count - 1, anchor: .bottom)
                 }

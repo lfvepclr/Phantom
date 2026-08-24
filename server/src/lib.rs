@@ -3,6 +3,17 @@ pub mod handler;
 #[cfg(target_os = "linux")]
 pub mod linux_ext;
 
+// Enabling `io-uring` on a musl target is a no-op (see server/Cargo.toml);
+// surface that at compile time instead of silently running epoll.
+#[cfg(all(target_os = "linux", not(target_env = "gnu"), feature = "io-uring"))]
+const _: () = {
+    #[deprecated(
+        note = "the io-uring feature has no effect on musl targets; the epoll runtime is used instead"
+    )]
+    const IO_URING_ON_MUSL: () = ();
+    let _ = IO_URING_ON_MUSL;
+};
+
 pub mod bootstrap;
 
 #[cfg(not(target_os = "linux"))]
@@ -10,9 +21,7 @@ use phantom_core::transport::TransportListener;
 
 use anyhow::Result;
 use base64::Engine;
-use phantom_core::{
-    CipherPreference, CongestionAlgorithm, ServerConfig, ServerEntry, TransportProtocol,
-};
+use phantom_core::{CipherPreference, ServerConfig, ServerEntry, TransportProtocol};
 use std::net::SocketAddr;
 
 /// All-in-one runtime configuration for the server, regardless of how the
@@ -26,10 +35,14 @@ use std::net::SocketAddr;
 pub struct BootstrapOptions {
     pub bind: SocketAddr,
     pub secret_key: [u8; 32],
+    /// Pre-shared key required by the Noise handshake. Peers without it are
+    /// rejected on the first handshake message.
+    pub psk: phantom_core::Psk,
     pub allowed_clients: Vec<[u8; 32]>,
     pub cipher: CipherPreference,
     pub protocol: TransportProtocol,
-    pub quic_congestion: CongestionAlgorithm,
+    /// Full `[quic]` section: congestion, stream cap, keep-alive.
+    pub quic_config: phantom_core::QuicConfig,
     pub io_uring: bool,
     /// Optional URL used for the Hello verification probe. When `None`, the
     /// built-in captive-portal targets are used.
@@ -46,7 +59,18 @@ pub async fn run(config_path: &str) -> Result<()> {
     let config = ServerConfig::load(config_path)?;
 
     tracing::info!("Loading key pair from {}", config.private_key);
-    let (public_key, secret_key) = config.load_key_pair()?;
+    // Loads the PSK from line 3 of the key file, minting one if the file
+    // predates PSK support.
+    let identity = phantom_core::KeyPair::load_server_identity(&config.private_key)?;
+    let public_key = identity.keys.public;
+    let secret_key = identity.keys.secret;
+    if identity.psk_generated {
+        tracing::warn!(
+            "{} had no PSK; one was generated and appended. Previously \
+             distributed URIs no longer work — re-distribute the URI below.",
+            config.private_key
+        );
+    }
 
     tracing::info!("Loading allowed clients from {:?}", config.clients);
     let allowed_clients = config.load_allowed_clients()?;
@@ -77,6 +101,7 @@ pub async fn run(config_path: &str) -> Result<()> {
     let uri = phantom_core::build_phantom_uri(
         &public_key_b64,
         &config.bind,
+        &identity.psk.to_base64(),
         config.cipher,
         protocol,
         Some("default"),
@@ -97,10 +122,11 @@ pub async fn run(config_path: &str) -> Result<()> {
     let opts = BootstrapOptions {
         bind,
         secret_key,
+        psk: identity.psk.clone(),
         allowed_clients,
         cipher: config.cipher,
         protocol,
-        quic_congestion: config.quic.congestion,
+        quic_config: config.quic.clone(),
         io_uring,
         verification_url: config.verification_url.clone(),
     };
@@ -111,18 +137,39 @@ pub async fn run(config_path: &str) -> Result<()> {
 /// Run the Noise listener with an already-constructed [`BootstrapOptions`].
 ///
 /// This is the unified runtime that all entry points funnel into. It owns
-/// the TCP/QUIC dispatch and the accept loop.
+/// the TCP/QUIC dispatch and the accept loop. The server stops on Ctrl-C;
+/// embedders that need programmatic shutdown should use
+/// [`run_with_shutdown`] instead.
 pub async fn run_with_options(opts: BootstrapOptions) -> Result<()> {
+    run_with_shutdown(opts, async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await
+}
+
+/// Like [`run_with_options`], but the accept loop also terminates when the
+/// supplied `shutdown` future resolves — whichever comes first. Used by the
+/// HarmonyOS embedded server, where there is no Ctrl-C and the UI stops the
+/// server via a oneshot channel.
+///
+/// Note: the io_uring runtime (`linux_ext::run_uring_server`) does not yet
+/// honour external shutdown; embedded targets never enable that feature.
+pub async fn run_with_shutdown<S>(opts: BootstrapOptions, shutdown: S) -> Result<()>
+where
+    S: std::future::Future<Output = ()> + Send,
+{
     init_tracing("info");
     match opts.protocol {
         TransportProtocol::Tcp => {
             run_tcp(
                 opts.bind,
                 opts.secret_key,
+                opts.psk,
                 opts.allowed_clients,
                 opts.cipher,
                 opts.io_uring,
                 opts.verification_url,
+                shutdown,
             )
             .await
         }
@@ -130,10 +177,12 @@ pub async fn run_with_options(opts: BootstrapOptions) -> Result<()> {
             run_quic(
                 opts.bind,
                 opts.secret_key,
+                opts.psk,
                 opts.allowed_clients,
                 opts.cipher,
-                opts.quic_congestion,
+                opts.quic_config,
                 opts.verification_url,
+                shutdown,
             )
             .await
         }
@@ -152,8 +201,9 @@ pub async fn run_from_uri(uri: &str, key_path: &str) -> Result<()> {
     let entry: ServerEntry = phantom_core::parse_phantom_uri(uri)
         .map_err(|e| anyhow::anyhow!("Failed to parse server URI: {}", e))?;
 
-    let kp = phantom_core::KeyPair::load_secret_from_file(key_path)
+    let identity = phantom_core::KeyPair::load_server_identity(key_path)
         .map_err(|e| anyhow::anyhow!("Failed to load key from {}: {}", key_path, e))?;
+    let kp = &identity.keys;
     let local_pub = kp.public_key_base64();
     if local_pub != entry.public_key {
         anyhow::bail!(
@@ -161,6 +211,15 @@ pub async fn run_from_uri(uri: &str, key_path: &str) -> Result<()> {
             entry.public_key,
             key_path,
             local_pub
+        );
+    }
+    // The URI is the credential clients use, so its PSK must match what this
+    // server will actually enforce; otherwise every client would be rejected.
+    if !entry.psk.is_empty() && entry.psk != identity.psk.to_base64() {
+        anyhow::bail!(
+            "PSK mismatch: the URI's psk= does not match the PSK in {}. \
+             Re-generate the URI from this server's key file.",
+            key_path
         );
     }
 
@@ -194,10 +253,11 @@ pub async fn run_from_uri(uri: &str, key_path: &str) -> Result<()> {
     let opts = BootstrapOptions {
         bind,
         secret_key: kp.secret,
+        psk: identity.psk.clone(),
         allowed_clients,
         cipher: entry.cipher,
         protocol,
-        quic_congestion: CongestionAlgorithm::default(),
+        quic_config: phantom_core::QuicConfig::default(),
         io_uring: false,
         verification_url: None,
     };
@@ -205,19 +265,28 @@ pub async fn run_from_uri(uri: &str, key_path: &str) -> Result<()> {
     run_with_options(opts).await
 }
 
-async fn run_tcp(
+async fn run_tcp<S>(
     addr: std::net::SocketAddr,
     secret_key: [u8; 32],
+    psk: phantom_core::Psk,
     allowed_clients: Vec<[u8; 32]>,
     cipher_preference: phantom_core::CipherPreference,
     _io_uring: bool,
     verification_url: Option<String>,
-) -> Result<()> {
-    #[cfg(all(target_os = "linux", feature = "io-uring"))]
+    shutdown: S,
+) -> Result<()>
+where
+    S: std::future::Future<Output = ()> + Send,
+{
+    // tokio-uring does not compile on musl (missing libc::statx), so the
+    // io_uring runtime only exists on gnu targets; on musl the flag is
+    // silently ignored here but flagged at compile time in lib.rs.
+    #[cfg(all(target_os = "linux", target_env = "gnu", feature = "io-uring"))]
     if _io_uring {
         return linux_ext::run_uring_server(
             addr,
             secret_key,
+            psk,
             allowed_clients,
             cipher_preference,
             verification_url,
@@ -241,7 +310,6 @@ async fn run_tcp(
         l
     };
 
-    let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
 
     loop {
@@ -250,11 +318,12 @@ async fn run_tcp(
                 match accept_result {
                     Ok((stream, _peer)) => {
                         let sk = secret_key;
+                        let peer_psk = psk.clone();
                         let allowed = allowed_clients.clone();
                         let cipher = cipher_preference;
                         let vurl = verification_url.clone();
                         tokio::spawn(async move {
-                            handler::handle_connection(stream, sk, &allowed, cipher, vurl.as_deref()).await;
+                            handler::handle_connection(stream, sk, peer_psk, &allowed, cipher, vurl.as_deref()).await;
                         });
                     }
                     Err(e) => {
@@ -272,22 +341,31 @@ async fn run_tcp(
     Ok(())
 }
 
-async fn run_quic(
+async fn run_quic<S>(
     addr: std::net::SocketAddr,
     secret_key: [u8; 32],
+    psk: phantom_core::Psk,
     allowed_clients: Vec<[u8; 32]>,
     cipher_preference: phantom_core::CipherPreference,
-    congestion: phantom_core::CongestionAlgorithm,
+    quic_config: phantom_core::QuicConfig,
     verification_url: Option<String>,
-) -> Result<()> {
-    let server_config = phantom_core::transport::quic::create_server_config(congestion)?;
-    let endpoint = quinn::Endpoint::server(server_config, addr)?;
+    shutdown: S,
+) -> Result<()>
+where
+    S: std::future::Future<Output = ()> + Send,
+{
+    // Noise-authenticated endpoint: the PSK and the server static key are
+    // bound during the QUIC handshake itself, so a peer without them never
+    // completes a connection. ASCON + QUIC fails right here with a clear
+    // message instead of at first connect.
+    let auth = phantom_core::QuicAuth::server(secret_key, psk, cipher_preference);
+    let endpoint = phantom_core::transport::create_server_endpoint(&addr, &auth, &quic_config)
+        .map_err(|e| anyhow::anyhow!("QUIC endpoint failed to start on {}: {}", addr, e))?;
     tracing::info!(
         "Phantom QUIC server listening on {}",
         endpoint.local_addr()?
     );
 
-    let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
 
     loop {
@@ -302,12 +380,10 @@ async fn run_quic(
                                 continue;
                             }
                         };
-                        let sk = secret_key;
                         let allowed = allowed_clients.clone();
-                        let cipher = cipher_preference;
                         let vurl = verification_url.clone();
                         tokio::spawn(async move {
-                            handler::handle_quic_connection(conn, sk, &allowed, cipher, vurl.as_deref()).await;
+                            handler::handle_quic_connection(conn, &allowed, vurl).await;
                         });
                     }
                     None => {

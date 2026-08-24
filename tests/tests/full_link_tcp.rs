@@ -7,8 +7,12 @@ use phantom_e2e::throughput::{echo_data, generate_random_data};
 async fn setup_tunnel(
     fixture: &TestFixture,
 ) -> anyhow::Result<(
-    phantom_core::protocol::FrameReader<tokio::io::ReadHalf<tokio::net::TcpStream>>,
-    phantom_core::protocol::FrameWriter<tokio::io::WriteHalf<tokio::net::TcpStream>>,
+    phantom_core::protocol::FrameReader<
+        phantom_core::SessionReader<tokio::io::ReadHalf<tokio::net::TcpStream>>,
+    >,
+    phantom_core::protocol::FrameWriter<
+        phantom_core::SessionWriter<tokio::io::WriteHalf<tokio::net::TcpStream>>,
+    >,
     u32,
 )> {
     let ip_bytes = match fixture.target_addr.ip() {
@@ -20,6 +24,7 @@ async fn setup_tunnel(
         fixture.server_addr,
         &fixture.server_key.public,
         &fixture.client_key.secret,
+        &fixture.psk,
         &target,
         fixture.cipher_preference,
     )
@@ -72,6 +77,7 @@ async fn tcp_full_link_concurrent() {
         let server_addr = fixture.server_addr;
         let server_public = fixture.server_key.public;
         let client_secret = fixture.client_key.secret;
+        let psk = fixture.psk.clone();
         let target_clone = target.clone();
         let cipher = fixture.cipher_preference;
 
@@ -80,6 +86,7 @@ async fn tcp_full_link_concurrent() {
                 server_addr,
                 &server_public,
                 &client_secret,
+                &psk,
                 &target_clone,
                 cipher,
             )

@@ -61,6 +61,7 @@ async fn domain_suffix_proxy_routes_through_tunnel() {
         fixture.server_addr,
         &fixture.server_key.public,
         &fixture.client_key.secret,
+        &fixture.psk,
         &target_from_fixture(&fixture),
         fixture.cipher_preference,
     )
@@ -151,6 +152,7 @@ async fn domain_priority_over_ip_with_tunnel_echo() {
         fixture.server_addr,
         &fixture.server_key.public,
         &fixture.client_key.secret,
+        &fixture.psk,
         &target_from_fixture(&fixture),
         fixture.cipher_preference,
     )

@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "skills": {
+    "harmonyos-build-deploy": {
+      "source": "fadinglight9291117/arkts_skills",
+      "sourceType": "github",
+      "skillPath": "harmonyos-build-deploy/SKILL.md",
+      "computedHash": "dee5b527905630a0423867faf38fa7e5dc98df72ab9e7b9bf384357312ac6f1a"
+    },
+    "harmonyos-device-automation": {
+      "source": "web-infra-dev/midscene-skills",
+      "sourceType": "github",
+      "skillPath": "skills/harmony-automation/SKILL.md",
+      "computedHash": "4c1e0d8ae927383949664feb9bd37da23a571571b2fd01ecedbc1bf4465257b6"
+    },
+    "rust-async-patterns": {
+      "source": "wshobson/agents",
+      "sourceType": "github",
+      "skillPath": "plugins/systems-programming/skills/rust-async-patterns/SKILL.md",
+      "computedHash": "20d32ef58158c94eb4dfc4aaf19bec7ae2a025ae5d42da7b49ccfbaeda389273"
+    },
+    "rust-best-practices": {
+      "source": "apollographql/skills",
+      "sourceType": "github",
+      "skillPath": "skills/rust-best-practices/SKILL.md",
+      "computedHash": "0ac6606adb27e64a31bdc8c1ed34e446ae0c14bff1c7648867c46e106adc048f"
+    }
+  }
+}

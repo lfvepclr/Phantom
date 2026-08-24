@@ -1,14 +1,24 @@
 use crate::{PhantomError, Result};
 use async_trait::async_trait;
+use socket2::{Domain, Protocol, Socket, Type};
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::net::TcpStream;
 
 use crate::transport::traits::{Transport, TransportListener};
 
+/// Default socket buffer size for tunnel endpoints.
+///
+/// Sized for a 1 Gbps x 30 ms path (BDP ≈ 3.75 MB) so weak/high-latency links
+/// can keep the pipe full; the kernel clamps to its own wmem_max/rmem_max, so
+/// requesting more is harmless on constrained hosts.
+pub const DEFAULT_SOCKET_BUFFER: usize = 4 * 1024 * 1024;
+
 pub struct TcpTransport {
     connect_timeout: Duration,
     nodelay: bool,
+    send_buffer: usize,
+    recv_buffer: usize,
 }
 
 impl TcpTransport {
@@ -16,7 +26,16 @@ impl TcpTransport {
         Self {
             connect_timeout,
             nodelay: true,
+            send_buffer: DEFAULT_SOCKET_BUFFER,
+            recv_buffer: DEFAULT_SOCKET_BUFFER,
         }
+    }
+
+    /// Override the SO_SNDBUF/SO_RCVBUF requested on tunnel sockets.
+    pub fn with_buffers(mut self, send: usize, recv: usize) -> Self {
+        self.send_buffer = send;
+        self.recv_buffer = recv;
+        self
     }
 }
 
@@ -25,18 +44,42 @@ impl Transport for TcpTransport {
     type Stream = TcpStream;
 
     async fn connect(&self, addr: &SocketAddr) -> Result<Self::Stream> {
-        let stream = tokio::time::timeout(self.connect_timeout, TcpStream::connect(addr))
+        // socket2 path: the buffers must be set before connect() so the
+        // SYN-carried window-scale factor already accounts for them.
+        let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).map_err(PhantomError::Io)?;
+        // Buffer failures are non-fatal: the kernel clamps over-large requests.
+        let _ = socket.set_send_buffer_size(self.send_buffer);
+        let _ = socket.set_recv_buffer_size(self.recv_buffer);
+        socket.set_nonblocking(true).map_err(PhantomError::Io)?;
+
+        match socket.connect(&(*addr).into()) {
+            Ok(()) => {}
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.raw_os_error() == Some(libc::EINPROGRESS) => {}
+            Err(e) => return Err(PhantomError::Io(e)),
+        }
+
+        let std_stream: std::net::TcpStream = socket.into();
+        let stream = TcpStream::from_std(std_stream).map_err(PhantomError::Io)?;
+
+        // Wait for the connect to finish, then surface the real result via
+        // SO_ERROR (writable readiness alone does not mean success).
+        tokio::time::timeout(self.connect_timeout, stream.writable())
             .await
-            .map_err(|_| PhantomError::Timeout)?
-            .map_err(|e| PhantomError::Io(e))?;
+            .map_err(|_| PhantomError::Timeout)??;
+        if let Some(err) = stream.take_error().map_err(PhantomError::Io)? {
+            return Err(PhantomError::Io(err));
+        }
 
         stream
             .set_nodelay(self.nodelay)
-            .map_err(|e| PhantomError::Io(e))?;
+            .map_err(PhantomError::Io)?;
 
         #[cfg(target_os = "linux")]
         {
-            use std::os::linux::net::TcpStreamExt;
+            // Inherent method on tokio's TcpStream; no std extension trait needed.
             let _ = stream.set_quickack(true);
         }
 
@@ -54,9 +97,18 @@ pub struct TcpListener {
 
 impl TcpListener {
     pub async fn bind(addr: &SocketAddr) -> Result<Self> {
-        let inner = tokio::net::TcpListener::bind(addr)
-            .await
-            .map_err(PhantomError::Io)?;
+        // socket2 listener: SO_REUSEADDR + pre-sized buffers; accepted sockets
+        // inherit SO_SNDBUF/SO_RCVBUF from the listener on Linux and macOS.
+        let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
+        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).map_err(PhantomError::Io)?;
+        socket.set_reuse_address(true).map_err(PhantomError::Io)?;
+        let _ = socket.set_send_buffer_size(DEFAULT_SOCKET_BUFFER);
+        let _ = socket.set_recv_buffer_size(DEFAULT_SOCKET_BUFFER);
+        socket.set_nonblocking(true).map_err(PhantomError::Io)?;
+        socket.bind(&(*addr).into()).map_err(PhantomError::Io)?;
+        socket.listen(1024).map_err(PhantomError::Io)?;
+        let std_listener: std::net::TcpListener = socket.into();
+        let inner = tokio::net::TcpListener::from_std(std_listener).map_err(PhantomError::Io)?;
         Ok(Self { inner })
     }
 }
@@ -111,71 +163,89 @@ mod tests {
     use std::net::{IpAddr, Ipv4Addr};
     use tokio::net::TcpListener as TokioTcp;
 
-    /// Pick a free port (immediately) and return it. The std listener is
-    /// dropped before we return, so the OS may still hold the port in
-    /// TIME_WAIT for a moment. Use this only when we want to **probe** a
-    /// free port (we never rebind the same port right after).
-    fn pick_free_port() -> u16 {
-        let l = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let port = l.local_addr().unwrap().port();
-        drop(l);
-        port
-    }
-
-    /// Synchronously occupy a port and return a guard. The guard's Drop will
-    /// release the port (though TIME_WAIT may still apply). Using
-    /// `tokio::net::TcpListener` here so SO_REUSEADDR is set.
-    async fn occupy_async(port: u16) -> TokioTcp {
-        TokioTcp::bind((Ipv4Addr::LOCALHOST, port))
-            .await
-            .expect("failed to occupy port")
+    /// Reserve `count` consecutive loopback ports, returning the base port and
+    /// the listeners holding them.
+    ///
+    /// Picking a port by binding `:0` and dropping the listener is racy: the
+    /// port is free again before the caller can use it, so a sibling test in
+    /// the same binary can take it. Here every port stays bound for the
+    /// lifetime of the returned guards, making the "busy" side of each
+    /// assertion deterministic.
+    async fn reserve_consecutive(count: u16) -> (u16, Vec<TokioTcp>) {
+        assert!(count > 0);
+        for _ in 0..64 {
+            let first = TokioTcp::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("failed to bind an ephemeral port");
+            let base = first.local_addr().unwrap().port();
+            if base.checked_add(count).is_none() {
+                continue;
+            }
+            let mut held = vec![first];
+            for offset in 1..count {
+                match TokioTcp::bind((Ipv4Addr::LOCALHOST, base + offset)).await {
+                    Ok(listener) => held.push(listener),
+                    // A neighbouring port is taken; start over from a new base.
+                    Err(_) => break,
+                }
+            }
+            if held.len() == count as usize {
+                return (base, held);
+            }
+        }
+        panic!("could not reserve {} consecutive loopback ports", count);
     }
 
     #[tokio::test]
     async fn try_bind_tcp_with_fallback_picks_next_port() {
-        // Pick a free port, then occupy it via tokio (which sets SO_REUSEADDR),
-        // so rebinding the same port is fine; the next attempt will succeed.
-        let port = pick_free_port();
-        // Brief sleep to let the port leave TIME_WAIT.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let _occupying = occupy_async(port).await;
+        // Hold two consecutive ports so the fallback has to skip both.
+        let (base, _held) = reserve_consecutive(2).await;
+        let start = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), base);
 
-        let start = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-        let (_listener, bound) = try_bind_tcp_with_fallback(start, 5)
+        let (_listener, bound) = try_bind_tcp_with_fallback(start, 50)
             .await
-            .expect("should find a free port within 5 attempts");
+            .expect("a free port should exist within a 50-port window");
         assert_eq!(bound.ip(), start.ip());
         assert!(
-            bound.port() > start.port(),
-            "expected fallback to a higher port, got {}",
+            bound.port() >= base + 2,
+            "expected both occupied ports to be skipped, got {}",
             bound.port()
         );
     }
 
     #[tokio::test]
     async fn try_bind_tcp_with_fallback_first_port_free() {
-        // Find a free port and immediately rebind it via tokio. SO_REUSEADDR
-        // is set on tokio TcpListener, so the rebind should succeed.
-        let port = pick_free_port();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let start = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
-        let (_listener, bound) = try_bind_tcp_with_fallback(start, 3).await.unwrap();
-        assert_eq!(bound.port(), port);
+        // Reserve a port, release it, then immediately claim it through the
+        // function under test. A concurrent bind may win that port, so retry a
+        // few times before declaring failure.
+        for attempt in 0..16 {
+            let (base, held) = reserve_consecutive(1).await;
+            drop(held);
+            let start = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), base);
+            match try_bind_tcp_with_fallback(start, 1).await {
+                Ok((_listener, bound)) => {
+                    assert_eq!(bound.port(), base, "a free start port must be used as-is");
+                    return;
+                }
+                Err(_) if attempt < 15 => continue,
+                Err(e) => panic!("never won a free port: {:?}", e),
+            }
+        }
     }
 
     #[tokio::test]
     async fn try_bind_tcp_with_fallback_exhausts_attempts() {
-        // Occupy 3 consecutive ports via tokio (SO_REUSEADDR), then ask for
-        // max_attempts=2 — should fail.
-        let port = pick_free_port();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let _a = occupy_async(port).await;
-        let _b = occupy_async(port + 1).await;
-        let start = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        // Both ports in the window stay bound for the whole test, so the
+        // fallback must run out of attempts.
+        let (base, _held) = reserve_consecutive(2).await;
+        let start = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), base);
+
         let result: Result<(TcpListener, SocketAddr)> = try_bind_tcp_with_fallback(start, 2).await;
         match result {
-            Ok(_) => panic!("expected an error, got Ok"),
-            Err(PhantomError::Config(msg)) => assert!(msg.contains("No free TCP port")),
+            Ok((_, bound)) => panic!("expected an error, bound {} instead", bound),
+            Err(PhantomError::Config(msg)) => {
+                assert!(msg.contains("No free TCP port"), "unexpected message: {}", msg)
+            }
             Err(other) => panic!("expected Config error, got {:?}", other),
         }
     }

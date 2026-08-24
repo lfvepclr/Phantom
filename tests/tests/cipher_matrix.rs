@@ -18,6 +18,7 @@ async fn cipher_aes256gcm() {
         fixture.server_addr,
         &fixture.server_key.public,
         &fixture.client_key.secret,
+        &fixture.psk,
         &target_from_fixture(&fixture),
         fixture.cipher_preference,
     )
@@ -35,6 +36,7 @@ async fn cipher_aes128gcm() {
         fixture.server_addr,
         &fixture.server_key.public,
         &fixture.client_key.secret,
+        &fixture.psk,
         &target_from_fixture(&fixture),
         fixture.cipher_preference,
     )
@@ -52,6 +54,7 @@ async fn cipher_chacha20() {
         fixture.server_addr,
         &fixture.server_key.public,
         &fixture.client_key.secret,
+        &fixture.psk,
         &target_from_fixture(&fixture),
         fixture.cipher_preference,
     )
@@ -69,6 +72,7 @@ async fn cipher_ascon128() {
         fixture.server_addr,
         &fixture.server_key.public,
         &fixture.client_key.secret,
+        &fixture.psk,
         &target_from_fixture(&fixture),
         fixture.cipher_preference,
     )
@@ -86,6 +90,7 @@ async fn cipher_auto() {
         fixture.server_addr,
         &fixture.server_key.public,
         &fixture.client_key.secret,
+        &fixture.psk,
         &target_from_fixture(&fixture),
         fixture.cipher_preference,
     )

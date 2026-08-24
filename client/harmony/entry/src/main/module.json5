@@ -42,6 +42,14 @@
     "requestPermissions": [
       {
         "name": "ohos.permission.INTERNET"
+      },
+      {
+        // Embedded server page: display the LAN address clients connect to.
+        "name": "ohos.permission.GET_NETWORK_INFO"
+      },
+      {
+        // Keep the embedded server alive while the app is backgrounded.
+        "name": "ohos.permission.KEEP_BACKGROUND_RUNNING"
       }
     ]
   }

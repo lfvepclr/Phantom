@@ -1,5 +1,5 @@
 use phantom_core::CipherPreference;
-use phantom_core::crypto::KeyPair;
+use phantom_core::crypto::{KeyPair, Psk};
 use phantom_core::protocol::TargetAddr;
 use phantom_e2e::echo::EchoMode;
 use phantom_e2e::fixture::{TestFixture, TestFixtureBuilder};
@@ -13,6 +13,46 @@ fn target_from_fixture(fixture: &TestFixture) -> TargetAddr {
     }
 }
 
+/// A client holding the correct server public key but the wrong PSK must not
+/// get a tunnel. This is the end-to-end counterpart of the unit test in
+/// `core/src/crypto/noise.rs` and the property that makes active probing fail.
+#[tokio::test]
+async fn wrong_psk_is_rejected() {
+    let fixture = TestFixtureBuilder::new().build().await;
+    let result = connect_tunnel(
+        fixture.server_addr,
+        &fixture.server_key.public,
+        &fixture.client_key.secret,
+        // Unrelated PSK; everything else is correct.
+        &Psk::generate(),
+        &target_from_fixture(&fixture),
+        fixture.cipher_preference,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "a mismatched PSK must not yield a working tunnel"
+    );
+}
+
+/// The matching PSK is what makes the same connection succeed, so the rejection
+/// above is attributable to the PSK rather than to unrelated setup.
+#[tokio::test]
+async fn matching_psk_is_accepted() {
+    let psk = Psk::generate();
+    let fixture = TestFixtureBuilder::new().psk(psk.clone()).build().await;
+    let result = connect_tunnel(
+        fixture.server_addr,
+        &fixture.server_key.public,
+        &fixture.client_key.secret,
+        &psk,
+        &target_from_fixture(&fixture),
+        fixture.cipher_preference,
+    )
+    .await;
+    assert!(result.is_ok(), "a matching PSK must be accepted");
+}
+
 /// Empty allowed_clients list means any client key is accepted.
 #[tokio::test]
 async fn empty_allowed_clients_accepts_any() {
@@ -21,6 +61,7 @@ async fn empty_allowed_clients_accepts_any() {
         fixture.server_addr,
         &fixture.server_key.public,
         &fixture.client_key.secret,
+        &fixture.psk,
         &target_from_fixture(&fixture),
         fixture.cipher_preference,
     )
@@ -44,6 +85,7 @@ async fn allowed_clients_rejects_unknown_key() {
         fixture.server_addr,
         &fixture.server_key.public,
         &fixture.client_key.secret,
+        &fixture.psk,
         &target_from_fixture(&fixture),
         fixture.cipher_preference,
     )
@@ -68,6 +110,7 @@ async fn allowed_clients_accepts_known_key() {
         fixture.server_addr,
         &fixture.server_key.public,
         &fixture.client_key.secret,
+        &fixture.psk,
         &target_from_fixture(&fixture),
         fixture.cipher_preference,
     )
@@ -87,6 +130,7 @@ async fn echo_mode_sink_swallows_data() {
         fixture.server_addr,
         &fixture.server_key.public,
         &fixture.client_key.secret,
+        &fixture.psk,
         &target_from_fixture(&fixture),
         fixture.cipher_preference,
     )

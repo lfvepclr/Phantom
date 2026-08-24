@@ -12,8 +12,12 @@ async fn setup_tunnel_with_proxy(
     fixture: &TestFixture,
     proxy_addr: std::net::SocketAddr,
 ) -> anyhow::Result<(
-    phantom_core::protocol::FrameReader<tokio::io::ReadHalf<tokio::net::TcpStream>>,
-    phantom_core::protocol::FrameWriter<tokio::io::WriteHalf<tokio::net::TcpStream>>,
+    phantom_core::protocol::FrameReader<
+        phantom_core::SessionReader<tokio::io::ReadHalf<tokio::net::TcpStream>>,
+    >,
+    phantom_core::protocol::FrameWriter<
+        phantom_core::SessionWriter<tokio::io::WriteHalf<tokio::net::TcpStream>>,
+    >,
     u32,
 )> {
     let ip_bytes = match fixture.target_addr.ip() {
@@ -25,6 +29,7 @@ async fn setup_tunnel_with_proxy(
         proxy_addr,
         &fixture.server_key.public,
         &fixture.client_key.secret,
+        &fixture.psk,
         &target,
         fixture.cipher_preference,
     )
@@ -187,6 +192,7 @@ async fn weak_net_200ms_aes256gcm_vs_ascon128() {
             proxy.listen_addr,
             &fixture.server_key.public,
             &fixture.client_key.secret,
+            &fixture.psk,
             &target,
             fixture.cipher_preference,
         )
