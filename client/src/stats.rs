@@ -42,6 +42,9 @@ pub struct TrafficStats {
     pub retransmit_suppressed: AtomicU64,
     /// Flows killed because they exceeded the duplicate-injection budget.
     pub retransmit_budget_rst: AtomicU64,
+    /// Direct connections that failed or timed out and had to be retried
+    /// through the tunnel. Each one cost the app `DIRECT_FALLBACK_TIMEOUT`.
+    pub route_direct_failed: AtomicU64,
 }
 
 impl TrafficStats {
@@ -59,7 +62,7 @@ impl TrafficStats {
         format!(
             "{{\"up\":{},\"down\":{},\"udp_up\":{},\"udp_down\":{},\"conns\":{},\"route_direct\":{},\"route_proxy\":{},\
              \"tcp_dup\":{},\"dup_acks\":{},\"tun_wq_ms\":{},\"tun_wq_max_ms\":{},\"tun_txq_peak\":{},\
-             \"retx_suppressed\":{},\"retx_budget_rst\":{}}}",
+             \"retx_suppressed\":{},\"retx_budget_rst\":{},\"route_direct_failed\":{}}}",
             self.tcp_bytes_up.load(Ordering::Relaxed),
             self.tcp_bytes_down.load(Ordering::Relaxed),
             self.udp_bytes_up.load(Ordering::Relaxed),
@@ -74,6 +77,7 @@ impl TrafficStats {
             self.tun_txq_peak.load(Ordering::Relaxed),
             self.retransmit_suppressed.load(Ordering::Relaxed),
             self.retransmit_budget_rst.load(Ordering::Relaxed),
+            self.route_direct_failed.load(Ordering::Relaxed),
         )
     }
 
@@ -84,7 +88,7 @@ impl TrafficStats {
     pub fn zero_snapshot_json() -> String {
         "{\"up\":0,\"down\":0,\"udp_up\":0,\"udp_down\":0,\"conns\":0,\"route_direct\":0,\"route_proxy\":0,\
          \"tcp_dup\":0,\"dup_acks\":0,\"tun_wq_ms\":0,\"tun_wq_max_ms\":0,\"tun_txq_peak\":0,\
-         \"retx_suppressed\":0,\"retx_budget_rst\":0}"
+         \"retx_suppressed\":0,\"retx_budget_rst\":0,\"route_direct_failed\":0}"
             .to_string()
     }
 
@@ -146,6 +150,12 @@ impl TrafficStats {
 
     pub fn record_retransmit_budget_rst(&self) {
         self.retransmit_budget_rst.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A direct connection attempt failed (censored destinations blackhole
+    /// instead of refusing, so these show up as timeouts).
+    pub fn record_route_direct_failed(&self) {
+        self.route_direct_failed.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Render stats in Prometheus exposition format.
@@ -249,7 +259,7 @@ mod tests {
             "{\"up\":1024,\"down\":2048,\"udp_up\":16,\"udp_down\":32,\
              \"conns\":1,\"route_direct\":2,\"route_proxy\":1,\
              \"tcp_dup\":0,\"dup_acks\":0,\"tun_wq_ms\":0,\"tun_wq_max_ms\":0,\"tun_txq_peak\":0,\
-             \"retx_suppressed\":0,\"retx_budget_rst\":0}"
+             \"retx_suppressed\":0,\"retx_budget_rst\":0,\"route_direct_failed\":0}"
         );
     }
 

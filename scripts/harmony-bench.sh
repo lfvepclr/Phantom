@@ -47,13 +47,19 @@ fi
 
 # --- helpers -------------------------------------------------------------
 
-# `ifconfig vpn-tun` → "rx_bytes tx_bytes rx_dropped tx_dropped"
+# `ifconfig vpn-tun` → "rx_bytes tx_bytes rx_dropped tx_dropped".
+#
+# Note the counter is part of the token (`bytes:25994594`), not a separate
+# field — matching on `$i == "bytes:"` silently yields 0 for every sample.
 read_tun_counters() {
     shell "ifconfig vpn-tun" | awk '
         /RX packets/ { for (i = 1; i <= NF; i++) if ($i ~ /^dropped:/) rx_drop = substr($i, 9) }
         /TX packets/ { for (i = 1; i <= NF; i++) if ($i ~ /^dropped:/) tx_drop = substr($i, 9) }
-        /RX bytes/   { for (i = 1; i <= NF; i++) if ($i == "bytes:") rx = $(i+1) }
-        /TX bytes/   { for (i = 1; i <= NF; i++) if ($i == "bytes:") tx = $(i+1) }
+        # `RX bytes:<n> TX bytes:<m>` is a single line, so each counter has to be
+        # taken from the field *after* its own label — matching the first
+        # `bytes:` token twice reports the download figure as the upload too.
+        /RX bytes/   { for (i = 1; i <= NF; i++) if ($i == "RX") { rx = substr($(i+1), 7); break } }
+        /TX bytes/   { for (i = 1; i <= NF; i++) if ($i == "TX") { tx = substr($(i+1), 7); break } }
         END { printf "%d %d %d %d\n", rx, tx, rx_drop, tx_drop }'
 }
 

@@ -89,6 +89,18 @@ const TUN_WRITE_STALL_WARN: std::time::Duration = std::time::Duration::from_mill
 /// app's own connect timeout while staying clear of ordinary domestic RTTs.
 const DIRECT_FALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2500);
 
+/// How long a destination stays marked "direct does not work here".
+///
+/// Without this every *new* connection to a blackholed address pays the full
+/// 2.5 s timeout again. YouTube opens dozens of connections to CDN addresses
+/// that are not tied to a whitelisted domain, and the on-device log showed 21
+/// such timeouts (≈53 s of stalling) in a ten-minute session — the "不断加载"
+/// the operator sees is largely this, one connection at a time.
+const DIRECT_FAILURE_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Upper bound on remembered failures, so a scanning app cannot grow it.
+const DIRECT_FAILURE_MAX: usize = 512;
+
 /// Bumped whenever the OS tells us the underlying network changed.
 ///
 /// Every flow records the epoch it was born in. When the epoch moves, sockets
@@ -97,8 +109,76 @@ const DIRECT_FALLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_m
 /// reset to retry on the new link instead of hanging until their own timeout.
 static NETWORK_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Destinations whose direct connection already failed in this session.
+///
+/// Keyed by the /24 (IPv4) or the address itself (IPv6): censorship blackholes
+/// a whole range, so remembering one address per connection only pays the
+/// 2.5 s timeout again for its neighbours.
+fn direct_failure_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            IpAddr::V4(std::net::Ipv4Addr::new(octets[0], octets[1], octets[2], 0))
+        }
+        v6 => v6,
+    }
+}
+
+#[derive(Default)]
+struct DirectFailureCache {
+    entries: std::sync::Mutex<HashMap<IpAddr, std::time::Instant>>,
+}
+
+impl DirectFailureCache {
+    /// `true` when this destination burned a direct attempt recently.
+    fn is_known_bad(&self, ip: IpAddr, now: std::time::Instant) -> bool {
+        let key = direct_failure_key(ip);
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        match entries.get(&key) {
+            Some(at) if now.duration_since(*at) < DIRECT_FAILURE_TTL => true,
+            Some(_) => {
+                entries.remove(&key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn remember(&self, ip: IpAddr, now: std::time::Instant) {
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        if entries.len() >= DIRECT_FAILURE_MAX {
+            // Drop the stalest half rather than refusing new knowledge.
+            let mut ordered: Vec<(IpAddr, std::time::Instant)> =
+                entries.iter().map(|(k, v)| (*k, *v)).collect();
+            ordered.sort_by_key(|(_, at)| *at);
+            for (key, _) in ordered.into_iter().take(DIRECT_FAILURE_MAX / 2) {
+                entries.remove(&key);
+            }
+        }
+        entries.insert(direct_failure_key(ip), now);
+    }
+
+    fn clear(&self) {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+}
+
+static DIRECT_FAILURES: std::sync::OnceLock<DirectFailureCache> = std::sync::OnceLock::new();
+
+fn direct_failures() -> &'static DirectFailureCache {
+    DIRECT_FAILURES.get_or_init(DirectFailureCache::default)
+}
+
 /// Invalidate every flow and report the new epoch.
 pub fn bump_network_epoch() -> u64 {
+    // A new link may not be censored the way the old one was, so the "direct
+    // does not work here" memory is scoped to one network.
+    direct_failures().clear();
     NETWORK_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
 }
 
@@ -1744,6 +1824,7 @@ impl<D: TunIo> TunProxy<D> {
         let device = Arc::clone(&self.writer);
         let flows = self.flows.clone();
         let socks5_addr = self.socks5_addr;
+        let stats = Arc::clone(&self.stats);
         tokio::spawn(async move {
             if let Err(e) = tcp_direct_relay_task(
                 rx_from_tun,
@@ -1755,6 +1836,7 @@ impl<D: TunIo> TunProxy<D> {
                 dst_port,
                 socks5_addr,
                 fallback_to_tunnel,
+                stats,
             )
             .await
             {
@@ -2257,10 +2339,34 @@ async fn tcp_direct_relay_task(
     dst_port: u16,
     socks5_addr: SocketAddr,
     fallback_to_tunnel: bool,
+    stats: Arc<TrafficStats>,
 ) -> Result<()> {
     // Nothing has been read from the tunnel yet, so the app's buffered payload
     // is still in `rx_from_tun` and can be handed to the tunnel relay verbatim
     // if the direct connect fails.
+    //
+    // A destination that already timed out once goes straight to the tunnel:
+    // the app cannot afford another 2.5 s of nothing on every connection.
+    if fallback_to_tunnel && direct_failures().is_known_bad(dst_ip, std::time::Instant::now()) {
+        tracing::info!(
+            "route {}:{} -> Proxy (direct unreachable earlier on this network)",
+            dst_ip,
+            dst_port
+        );
+        crate::tun_trace!("direct-retry-skip {}:{}", dst_ip, dst_port);
+        stats.record_route_direct_failed();
+        return retry_through_tunnel(
+            rx_from_tun,
+            device,
+            flows,
+            key,
+            state,
+            socks5_addr,
+            dst_ip,
+            dst_port,
+        )
+        .await;
+    }
     let connect = tokio::time::timeout(
         DIRECT_FALLBACK_TIMEOUT,
         TcpStream::connect(SocketAddr::new(dst_ip, dst_port)),
@@ -2275,6 +2381,8 @@ async fn tcp_direct_relay_task(
             stream
         }
         Ok(Err(e)) if fallback_to_tunnel => {
+            direct_failures().remember(dst_ip, std::time::Instant::now());
+            stats.record_route_direct_failed();
             tracing::info!(
                 "route {}:{} -> Proxy (direct connect failed: {}; retrying through the tunnel)",
                 dst_ip,
@@ -2294,6 +2402,10 @@ async fn tcp_direct_relay_task(
             .await;
         }
         Err(_) if fallback_to_tunnel => {
+            // Blackholed, not refused: remember it so the next connection to
+            // this range skips the 2.5 s wait entirely.
+            direct_failures().remember(dst_ip, std::time::Instant::now());
+            stats.record_route_direct_failed();
             tracing::info!(
                 "route {}:{} -> Proxy (direct connect timed out; retrying through the tunnel)",
                 dst_ip,
@@ -3189,6 +3301,51 @@ mod tests {
         assert!(
             injected >= DUP_INJECT_TOTAL_BUDGET - DUP_INJECT_WINDOW_BUDGET,
             "the cap should be reached, not tripped early ({injected} bytes)"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Direct-connect failure memory
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn direct_failure_is_remembered_per_range() {
+        let cache = DirectFailureCache::default();
+        let t0 = std::time::Instant::now();
+        let bad = "209.85.228.136".parse().unwrap();
+
+        assert!(!cache.is_known_bad(bad, t0));
+        cache.remember(bad, t0);
+        assert!(cache.is_known_bad(bad, t0));
+        // Same /24: the whole range is blackholed, so its neighbours must not
+        // pay the 2.5 s timeout again.
+        assert!(cache.is_known_bad("209.85.228.169".parse().unwrap(), t0));
+        // A different range is unaffected.
+        assert!(!cache.is_known_bad("142.250.199.78".parse().unwrap(), t0));
+    }
+
+    #[test]
+    fn direct_failure_memory_expires() {
+        let cache = DirectFailureCache::default();
+        let t0 = std::time::Instant::now();
+        let bad = "209.85.228.136".parse().unwrap();
+        cache.remember(bad, t0);
+        assert!(cache.is_known_bad(bad, t0 + DIRECT_FAILURE_TTL - std::time::Duration::from_secs(1)));
+        assert!(!cache.is_known_bad(bad, t0 + DIRECT_FAILURE_TTL + std::time::Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn direct_failure_memory_is_bounded() {
+        let cache = DirectFailureCache::default();
+        let t0 = std::time::Instant::now();
+        for i in 0..(DIRECT_FAILURE_MAX + 64) {
+            let ip: IpAddr = format!("10.{}.{}.1", (i / 256) % 256, i % 256).parse().unwrap();
+            cache.remember(ip, t0 + std::time::Duration::from_millis(i as u64));
+        }
+        assert!(
+            cache.len() <= DIRECT_FAILURE_MAX,
+            "cache grew to {} entries",
+            cache.len()
         );
     }
 }
