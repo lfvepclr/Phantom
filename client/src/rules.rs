@@ -207,16 +207,34 @@ impl RuleEngine {
     /// 2. IP-CIDR (longest prefix first)
     /// 3. Port
     /// 4. GEOIP
-    /// 5. Final action
+    /// 5. Caller-supplied fallthrough (built-in whitelist lives in `routing`)
     pub fn query(&self, domain: Option<&str>, ip: Option<IpAddr>, port: Option<u16>) -> RuleAction {
+        self.query_rule(domain, ip, port)
+            .unwrap_or(self.final_action)
+    }
+
+    /// Action applied when no rule matched.
+    pub fn final_action(&self) -> RuleAction {
+        self.final_action
+    }
+
+    /// Like [`Self::query`], but `None` means "no rule matched", so callers can
+    /// consult the built-in proxy whitelist before falling back to the
+    /// configured `final_action`.
+    pub fn query_rule(
+        &self,
+        domain: Option<&str>,
+        ip: Option<IpAddr>,
+        port: Option<u16>,
+    ) -> Option<RuleAction> {
         // 1. Domain rules (most specific first).
         if let Some(d) = domain {
             let d = d.to_lowercase();
             if let Some(action) = self.domain_full.get(&d) {
-                return *action;
+                return Some(*action);
             }
             if let Some(action) = self.domain_suffix.query(&d) {
-                return action;
+                return Some(action);
             }
             if let Some(ac) = &self.domain_keyword {
                 // `leftmost_find_iter` yields non-overlapping leftmost
@@ -226,7 +244,7 @@ impl RuleEngine {
                 // the global match order — equivalent to scanning a Vec in
                 // order.
                 if let Some(m) = ac.leftmost_find_iter(&d).next() {
-                    return m.value();
+                    return Some(m.value());
                 }
             }
             if let Some(re_set) = &self.domain_regex {
@@ -235,7 +253,7 @@ impl RuleEngine {
                 // earliest-registered pattern, matching the previous
                 // `Vec<Regex>` greedy semantics.
                 if let Some(idx) = re_set.matches(&d).iter().next() {
-                    return self.regex_actions[idx];
+                    return Some(self.regex_actions[idx]);
                 }
             }
         }
@@ -250,7 +268,7 @@ impl RuleEngine {
                         let key = Ipv4Prefix::new(v4, 32).expect("/32 always valid");
                         let (_, opt_action) = trie.lookup(&key);
                         if let Some(action) = opt_action {
-                            return *action;
+                            return Some(*action);
                         }
                     }
                 }
@@ -259,7 +277,7 @@ impl RuleEngine {
                         let key = Ipv6Prefix::new(v6, 128).expect("/128 always valid");
                         let (_, opt_action) = trie.lookup(&key);
                         if let Some(action) = opt_action {
-                            return *action;
+                            return Some(*action);
                         }
                     }
                 }
@@ -269,7 +287,7 @@ impl RuleEngine {
         // 3. Port rules.
         if let Some(p) = port {
             if let Some(action) = self.ports.get(&p) {
-                return *action;
+                return Some(*action);
             }
         }
 
@@ -280,7 +298,7 @@ impl RuleEngine {
                 if let Ok(country) = reader.lookup::<maxminddb::geoip2::Country>(addr) {
                     if let Some(iso) = country.country.and_then(|c| c.iso_code) {
                         if let Some(action) = self.geoip_rules.get(&iso.to_uppercase()) {
-                            return *action;
+                            return Some(*action);
                         }
                     }
                 }
@@ -293,7 +311,7 @@ impl RuleEngine {
             tracing::trace!("GEOIP rules configured but geoip feature disabled");
         }
 
-        self.final_action
+        None
     }
 }
 
@@ -360,6 +378,8 @@ mod tests {
                 .map(|(pattern, action)| ClientRule { pattern, action })
                 .collect(),
             final_action: RuleAction::Proxy,
+            // Tests exercise explicit rules, not the shipped whitelist.
+            builtin_proxy_whitelist: false,
         }
     }
 
@@ -367,6 +387,7 @@ mod tests {
         RulesConfig {
             rules,
             final_action,
+            builtin_proxy_whitelist: false,
         }
     }
 

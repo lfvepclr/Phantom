@@ -64,8 +64,8 @@ pub async fn establish_udp_flow_tcp(
     let mut frame_reader = FrameReader::new(session_reader);
     let mut frame_writer = FrameWriter::new(session_writer);
 
-    let stream_id = udp_syn_handshake(&mut frame_reader, &mut frame_writer, target, first_datagram)
-        .await?;
+    let stream_id =
+        udp_syn_handshake(&mut frame_reader, &mut frame_writer, target, first_datagram).await?;
     Ok(spawn_udp_frame_pump(frame_reader, frame_writer, stream_id))
 }
 
@@ -87,8 +87,8 @@ pub async fn establish_udp_flow_quic(
     let mut frame_reader = FrameReader::new(PlainMessageReader::new(read_half));
     let mut frame_writer = FrameWriter::new(PlainMessageWriter::new(write_half));
 
-    let stream_id = udp_syn_handshake(&mut frame_reader, &mut frame_writer, target, first_datagram)
-        .await?;
+    let stream_id =
+        udp_syn_handshake(&mut frame_reader, &mut frame_writer, target, first_datagram).await?;
     Ok(spawn_udp_frame_pump(frame_reader, frame_writer, stream_id))
 }
 
@@ -116,7 +116,9 @@ async fn udp_syn_handshake<M: MessageRead, N: MessageWrite>(
         return Err(PhantomError::Protocol("UDP SYN rejected".to_string()));
     }
     if !ack.flags.contains(FrameFlags::ACK) {
-        return Err(PhantomError::Protocol("Expected ACK for UDP SYN".to_string()));
+        return Err(PhantomError::Protocol(
+            "Expected ACK for UDP SYN".to_string(),
+        ));
     }
     Ok(stream_id)
 }
@@ -165,9 +167,7 @@ where
                     Ok(f) => f,
                     Err(_) => break,
                 };
-                if frame.flags.contains(FrameFlags::DATA)
-                    && frame.flags.contains(FrameFlags::UDP)
-                {
+                if frame.flags.contains(FrameFlags::DATA) && frame.flags.contains(FrameFlags::UDP) {
                     if inbound_tx.send(frame.payload.to_vec()).is_err() {
                         break;
                     }

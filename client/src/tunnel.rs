@@ -6,8 +6,10 @@ use tracing;
 
 use crate::failover::FailoverManager;
 use crate::hello::verify_server_connection;
-use crate::quic_pool::QuicPool;
+use phantom_core::CipherPreference;
 use crate::http_proxy::handle_inbound;
+use crate::quic_pool::QuicPool;
+use crate::tcp_pool::TcpSessionPool;
 use crate::tun::TunSettings;
 
 /// Options for the TUN transparent-proxy runtime (`phantom client --tun`).
@@ -66,6 +68,10 @@ pub struct PhantomClient {
     /// Multiplexed QUIC connections, one per server address. Harmless for
     /// TCP-only configs: the pool is only touched on the QUIC code path.
     quic_pool: Arc<QuicPool>,
+    /// Ready-to-use TCP tunnel sessions. Cold connections pay a connect plus a
+    /// Noise handshake before their first byte moves; this pool removes that
+    /// from every flow after the first (see `crate::tcp_pool`).
+    tcp_pool: Arc<TcpSessionPool>,
     /// Shared traffic counters: SOCKS5 and TUN traffic land in the same
     /// instance, which the metrics endpoint serves.
     stats: Arc<crate::stats::TrafficStats>,
@@ -80,6 +86,7 @@ impl PhantomClient {
             local_secret: key_pair.secret,
             failover,
             quic_pool: Arc::new(QuicPool::new()),
+            tcp_pool: Arc::new(TcpSessionPool::new()),
             stats: crate::stats::TrafficStats::new(),
         })
     }
@@ -87,6 +94,7 @@ impl PhantomClient {
     /// Run in SOCKS5-only mode.
     pub async fn run(&self) -> Result<()> {
         self.verify().await?;
+        self.prewarm_tcp_pool();
         let listener = self.bind_socks5().await?;
         self.spawn_health_check();
         self.spawn_metrics();
@@ -105,6 +113,7 @@ impl PhantomClient {
     #[cfg(not(any(target_os = "android", target_env = "ohos")))]
     pub async fn run_tun(&self, options: TunRuntimeOptions) -> Result<()> {
         self.verify().await?;
+        self.prewarm_tcp_pool();
 
         // Bind SOCKS5 before touching the network configuration: a port clash
         // should fail cleanly rather than half-install a gateway.
@@ -130,17 +139,16 @@ impl PhantomClient {
             None => None,
         };
 
-        let socks5_addr = self
-            .config
-            .client
-            .listen
-            .parse()
-            .map_err(|e| PhantomError::Config(format!("Invalid SOCKS5 listen address: {}", e)))?;
+        let socks5_addr =
+            self.config.client.listen.parse().map_err(|e| {
+                PhantomError::Config(format!("Invalid SOCKS5 listen address: {}", e))
+            })?;
 
         let mut proxy = crate::tun::TunProxy::new(device, socks5_addr)
             .with_mode(self.config.client.mode)
             .with_failover(Arc::clone(&self.failover))
-            .with_stats(Arc::clone(&self.stats));
+            .with_stats(Arc::clone(&self.stats))
+            .with_whitelist(crate::whitelist::shared(&self.config).whitelist());
 
         if let Some(server) = self.config.servers.first() {
             proxy = proxy.with_server(server.clone(), self.local_secret);
@@ -158,18 +166,25 @@ impl PhantomClient {
             }
             Err(e) => tracing::warn!("Rule engine init failed: {}", e),
         }
-        if let Some(dns_addr) = crate::dns::parse_dns_addr(&self.config.client.dns) {
-            match crate::dns::DnsProxy::new(dns_addr).await {
+        let tunnel_dns = crate::dns::parse_dns_addr(&self.config.client.dns);
+        let direct_dns = crate::dns::parse_dns_addr(&self.config.client.dns_direct);
+        if let (Some(tunnel_dns), Some(direct_dns)) = (tunnel_dns, direct_dns) {
+            match crate::dns::DnsProxy::new(tunnel_dns, direct_dns).await {
                 Ok(dns) => {
-                    proxy = proxy.with_dns(dns);
-                    tracing::info!("DNS hijack enabled, upstream = {}", dns_addr);
+                    proxy = proxy.with_dns(std::sync::Arc::new(dns));
+                    tracing::info!(
+                        "DNS hijack enabled, tunnel resolver = {}, direct resolver = {}",
+                        tunnel_dns,
+                        direct_dns
+                    );
                 }
                 Err(e) => tracing::warn!("DNS proxy init failed: {}", e),
             }
         } else {
             tracing::warn!(
-                "Invalid client.dns value '{}', DNS hijack disabled",
-                self.config.client.dns
+                "Invalid DNS config (client.dns = '{}', client.dns_direct = '{}'), DNS hijack disabled",
+                self.config.client.dns,
+                self.config.client.dns_direct
             );
         }
 
@@ -252,15 +267,41 @@ impl PhantomClient {
         Arc::clone(&self.stats)
     }
 
+    /// Expose the TCP session pool (used by platform bridges and tests).
+    pub fn tcp_pool(&self) -> Arc<TcpSessionPool> {
+        Arc::clone(&self.tcp_pool)
+    }
+
+    /// Handshake one tunnel session before the first flow asks for it.
+    ///
+    /// The first page load after "connect" is exactly when a saved round trip is
+    /// most visible, and the pool has nothing to reuse until something warms it.
+    /// A failure here is harmless: the pool refills on the first flow instead.
+    fn prewarm_tcp_pool(&self) {
+        let Ok((server, _)) = self.failover.select_server_with_migration() else {
+            return;
+        };
+        if server.protocol != phantom_core::TransportProtocol::Tcp {
+            return;
+        }
+        let cipher = CipherPreference::effective_for(server.cipher, self.config.client.cipher);
+        self.tcp_pool
+            .spawn_refill(server, self.local_secret, cipher);
+    }
+
     async fn accept_socks5(&self, listener: TcpListener) -> Result<()> {
         loop {
             let (stream, peer) = listener.accept().await.map_err(PhantomError::Io)?;
             tracing::debug!("SOCKS5 connection from {}", peer);
+            // The ingress writes the app's payload back verbatim, so it must not
+            // add Nagle delay of its own on top of the proxy hop.
+            crate::net_tune::tune(&stream);
 
             let config = self.config.clone();
             let failover = Arc::clone(&self.failover);
             let local_secret = self.local_secret;
             let quic_pool = Arc::clone(&self.quic_pool);
+            let tcp_pool = Arc::clone(&self.tcp_pool);
             let stats = Arc::clone(&self.stats);
             tokio::spawn(async move {
                 if let Err(e) = handle_inbound(
@@ -268,6 +309,7 @@ impl PhantomClient {
                     &config,
                     &failover,
                     &quic_pool,
+                    &tcp_pool,
                     local_secret,
                     &stats,
                 )

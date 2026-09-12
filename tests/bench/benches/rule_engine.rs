@@ -304,6 +304,7 @@ fn engine(rules: Vec<ClientRule>, final_action: RuleAction) -> RuleEngine {
     let cfg = RulesConfig {
         rules,
         final_action,
+        builtin_proxy_whitelist: true,
     };
     RuleEngine::from_config(&cfg).expect("valid rules")
 }
@@ -441,6 +442,7 @@ fn build_engine_mixed(bencher: Bencher, n: usize) {
     let cfg = RulesConfig {
         rules,
         final_action: RuleAction::Proxy,
+        builtin_proxy_whitelist: true,
     };
     bencher.bench_local(|| {
         // Clone is cheap relative to the parse, but we want to measure parse.

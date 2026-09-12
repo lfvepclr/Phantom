@@ -5,8 +5,8 @@
 //!
 //! 用法：`cipher_bench [块大小列表]`，默认 1024 16384 65536 字节。
 
-use phantom_core::crypto::aead_state::AeadState;
 use phantom_core::CipherSuite;
+use phantom_core::crypto::aead_state::AeadState;
 use std::time::Instant;
 
 const BUDGET_BYTES: usize = 256 * 1024 * 1024; // 每组总数据量上限
@@ -40,7 +40,9 @@ fn bench_one(suite: CipherSuite, size: usize) -> (f64, f64) {
     // decrypt 计时（重新加密生成密文源）
     let cts: Vec<Vec<u8>> = {
         let mut k = AeadState::new(suite, &key, [1, 2, 3, 4]);
-        (0..iterations).map(|_| k.encrypt(&buf).expect("encrypt")).collect()
+        (0..iterations)
+            .map(|_| k.encrypt(&buf).expect("encrypt"))
+            .collect()
     };
     let start = Instant::now();
     let mut sink2 = 0usize;
@@ -52,16 +54,24 @@ fn bench_one(suite: CipherSuite, size: usize) -> (f64, f64) {
 
     std::hint::black_box((sink, sink2));
     let total = (iterations * size) as f64;
-    (total / enc_secs / 1024.0 / 1024.0, total / dec_secs / 1024.0 / 1024.0)
+    (
+        total / enc_secs / 1024.0 / 1024.0,
+        total / dec_secs / 1024.0 / 1024.0,
+    )
 }
 
 fn main() {
     println!("cipher-bench target={}", std::env::consts::ARCH);
+    report_selection();
     let sizes: Vec<usize> = std::env::args()
         .skip(1)
         .filter_map(|a| a.parse().ok())
         .collect();
-    let sizes = if sizes.is_empty() { vec![1024, 16384, 65536] } else { sizes };
+    let sizes = if sizes.is_empty() {
+        vec![1024, 16384, 65536]
+    } else {
+        sizes
+    };
 
     let suites = [
         (CipherSuite::Aes256Gcm, "AES-256-GCM"),
@@ -70,11 +80,41 @@ fn main() {
         (CipherSuite::Ascon128, "ASCON-128"),
     ];
 
-    println!("{:<20} {:>8} {:>14} {:>14}", "cipher", "block", "enc MiB/s", "dec MiB/s");
+    println!(
+        "{:<20} {:>8} {:>14} {:>14}",
+        "cipher", "block", "enc MiB/s", "dec MiB/s"
+    );
     for (suite, name) in suites {
         for &size in &sizes {
             let (e, d) = bench_one(suite, size);
             println!("{:<20} {:>8} {:>14.1} {:>14.1}", name, size, e, d);
         }
     }
+}
+
+/// Print the three facts that decide whether this device really uses hardware
+/// AES, plus the cipher `cipher=auto` would pick.
+///
+/// The client's AES backend only exists when the crate is compiled with
+/// `--cfg=aes_armv8` (see `.cargo/config.toml`), *and* it is only taken at
+/// runtime when the CPU is reported as having the `aes` extension — a probe
+/// that is unavailable on targets `cpufeatures` does not know (HarmonyOS is one
+/// of them) unless the feature is also enabled at compile time. Printing all
+/// three answers separates "the backend is missing" from "the backend is there
+/// but unused", which are indistinguishable from a throughput number alone.
+fn report_selection() {
+    #[cfg(target_arch = "aarch64")]
+    let runtime_aes = std::arch::is_aarch64_feature_detected!("aes");
+    #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
+    let runtime_aes = std::arch::is_x86_feature_detected!("aes");
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86", target_arch = "x86_64")))]
+    let runtime_aes = false;
+
+    println!(
+        "detect cfg(aes_armv8)={} target_feature(aes)={} runtime_aes={} auto_suite={:?}",
+        cfg!(aes_armv8),
+        cfg!(target_feature = "aes"),
+        runtime_aes,
+        CipherSuite::auto_detect()
+    );
 }

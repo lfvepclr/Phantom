@@ -34,6 +34,7 @@ async fn domain_suffix_proxy_routes_through_tunnel() {
             action: RuleAction::Proxy,
         }],
         final_action: RuleAction::Direct,
+        builtin_proxy_whitelist: true,
     };
     let engine = RuleEngine::from_config(&cfg).unwrap();
 
@@ -89,6 +90,7 @@ async fn ip_cidr_direct_bypasses_proxy() {
             action: RuleAction::Direct,
         }],
         final_action: RuleAction::Proxy,
+        builtin_proxy_whitelist: true,
     };
     let engine = RuleEngine::from_config(&cfg).unwrap();
 
@@ -129,6 +131,7 @@ async fn domain_priority_over_ip_with_tunnel_echo() {
             },
         ],
         final_action: RuleAction::Direct,
+        builtin_proxy_whitelist: true,
     };
     let engine = RuleEngine::from_config(&cfg).unwrap();
 

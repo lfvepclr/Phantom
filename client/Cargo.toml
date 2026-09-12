@@ -26,6 +26,8 @@ maxminddb = { version = "0.24", optional = true }
 daachorse = "1"
 iptrie = "0.8"
 serde_json = { workspace = true }
+# Built-in proxy whitelist: zero-copy FST index (see client/src/whitelist.rs).
+fst = "0.4"
 
 [features]
 default = []
@@ -34,5 +36,7 @@ geoip = ["maxminddb"]
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
 
-[target.'cfg(any(target_os = "android", target_env = "ohos"))'.dependencies]
+# libc: Android TUN fd handling, macOS effective-uid check (TUN creation and
+# networksetup proxy changes both require root), and OHOS vpn connection calls.
+[target.'cfg(any(target_os = "android", target_os = "macos", target_env = "ohos"))'.dependencies]
 libc = "0.2.186"

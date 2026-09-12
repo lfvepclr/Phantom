@@ -219,10 +219,16 @@ async fn perf_concurrent_connections() {
         let target = target_from_fixture(&fixture);
         let cipher = fixture.cipher_preference;
         let handle = tokio::spawn(async move {
-            let (mut reader, mut writer, stream_id) =
-                connect_tunnel(server_addr, &server_public, &client_secret, &psk, &target, cipher)
-                    .await
-                    .unwrap();
+            let (mut reader, mut writer, stream_id) = connect_tunnel(
+                server_addr,
+                &server_public,
+                &client_secret,
+                &psk,
+                &target,
+                cipher,
+            )
+            .await
+            .unwrap();
             let mut data = vec![0u8; payload_size];
             for byte in data.iter_mut() {
                 *byte = (i % 256) as u8;

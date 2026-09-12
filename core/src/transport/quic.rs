@@ -291,9 +291,7 @@ fn quic_noise_pattern(pref: CipherPreference) -> Result<&'static str> {
         // Every supported platform (Apple Silicon, BCM4912, recent Kirin /
         // Snapdragon, modern ARM servers) has AES hardware, so Auto picks
         // AES-256-GCM.
-        CipherPreference::Auto | CipherPreference::Aes256Gcm => {
-            Ok("Noise_IK_25519_AESGCM_SHA256")
-        }
+        CipherPreference::Auto | CipherPreference::Aes256Gcm => Ok("Noise_IK_25519_AESGCM_SHA256"),
         // Noise's "AESGCM" is AES-256-GCM; there is no AES-128 variant in the
         // spec, so a 128-bit preference is served by the 256-bit suite.
         CipherPreference::Aes128Gcm => Ok("Noise_IK_25519_AESGCM_SHA256"),
@@ -329,9 +327,9 @@ fn build_hyphae_config(auth: &QuicAuth) -> Result<HyphaeConfig> {
         builder = builder.with_remote_public(remote);
     }
 
-    builder.build(RustCryptoBackend).map_err(|e| {
-        PhantomError::Crypto(format!("QUIC Noise handshake config failed: {:?}", e))
-    })
+    builder
+        .build(RustCryptoBackend)
+        .map_err(|e| PhantomError::Crypto(format!("QUIC Noise handshake config failed: {:?}", e)))
 }
 
 /// Create a QUIC client endpoint authenticated by Noise.
@@ -367,7 +365,6 @@ pub fn peer_static_key(conn: &quinn::Connection) -> Option<[u8; 32]> {
     let remote = identity.remote_public.as_ref()?;
     <[u8; 32]>::try_from(remote.as_slice()).ok()
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -424,8 +421,7 @@ mod tests {
         let (base, _held) = reserve_consecutive_udp(2).await;
         let start = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), base);
         let auth = test_server_auth();
-        let result =
-            try_bind_quic_with_fallback(start, 50, &auth, &QuicConfig::default()).await;
+        let result = try_bind_quic_with_fallback(start, 50, &auth, &QuicConfig::default()).await;
         match result {
             Ok((_listener, bound)) => {
                 assert!(
@@ -438,7 +434,11 @@ mod tests {
                 // Acceptable on CI where the loopback may refuse UDP socket
                 // creation. As long as we get a Config error (not an outright
                 // panic), the test still demonstrates error handling.
-                assert!(msg.contains("No free QUIC port"), "unexpected message: {}", msg);
+                assert!(
+                    msg.contains("No free QUIC port"),
+                    "unexpected message: {}",
+                    msg
+                );
             }
             Err(other) => panic!("unexpected error: {:?}", other),
         }
@@ -459,13 +459,21 @@ mod tests {
                     return;
                 }
                 Err(PhantomError::Config(msg)) if attempt < 15 => {
-                    assert!(msg.contains("No free QUIC port"), "unexpected message: {}", msg);
+                    assert!(
+                        msg.contains("No free QUIC port"),
+                        "unexpected message: {}",
+                        msg
+                    );
                     continue;
                 }
                 // Tolerated: CI loopback may not support QUIC at all; the error
                 // path is still exercised.
                 Err(PhantomError::Config(msg)) => {
-                    assert!(msg.contains("No free QUIC port"), "unexpected message: {}", msg);
+                    assert!(
+                        msg.contains("No free QUIC port"),
+                        "unexpected message: {}",
+                        msg
+                    );
                     return;
                 }
                 Err(other) => panic!("unexpected error: {:?}", other),
@@ -477,8 +485,8 @@ mod tests {
     /// Returns the address the server bound to.
     async fn spawn_echo_server(auth: QuicAuth) -> SocketAddr {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let endpoint = create_server_endpoint(&addr, &auth, &QuicConfig::default())
-            .expect("server endpoint");
+        let endpoint =
+            create_server_endpoint(&addr, &auth, &QuicConfig::default()).expect("server endpoint");
         let local = endpoint.local_addr().expect("local addr");
         tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
@@ -543,18 +551,16 @@ mod tests {
     async fn noise_quic_multiplexes_streams() {
         let server_keys = KeyPair::generate().expect("server keys");
         let psk = Psk::generate();
-        let server_auth =
-            QuicAuth::server(server_keys.secret, psk.clone(), CipherPreference::ChaCha20Poly1305);
+        let server_auth = QuicAuth::server(
+            server_keys.secret,
+            psk.clone(),
+            CipherPreference::ChaCha20Poly1305,
+        );
         let server_addr = spawn_echo_server(server_auth).await;
 
-        let conn = open_client_connection(
-            server_addr,
-            server_keys.public,
-            [0x11; 32],
-            psk,
-        )
-        .await
-        .expect("client connection");
+        let conn = open_client_connection(server_addr, server_keys.public, [0x11; 32], psk)
+            .await
+            .expect("client connection");
 
         for i in 0..3u8 {
             let payload = format!("phantom-stream-{}", i).into_bytes();
@@ -600,11 +606,13 @@ mod tests {
         let psk = Psk::generate();
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let server_auth =
-            QuicAuth::server(server_keys.secret, psk.clone(), CipherPreference::ChaCha20Poly1305);
-        let server_endpoint =
-            create_server_endpoint(&addr, &server_auth, &QuicConfig::default())
-                .expect("server endpoint");
+        let server_auth = QuicAuth::server(
+            server_keys.secret,
+            psk.clone(),
+            CipherPreference::ChaCha20Poly1305,
+        );
+        let server_endpoint = create_server_endpoint(&addr, &server_auth, &QuicConfig::default())
+            .expect("server endpoint");
         let server_addr = server_endpoint.local_addr().expect("local addr");
 
         let seen = tokio::spawn(async move {
@@ -631,16 +639,18 @@ mod tests {
 
         let server_keys = KeyPair::generate().expect("server keys");
         let psk = Psk::generate();
-        let server_auth =
-            QuicAuth::server(server_keys.secret, psk.clone(), CipherPreference::ChaCha20Poly1305);
+        let server_auth = QuicAuth::server(
+            server_keys.secret,
+            psk.clone(),
+            CipherPreference::ChaCha20Poly1305,
+        );
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
         let quic = QuicConfig {
             max_streams: 2,
             ..QuicConfig::default()
         };
-        let endpoint =
-            create_server_endpoint(&addr, &server_auth, &quic).expect("server endpoint");
+        let endpoint = create_server_endpoint(&addr, &server_auth, &quic).expect("server endpoint");
         let server_addr = endpoint.local_addr().expect("local addr");
         tokio::spawn(async move {
             // Accept one connection and hold every bi-stream open forever so
@@ -648,7 +658,9 @@ mod tests {
             while let Some(incoming) = endpoint.accept().await {
                 let Ok(conn) = incoming.await else { continue };
                 loop {
-                    let Ok((send, _recv)) = conn.accept_bi().await else { break };
+                    let Ok((send, _recv)) = conn.accept_bi().await else {
+                        break;
+                    };
                     tokio::spawn(async move {
                         let _send = send;
                         std::future::pending::<()>().await;
@@ -759,14 +771,15 @@ mod tests {
         );
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-        let endpoint = create_server_endpoint(&addr, &server_auth, &bbr)
-            .expect("server endpoint");
+        let endpoint = create_server_endpoint(&addr, &server_auth, &bbr).expect("server endpoint");
         let server_addr = endpoint.local_addr().expect("local addr");
         tokio::spawn(async move {
             while let Some(incoming) = endpoint.accept().await {
                 let Ok(conn) = incoming.await else { continue };
                 loop {
-                    let Ok((mut send, mut recv)) = conn.accept_bi().await else { break };
+                    let Ok((mut send, mut recv)) = conn.accept_bi().await else {
+                        break;
+                    };
                     tokio::spawn(async move {
                         // Chunked echo keeps the flow-control window draining
                         // regardless of payload size.
@@ -803,10 +816,7 @@ mod tests {
                 send.finish().expect("finish");
             }
         });
-        let echoed = recv
-            .read_to_end(2 * 1024 * 1024)
-            .await
-            .expect("read echo");
+        let echoed = recv.read_to_end(2 * 1024 * 1024).await.expect("read echo");
         writer.await.expect("writer task");
         assert_eq!(
             echoed, payload,

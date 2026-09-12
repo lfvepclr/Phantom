@@ -413,7 +413,11 @@ fn cli_client_lan_flags_require_gateway() {
         vec!["client", "--tun", "--no-lan-dns-hijack"],
     ] {
         let (ok, out) = run_phantom(&args);
-        assert!(!ok, "{:?} should fail without --gateway. output: {}", args, out);
+        assert!(
+            !ok,
+            "{:?} should fail without --gateway. output: {}",
+            args, out
+        );
         assert!(
             out.contains("--gateway"),
             "error for {:?} should mention --gateway, got: {}",

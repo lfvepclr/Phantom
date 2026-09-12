@@ -55,7 +55,10 @@ fn chacha20poly1305_encrypt(bencher: Bencher, size: usize) {
 
     bencher.bench_local(|| {
         cipher
-            .encrypt(chacha20poly1305::Nonce::from_slice(&nonce), payload.as_slice())
+            .encrypt(
+                chacha20poly1305::Nonce::from_slice(&nonce),
+                payload.as_slice(),
+            )
             .unwrap()
     });
 }

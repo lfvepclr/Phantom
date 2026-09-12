@@ -102,10 +102,10 @@ impl<W: AsyncWrite + Unpin> PlainMessageWriter<W> {
 impl<W: AsyncWrite + Unpin + Send> MessageWrite for PlainMessageWriter<W> {
     async fn write_message_bytes(&mut self, data: Bytes) -> Result<()> {
         let len_be = (data.len() as u16).to_be_bytes();
-        write_vectored_all(&mut self.writer, [
-            IoSlice::new(&len_be),
-            IoSlice::new(&data),
-        ])
+        write_vectored_all(
+            &mut self.writer,
+            [IoSlice::new(&len_be), IoSlice::new(&data)],
+        )
         .await
         .map_err(|e| PhantomError::Protocol(format!("Write message failed: {}", e)))?;
         Ok(())

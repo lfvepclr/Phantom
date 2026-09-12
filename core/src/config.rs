@@ -69,8 +69,22 @@ pub struct ClientConfig {
 pub struct ClientSettings {
     #[serde(default = "default_listen")]
     pub listen: String,
+    /// Remote resolver used for destinations that are routed **through the
+    /// tunnel** (censored domains in Smart mode, everything in Proxy mode).
+    ///
+    /// This address is never dialled directly: the query travels inside the
+    /// Phantom tunnel and is answered by the server's network. Plain DNS on
+    /// port 53 is used — the `tls://` prefix is accepted for backwards
+    /// compatibility but DoT is not implemented.
     #[serde(default = "default_dns")]
     pub dns: String,
+    /// Resolver used for destinations that are routed **directly** (everything
+    /// not in the proxy whitelist while in Smart mode).
+    ///
+    /// Queried from the physical network so domestic CDNs still answer with a
+    /// local node; never polluted by the tunnel's egress country.
+    #[serde(default = "default_dns_direct")]
+    pub dns_direct: String,
     #[serde(default = "default_proxy_mode")]
     pub mode: ProxyMode,
     #[serde(default)]
@@ -100,7 +114,11 @@ fn default_listen() -> String {
 }
 
 fn default_dns() -> String {
-    "tls://8.8.8.8:853".to_string()
+    "8.8.8.8:53".to_string()
+}
+
+fn default_dns_direct() -> String {
+    "223.5.5.5:53".to_string()
 }
 
 fn default_proxy_mode() -> ProxyMode {
@@ -116,6 +134,7 @@ impl Default for ClientSettings {
         Self {
             listen: default_listen(),
             dns: default_dns(),
+            dns_direct: default_dns_direct(),
             mode: default_proxy_mode(),
             cipher: CipherPreference::Auto,
             metrics_listen: default_metrics_listen(),
@@ -207,12 +226,31 @@ pub struct ClientRule {
     pub action: RuleAction,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct RulesConfig {
     #[serde(default)]
     pub rules: Vec<ClientRule>,
     #[serde(default = "default_rules_final_action")]
     pub final_action: RuleAction,
+    /// Ship-with-the-app proxy whitelist (the censored-domain FST built by
+    /// `cargo xtask rules update`). Smart mode proxies whitelisted domains and
+    /// sends everything else direct; set to `false` to ignore it and rely on
+    /// explicit `rules` + `final_action` only.
+    #[serde(default = "default_builtin_proxy_whitelist")]
+    pub builtin_proxy_whitelist: bool,
+}
+
+/// Hand-written so the in-code default matches the serde default: **direct by
+/// default with the built-in proxy whitelist enabled** (deriving `Default`
+/// would pick `RuleAction::default() == Proxy` and `false` for the flag).
+impl Default for RulesConfig {
+    fn default() -> Self {
+        Self {
+            rules: Vec::new(),
+            final_action: default_rules_final_action(),
+            builtin_proxy_whitelist: default_builtin_proxy_whitelist(),
+        }
+    }
 }
 
 impl Default for ClientConfig {
@@ -228,7 +266,14 @@ impl Default for ClientConfig {
 }
 
 fn default_rules_final_action() -> RuleAction {
-    RuleAction::Proxy
+    // Direct by default: Phantom is a bypass tool, not a full-tunnel. Only
+    // whitelisted (censored) destinations take the tunnel unless the operator
+    // opts into `final_action = "proxy"`.
+    RuleAction::Direct
+}
+
+fn default_builtin_proxy_whitelist() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq, Default)]
@@ -535,7 +580,25 @@ public_key = "dGVzdA=="
         let config: ClientConfig = toml::from_str(toml).unwrap();
         assert_eq!(config.servers.len(), 1);
         assert_eq!(config.client.listen, "127.0.0.1:1080");
-        assert_eq!(config.client.dns, "tls://8.8.8.8:853");
+        assert_eq!(config.client.dns, "8.8.8.8:53");
+        assert_eq!(config.client.dns_direct, "223.5.5.5:53");
+    }
+
+    #[test]
+    fn dns_direct_can_be_overridden() {
+        let toml = r#"
+[[servers]]
+name = "primary"
+address = "example.com:443"
+public_key = "dGVzdA=="
+
+[client]
+dns = "1.1.1.1:53"
+dns_direct = "119.29.29.29:53"
+"#;
+        let config: ClientConfig = toml::from_str(toml).unwrap();
+        assert_eq!(config.client.dns, "1.1.1.1:53");
+        assert_eq!(config.client.dns_direct, "119.29.29.29:53");
     }
 
     #[test]

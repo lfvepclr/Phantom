@@ -21,10 +21,10 @@ impl<W: AsyncWrite + Unpin> SessionWriter<W> {
         self.state.encrypt_in_place(&mut buf)?;
 
         let len_be = (buf.len() as u16).to_be_bytes();
-        write_vectored_all(&mut self.writer, [
-            IoSlice::new(&len_be),
-            IoSlice::new(&buf),
-        ])
+        write_vectored_all(
+            &mut self.writer,
+            [IoSlice::new(&len_be), IoSlice::new(&buf)],
+        )
         .await
         .map_err(|e| PhantomError::Protocol(format!("Write message failed: {}", e)))?;
 
@@ -50,10 +50,10 @@ impl<W: AsyncWrite + Unpin> SessionWriter<W> {
         self.state.encrypt_in_place(&mut buf)?;
 
         let len_be = (buf.len() as u16).to_be_bytes();
-        write_vectored_all(&mut self.writer, [
-            IoSlice::new(&len_be),
-            IoSlice::new(&buf),
-        ])
+        write_vectored_all(
+            &mut self.writer,
+            [IoSlice::new(&len_be), IoSlice::new(&buf)],
+        )
         .await
         .map_err(|e| PhantomError::Protocol(format!("Write message failed: {}", e)))?;
 

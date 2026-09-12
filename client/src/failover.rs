@@ -154,6 +154,27 @@ impl FailoverManager {
         // Handled by health check loop resetting counters.
     }
 
+    /// Clear every server's failure counters without moving the active server.
+    ///
+    /// Used after a network change: the failures recorded while the phone had
+    /// no usable link say nothing about the servers themselves, and leaving
+    /// them set made the next health check trip the failover threshold and
+    /// migrate to a healthy server that was never broken.
+    pub fn reset_health(&self) {
+        let mut pool = self.write_pool();
+        let mut reset = 0;
+        for state in pool.states.iter_mut() {
+            if state.consecutive_failures != 0 || state.status != ServerStatus::Healthy {
+                state.consecutive_failures = 0;
+                state.status = ServerStatus::Healthy;
+                reset += 1;
+            }
+        }
+        if reset > 0 {
+            tracing::info!("Failover: health counters reset after network change");
+        }
+    }
+
     /// Swap the server pool and failover tuning in place.
     ///
     /// The currently selected server is preserved when it survives the reload,
@@ -202,7 +223,8 @@ impl FailoverManager {
     /// reload which adds servers starts being probed without a restart.
     pub async fn run_health_check_loop(self: Arc<Self>) {
         let mut interval_secs = self.tuning().health_check_interval;
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(interval_secs.max(1)));
+        let mut ticker =
+            tokio::time::interval(std::time::Duration::from_secs(interval_secs.max(1)));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;

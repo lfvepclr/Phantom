@@ -72,11 +72,24 @@ async fn start_inbound_front_with_auth(
                 Ok(s) => s,
                 Err(_) => break,
             };
-            let (config, failover, pool, stats) =
-                (config.clone(), failover.clone(), pool.clone(), stats.clone());
+            let (config, failover, pool, stats) = (
+                config.clone(),
+                failover.clone(),
+                pool.clone(),
+                stats.clone(),
+            );
+            let tcp_pool = std::sync::Arc::new(phantom_client::tcp_pool::TcpSessionPool::new());
             tokio::spawn(async move {
-                let _ =
-                    handle_inbound(stream, &config, &failover, &pool, client_secret, &stats).await;
+                let _ = handle_inbound(
+                    stream,
+                    &config,
+                    &failover,
+                    &pool,
+                    &tcp_pool,
+                    client_secret,
+                    &stats,
+                )
+                .await;
             });
         }
     });
@@ -171,7 +184,10 @@ async fn http_connect_tunnel_echo() {
     let inbound = start_inbound_front(server_addr, &server_key, &psk, client_key.secret).await;
 
     let mut stream = TcpStream::connect(inbound).await.expect("connect inbound");
-    let connect_req = format!("CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n", echo.addr, echo.addr);
+    let connect_req = format!(
+        "CONNECT {} HTTP/1.1\r\nHost: {}\r\n\r\n",
+        echo.addr, echo.addr
+    );
     stream
         .write_all(connect_req.as_bytes())
         .await
@@ -216,7 +232,10 @@ async fn http_absolute_get_rewritten_to_origin_form() {
         "GET http://{}/s?wd=phantom HTTP/1.1\r\nHost: {}\r\nProxy-Connection: keep-alive\r\nConnection: keep-alive\r\n\r\n",
         origin.addr, origin.addr
     );
-    stream.write_all(request.as_bytes()).await.expect("send GET");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("send GET");
 
     let response = tokio::time::timeout(Duration::from_secs(3), read_to_eof(&mut stream))
         .await
@@ -226,7 +245,11 @@ async fn http_absolute_get_rewritten_to_origin_form() {
         "expected 200, got: {}",
         response
     );
-    assert!(response.ends_with("rewritten-ok"), "body mismatch: {}", response);
+    assert!(
+        response.ends_with("rewritten-ok"),
+        "body mismatch: {}",
+        response
+    );
 
     // The origin must have seen the rewritten origin-form request.
     let head = origin.head_rx.await.expect("origin head captured");
@@ -274,7 +297,9 @@ async fn sniffing_dispatch_socks5_and_http_on_one_port() {
     // Connection B: HTTP CONNECT on the same port.
     let mut http = TcpStream::connect(inbound).await.expect("connect inbound");
     let connect_req = format!("CONNECT {} HTTP/1.1\r\n\r\n", echo.addr);
-    http.write_all(connect_req.as_bytes()).await.expect("send CONNECT");
+    http.write_all(connect_req.as_bytes())
+        .await
+        .expect("send CONNECT");
     let mut reply = Vec::new();
     let mut buf = [0u8; 1024];
     loop {
@@ -351,7 +376,10 @@ async fn socks5_handshake(
         sub.extend_from_slice(pass.as_bytes());
         stream.write_all(&sub).await.expect("sub-negotiation");
         let mut auth_reply = [0u8; 2];
-        stream.read_exact(&mut auth_reply).await.expect("auth reply");
+        stream
+            .read_exact(&mut auth_reply)
+            .await
+            .expect("auth reply");
         assert_eq!(auth_reply[0], 0x01);
         status = Some(auth_reply[1]);
     }
@@ -382,8 +410,7 @@ async fn socks5_rfc1929_auth_enforced() {
 
     // 2. Wrong password: method accepted, sub-negotiation fails.
     let mut s = TcpStream::connect(inbound).await.expect("connect");
-    let (method, status) =
-        socks5_handshake(&mut s, &[0x02], Some(("phantom", "wrong"))).await;
+    let (method, status) = socks5_handshake(&mut s, &[0x02], Some(("phantom", "wrong"))).await;
     assert_eq!(method, 0x02);
     assert_eq!(status, Some(0x01), "wrong password must fail auth");
     drop(s);
@@ -431,13 +458,23 @@ async fn http_basic_auth_enforced() {
 
     // 1. Missing header → 407 with Proxy-Authenticate challenge.
     let mut s = TcpStream::connect(inbound).await.expect("connect");
-    let req = format!("GET http://{}/ HTTP/1.1\r\nHost: {}\r\n\r\n", origin.addr, origin.addr);
+    let req = format!(
+        "GET http://{}/ HTTP/1.1\r\nHost: {}\r\n\r\n",
+        origin.addr, origin.addr
+    );
     s.write_all(req.as_bytes()).await.expect("send GET");
     let resp = tokio::time::timeout(Duration::from_secs(3), read_to_eof(&mut s))
         .await
         .expect("407 timed out");
-    assert!(resp.starts_with("HTTP/1.1 407"), "expected 407, got: {}", resp);
-    assert!(resp.contains("Proxy-Authenticate: Basic"), "missing challenge");
+    assert!(
+        resp.starts_with("HTTP/1.1 407"),
+        "expected 407, got: {}",
+        resp
+    );
+    assert!(
+        resp.contains("Proxy-Authenticate: Basic"),
+        "missing challenge"
+    );
 
     // 2. Wrong password → 407.
     let mut s = TcpStream::connect(inbound).await.expect("connect");
@@ -450,7 +487,11 @@ async fn http_basic_auth_enforced() {
     let resp = tokio::time::timeout(Duration::from_secs(3), read_to_eof(&mut s))
         .await
         .expect("407 timed out");
-    assert!(resp.starts_with("HTTP/1.1 407"), "expected 407, got: {}", resp);
+    assert!(
+        resp.starts_with("HTTP/1.1 407"),
+        "expected 407, got: {}",
+        resp
+    );
 
     // 3. Correct credentials → request forwarded, origin head captured.
     let mut s = TcpStream::connect(inbound).await.expect("connect");
@@ -463,7 +504,11 @@ async fn http_basic_auth_enforced() {
     let resp = tokio::time::timeout(Duration::from_secs(3), read_to_eof(&mut s))
         .await
         .expect("200 timed out");
-    assert!(resp.starts_with("HTTP/1.1 200"), "expected 200, got: {}", resp);
+    assert!(
+        resp.starts_with("HTTP/1.1 200"),
+        "expected 200, got: {}",
+        resp
+    );
     assert!(resp.ends_with("auth-ok"));
 
     // The credential header must never reach the origin.

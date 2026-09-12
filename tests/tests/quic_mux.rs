@@ -14,7 +14,9 @@ use phantom_client::quic_pool::QuicPool;
 use phantom_client::socks5::handle_socks5_connection;
 use phantom_core::crypto::{KeyPair, Psk};
 use phantom_core::transport::quic::{QuicAuth, create_server_endpoint};
-use phantom_core::{CipherPreference, ClientConfig, QuicConfig, ServerEntry, TransportProtocol};
+use phantom_core::{
+    CipherPreference, ClientConfig, QuicConfig, RulesConfig, ServerEntry, TransportProtocol,
+};
 use phantom_e2e::echo::{EchoMode, start_echo_server};
 use phantom_e2e::socks5::Socks5Client;
 use phantom_server::handler::handle_quic_connection;
@@ -91,6 +93,14 @@ async fn quic_tunnels_share_one_connection_without_crosstalk() {
             cipher: CipherPreference::Auto,
             protocol: TransportProtocol::Quic,
         }],
+        // Smart mode is direct-by-default now, and the echo target is a
+        // loopback IP with no domain to match the whitelist against: without
+        // this the flows would bypass the tunnel entirely and the handshake
+        // counter would stay at 0 while the payload assertions still passed.
+        rules: RulesConfig {
+            final_action: phantom_core::RuleAction::Proxy,
+            ..Default::default()
+        },
         ..Default::default()
     });
     let failover = Arc::new(FailoverManager::new(&config).expect("failover manager"));
@@ -109,6 +119,7 @@ async fn quic_tunnels_share_one_connection_without_crosstalk() {
                 Err(_) => break,
             };
             let (config, failover, pool) = (config.clone(), failover.clone(), pool.clone());
+            let tcp_pool = std::sync::Arc::new(phantom_client::tcp_pool::TcpSessionPool::new());
             let stats = stats.clone();
             tokio::spawn(async move {
                 let _ = handle_socks5_connection(
@@ -116,6 +127,7 @@ async fn quic_tunnels_share_one_connection_without_crosstalk() {
                     &config,
                     &failover,
                     &pool,
+                    &tcp_pool,
                     local_secret,
                     &stats,
                 )

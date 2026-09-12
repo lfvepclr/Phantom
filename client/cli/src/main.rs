@@ -305,17 +305,11 @@ mod tests {
     fn tun_cidr_parses_prefix_into_netmask() {
         assert_eq!(
             parse_tun_cidr("10.7.0.1/24").unwrap(),
-            (
-                Ipv4Addr::new(10, 7, 0, 1),
-                Ipv4Addr::new(255, 255, 255, 0)
-            )
+            (Ipv4Addr::new(10, 7, 0, 1), Ipv4Addr::new(255, 255, 255, 0))
         );
         assert_eq!(
             parse_tun_cidr("172.19.0.1/16").unwrap(),
-            (
-                Ipv4Addr::new(172, 19, 0, 1),
-                Ipv4Addr::new(255, 255, 0, 0)
-            )
+            (Ipv4Addr::new(172, 19, 0, 1), Ipv4Addr::new(255, 255, 0, 0))
         );
         assert_eq!(
             parse_tun_cidr("10.0.0.1/32").unwrap().1,

@@ -22,6 +22,7 @@ use crate::failover::FailoverManager;
 use crate::quic_pool::QuicPool;
 use crate::stats::TrafficStats;
 use crate::udp_relay::{UdpFlowChannels, establish_udp_flow_quic, establish_udp_flow_tcp};
+use crate::tcp_pool::TcpSessionPool;
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
@@ -33,6 +34,7 @@ pub async fn handle_socks5_connection(
     config: &ClientConfig,
     failover: &FailoverManager,
     quic_pool: &QuicPool,
+    tcp_pool: &Arc<TcpSessionPool>,
     local_secret: [u8; 32],
     stats: &Arc<TrafficStats>,
 ) -> Result<()> {
@@ -41,13 +43,66 @@ pub async fn handle_socks5_connection(
     negotiate_method(&mut socks5, config.client.proxy_auth.as_ref()).await?;
 
     // 2. SOCKS5 request
-    let (cmd, target) = read_request(&mut socks5).await?;
+    let (cmd, target, prerouted) = read_request(&mut socks5).await?;
     tracing::info!("SOCKS5 target: {} (cmd={:#x})", target, cmd);
 
     if cmd == SOCKS5_CMD_UDP_ASSOCIATE {
         return handle_udp_associate(socks5, config, failover, quic_pool, local_secret, stats)
             .await;
     }
+
+    // 2b. Routing decision (default is DIRECT — Phantom only tunnels what the
+    //     whitelist says needs it; see `crate::whitelist`).
+    //
+    //     The TUN transparent proxy reaches this listener for flows it has
+    //     *already* routed. It marks those requests (`ATYP_PREROUTED`) because
+    //     by the time the target is an IP here the domain context that drove
+    //     the original decision is gone — re-deciding would silently turn a
+    //     whitelisted destination back into a direct connection.
+    let (decision_domain, decision_ip) = match &target {
+        TargetAddr::Domain(d, _) => (Some(d.as_str()), None),
+        TargetAddr::IPv4(octets, _) => (None, Some(IpAddr::from(*octets))),
+        TargetAddr::IPv6(octets, _) => (None, Some(IpAddr::from(*octets))),
+    };
+    let target_port = match &target {
+        TargetAddr::Domain(_, p) | TargetAddr::IPv4(_, p) | TargetAddr::IPv6(_, p) => *p,
+    };
+    let decision = if prerouted {
+        // Only trusted for loopback callers (the TUN proxy), never for a
+        // LAN-shared proxy where a remote client could force the tunnel.
+        if !is_loopback_peer(&socks5) {
+            return Err(PhantomError::Protocol(
+                "pre-routed SOCKS5 request from a non-loopback peer".into(),
+            ));
+        }
+        // The TUN path already logged this decision; keep the relay quiet so
+        // one connection does not produce two route lines.
+        tracing::debug!("route {} -> PROXY (decided by TUN)", target);
+        crate::whitelist::RouteDecision {
+            action: phantom_core::RuleAction::Proxy,
+            reason: crate::whitelist::RouteReason::Whitelist,
+        }
+    } else {
+        let router = crate::whitelist::shared(config);
+        let decision = router.decide(decision_domain, decision_ip, target_port);
+        tracing::info!(
+            "route {} -> {} ({})",
+            target,
+            if decision.is_direct() {
+                "DIRECT"
+            } else {
+                "PROXY"
+            },
+            decision.reason.as_str()
+        );
+        decision
+    };
+
+    if decision.is_direct() {
+        stats.record_route_direct();
+        return handle_direct_connect(socks5, &target, stats).await;
+    }
+    stats.record_route_proxy();
 
     // 3. Select server via failover manager (owned snapshot: the pool is
     // hot-reloadable, so we must not hold its lock across the relay). The
@@ -61,15 +116,7 @@ pub async fn handle_socks5_connection(
     tracing::info!("Connecting to server {} ({})", server.name, server.address);
     match server.protocol {
         TransportProtocol::Tcp => {
-            let transport = TcpTransport::new(std::time::Duration::from_secs(10));
-            match establish_tunnel(
-                &transport,
-                &server,
-                &local_secret,
-                &target,
-                effective_cipher,
-            )
-            .await
+            match open_tcp_tunnel(tcp_pool, &server, &local_secret, &target, effective_cipher).await
             {
                 Ok((frame_reader, frame_writer, stream_id)) => {
                     tracing::info!(
@@ -154,6 +201,68 @@ pub async fn handle_socks5_connection(
                 }
             }
         }
+    }
+}
+
+/// Serve a SOCKS5 CONNECT locally, without touching the tunnel.
+///
+/// Used for the default (direct) route: domestic destinations connect from this
+/// machine using the local resolver, which is both faster and keeps the VPS's
+/// tiny uplink free.
+async fn handle_direct_connect(
+    mut socks5: TcpStream,
+    target: &TargetAddr,
+    stats: &Arc<TrafficStats>,
+) -> Result<()> {
+    let addr = match resolve_local(target).await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::info!("Direct connect failed -> {}: {}", target, e);
+            let _ = send_reply(&mut socks5, 0x04).await;
+            return Ok(());
+        }
+    };
+
+    let mut upstream = match TcpStream::connect(addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::info!("Direct connect failed -> {}: {}", target, e);
+            let _ = send_reply(&mut socks5, 0x05).await;
+            return Ok(());
+        }
+    };
+    crate::net_tune::tune(&upstream);
+    let bound = upstream
+        .local_addr()
+        .unwrap_or_else(|_| SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 0));
+    send_reply_addr(&mut socks5, 0x00, &bound).await?;
+    tracing::info!("Direct connection established -> {}", target);
+
+    let (up, down) = tokio::io::copy_bidirectional(&mut socks5, &mut upstream).await?;
+    stats.record_tcp_up(up);
+    stats.record_tcp_down(down);
+    Ok(())
+}
+
+/// Resolve a target for a **direct** (non-tunnelled) connection.
+///
+/// Domains are resolved with the *local* resolver on purpose: direct
+/// destinations are not censored, and local answers keep CDN locality. Proxied
+/// destinations never reach this function, so censored domains are never
+/// resolved locally (no poisoned cache entries).
+pub(crate) async fn resolve_local(target: &TargetAddr) -> std::io::Result<SocketAddr> {
+    match target {
+        TargetAddr::Domain(host, port) => {
+            let mut addrs = tokio::net::lookup_host((host.as_str(), *port)).await?;
+            addrs.next().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!("no address for {}", host),
+                )
+            })
+        }
+        TargetAddr::IPv4(octets, port) => Ok(SocketAddr::new(IpAddr::from(*octets), *port)),
+        TargetAddr::IPv6(octets, port) => Ok(SocketAddr::new(IpAddr::from(*octets), *port)),
     }
 }
 
@@ -270,7 +379,14 @@ pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 const SOCKS5_CMD_CONNECT: u8 = 0x01;
 const SOCKS5_CMD_UDP_ASSOCIATE: u8 = 0x03;
 
-async fn read_request(stream: &mut TcpStream) -> Result<(u8, TargetAddr)> {
+/// Phantom-internal address type: "the caller already applied the routing
+/// policy". Followed by a regular address type byte (0x01/0x04/0x03).
+///
+/// Used by the TUN transparent proxy when it reaches the local SOCKS5 ingress,
+/// which has no domain information left to re-derive the decision from.
+pub const ATYP_PREROUTED: u8 = 0x80;
+
+async fn read_request(stream: &mut TcpStream) -> Result<(u8, TargetAddr, bool)> {
     let mut header = [0u8; 4];
     stream
         .read_exact(&mut header)
@@ -294,7 +410,20 @@ async fn read_request(stream: &mut TcpStream) -> Result<(u8, TargetAddr)> {
     }
     let cmd = header[1];
 
-    let atyp = header[3];
+    // `ATYP_PREROUTED` is a Phantom-internal marker: the routing policy has
+    // already been applied upstream (TUN proxy), so the address that follows
+    // is relayed as-is instead of being judged again.
+    let mut prerouted = false;
+    let mut atyp = header[3];
+    if atyp == ATYP_PREROUTED {
+        prerouted = true;
+        let mut inner = [0u8; 1];
+        stream
+            .read_exact(&mut inner)
+            .await
+            .map_err(PhantomError::Io)?;
+        atyp = inner[0];
+    }
     let target = match atyp {
         0x01 => {
             let mut addr = [0u8; 4];
@@ -354,7 +483,16 @@ async fn read_request(stream: &mut TcpStream) -> Result<(u8, TargetAddr)> {
         }
     };
 
-    Ok((cmd, target))
+    Ok((cmd, target, prerouted))
+}
+
+/// Whether the SOCKS5 peer is on loopback (the only place the internal
+/// `ATYP_PREROUTED` marker is honoured).
+fn is_loopback_peer(stream: &TcpStream) -> bool {
+    stream
+        .peer_addr()
+        .map(|addr| addr.ip().is_loopback())
+        .unwrap_or(false)
 }
 
 async fn send_reply(stream: &mut TcpStream, reply: u8) -> Result<()> {
@@ -636,6 +774,73 @@ pub(crate) async fn establish_quic_tunnel(
     Ok((frame_reader, frame_writer, stream_id))
 }
 
+/// A tunnel ready to relay bytes: framed reader, framed writer, stream id.
+/// Public so integration tests (and future clients) can drive the same path the
+/// proxy uses instead of hand-rolling a handshake.
+pub type TcpTunnel = (
+    FrameReader<SessionReader<tokio::io::ReadHalf<TcpStream>>>,
+    FrameWriter<SessionWriter<tokio::io::WriteHalf<TcpStream>>>,
+    u32,
+);
+
+/// Open a TCP tunnel for `target`, reusing a pooled session when one is ready.
+///
+/// A cold tunnel costs two round trips before the first byte moves — TCP
+/// connect plus the Noise handshake. The pool keeps authenticated sessions
+/// waiting, so a flow that finds one starts relaying immediately and only pays
+/// the SYN/ACK inside the tunnel (roughly one round trip).
+///
+/// A pooled session that fails mid-SYN is dropped and the flow retries on a
+/// fresh connection. That is the half-open guard: the pool can be wrong about
+/// whether a session is still alive, but the *flow* never notices.
+pub async fn open_tcp_tunnel(
+    pool: &Arc<TcpSessionPool>,
+    server: &ServerEntry,
+    local_secret: &[u8; 32],
+    target: &TargetAddr,
+    cipher_preference: CipherPreference,
+) -> Result<TcpTunnel> {
+    // Top the pool back up for the *next* flow before this one consumes
+    // anything; the refill is spawned, so it never delays the caller.
+    pool.spawn_refill(server.clone(), *local_secret, cipher_preference);
+
+    if let Some(session) = pool.take(server, cipher_preference).await {
+        let idle_ms = session.idle_ms();
+        let mut frame_reader = FrameReader::new(session.reader);
+        let mut frame_writer = FrameWriter::new(session.writer);
+        match syn_handshake(&mut frame_reader, &mut frame_writer, server, target).await {
+            Ok(stream_id) => {
+                tracing::info!(
+                    "Tunnel established → {} (cipher={:?}, pooled session, idle {} ms)",
+                    target,
+                    cipher_preference,
+                    idle_ms
+                );
+                return Ok((frame_reader, frame_writer, stream_id));
+            }
+            Err(e) => {
+                // The session died while it waited (server restart, NAT rebind,
+                // idle timeout somewhere in the path). The flow simply pays the
+                // handshake the pool was meant to save it.
+                tracing::info!(
+                    "Pooled session unusable for {} ({e}); reconnecting cold",
+                    target
+                );
+            }
+        }
+    }
+
+    let transport = TcpTransport::new(std::time::Duration::from_secs(10));
+    establish_tunnel(
+        &transport,
+        server,
+        local_secret,
+        target,
+        cipher_preference,
+    )
+    .await
+}
+
 /// Shared tunnel bootstrap: send SYN, expect ACK/RST. Identical on both
 /// transports — only the message framing underneath differs.
 pub(crate) async fn syn_handshake<M: MessageRead, N: MessageWrite>(
@@ -663,7 +868,7 @@ pub(crate) async fn syn_handshake<M: MessageRead, N: MessageWrite>(
     Ok(stream_id)
 }
 
-fn decode_public_key(b64: &str) -> Result<[u8; 32]> {
+pub(crate) fn decode_public_key(b64: &str) -> Result<[u8; 32]> {
     let decoded = STANDARD
         .decode(b64.trim())
         .map_err(|e| PhantomError::Crypto(format!("Base64 decode failed: {}", e)))?;

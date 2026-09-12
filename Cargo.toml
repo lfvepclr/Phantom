@@ -62,7 +62,9 @@ quinn-hyphae = "0.1.0-beta.0"
 hyphae-handshake = "0.1.0-beta.0"
 
 # Raw socket options (SO_SNDBUF/SO_RCVBUF sized to the path BDP)
-socket2 = "0.5"
+# "all" exposes the cross-platform socket options (TCP keepalive retries here);
+# the default feature set only covers a subset.
+socket2 = { version = "0.5", features = ["all"] }
 libc = "0.2"
 
 # Logging

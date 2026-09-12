@@ -46,11 +46,27 @@ impl Transport for TcpTransport {
     async fn connect(&self, addr: &SocketAddr) -> Result<Self::Stream> {
         // socket2 path: the buffers must be set before connect() so the
         // SYN-carried window-scale factor already accounts for them.
-        let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
-        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).map_err(PhantomError::Io)?;
+        let domain = if addr.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket =
+            Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).map_err(PhantomError::Io)?;
         // Buffer failures are non-fatal: the kernel clamps over-large requests.
         let _ = socket.set_send_buffer_size(self.send_buffer);
         let _ = socket.set_recv_buffer_size(self.recv_buffer);
+        // Keep the tunnel socket honest across network changes. Without
+        // keepalive a socket whose path disappeared (Wi-Fi ⇄ cellular) stays
+        // "established" until the OS TCP retransmission timeout — minutes in
+        // which the client believes it is connected but nothing moves.
+        // 15 s idle + 3 probes fails such a socket in well under a minute.
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(15))
+            .with_interval(Duration::from_secs(5));
+        #[cfg(not(any(target_os = "openbsd", target_os = "redox")))]
+        let keepalive = keepalive.with_retries(3);
+        let _ = socket.set_tcp_keepalive(&keepalive);
         socket.set_nonblocking(true).map_err(PhantomError::Io)?;
 
         match socket.connect(&(*addr).into()) {
@@ -73,9 +89,7 @@ impl Transport for TcpTransport {
             return Err(PhantomError::Io(err));
         }
 
-        stream
-            .set_nodelay(self.nodelay)
-            .map_err(PhantomError::Io)?;
+        stream.set_nodelay(self.nodelay).map_err(PhantomError::Io)?;
 
         #[cfg(target_os = "linux")]
         {
@@ -99,8 +113,13 @@ impl TcpListener {
     pub async fn bind(addr: &SocketAddr) -> Result<Self> {
         // socket2 listener: SO_REUSEADDR + pre-sized buffers; accepted sockets
         // inherit SO_SNDBUF/SO_RCVBUF from the listener on Linux and macOS.
-        let domain = if addr.is_ipv4() { Domain::IPV4 } else { Domain::IPV6 };
-        let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).map_err(PhantomError::Io)?;
+        let domain = if addr.is_ipv4() {
+            Domain::IPV4
+        } else {
+            Domain::IPV6
+        };
+        let socket =
+            Socket::new(domain, Type::STREAM, Some(Protocol::TCP)).map_err(PhantomError::Io)?;
         socket.set_reuse_address(true).map_err(PhantomError::Io)?;
         let _ = socket.set_send_buffer_size(DEFAULT_SOCKET_BUFFER);
         let _ = socket.set_recv_buffer_size(DEFAULT_SOCKET_BUFFER);
@@ -244,7 +263,11 @@ mod tests {
         match result {
             Ok((_, bound)) => panic!("expected an error, bound {} instead", bound),
             Err(PhantomError::Config(msg)) => {
-                assert!(msg.contains("No free TCP port"), "unexpected message: {}", msg)
+                assert!(
+                    msg.contains("No free TCP port"),
+                    "unexpected message: {}",
+                    msg
+                )
             }
             Err(other) => panic!("expected Config error, got {:?}", other),
         }

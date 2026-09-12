@@ -45,6 +45,25 @@ const LOG_BUFFER_CAPACITY: usize = 200;
 static LOG_BUFFER: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static LOG_CURSOR: Mutex<u64> = Mutex::new(0);
 
+/// Live counters of the running tunnel, shared with the UI.
+///
+/// The tunnel owns the only copy that matters (it is created on `start`), so
+/// the UI polls a clone instead of keeping its own bookkeeping. `None` until
+/// the first successful start.
+static TRAFFIC_STATS: Mutex<Option<std::sync::Arc<crate::stats::TrafficStats>>> =
+    Mutex::new(None);
+
+/// Long-lived datapath objects the UI process may need to poke when the phone
+/// switches networks. They are created inside the tunnel task, so the only way
+/// to reach them later is to publish them here.
+static SHARED_DNS: Mutex<Option<std::sync::Arc<crate::dns::DnsProxy>>> = Mutex::new(None);
+static SHARED_QUIC: Mutex<Option<std::sync::Arc<crate::quic_pool::QuicPool>>> =
+    Mutex::new(None);
+static SHARED_TCP_POOL: Mutex<Option<std::sync::Arc<crate::tcp_pool::TcpSessionPool>>> =
+    Mutex::new(None);
+static SHARED_FAILOVER: Mutex<Option<std::sync::Arc<crate::failover::FailoverManager>>> =
+    Mutex::new(None);
+
 fn set_status(code: i32) {
     TUNNEL_STATUS.store(code, Ordering::SeqCst);
 }
@@ -91,7 +110,10 @@ fn build_config_from_uri(uri: &str, mode: &str) -> Result<ClientConfig, i32> {
         servers: vec![server_entry],
         client: ClientSettings {
             listen: "127.0.0.1:11080".to_string(),
-            dns: "tls://8.8.8.8:853".to_string(),
+            // Tunnel resolver for whitelisted domains; the URI form keeps the
+            // direct resolver at the `ClientSettings` default (domestic).
+            dns: "8.8.8.8:53".to_string(),
+            dns_direct: phantom_core::ClientSettings::default().dns_direct,
             mode: proxy_mode,
             cipher: Default::default(),
             metrics_listen: "127.0.0.1:9150".to_string(),
@@ -178,6 +200,118 @@ pub fn android_get_logs(since_cursor: u64) -> (Vec<String>, u64) {
     (lines, *cursor)
 }
 
+/// Snapshot of the live traffic counters as a JSON object.
+///
+/// Returns JSON (rather than a wide tuple) so the binding stays stable when a
+/// counter is added, and so the UI can render it without positional parsing:
+/// `{"up":<tcp bytes up>,"down":<tcp bytes down>,"udp_up":…,"udp_down":…,
+///   "conns":…,"route_direct":…,"route_proxy":…}`.
+///
+/// All zeroes when no tunnel has been started yet.
+pub fn android_get_stats_json() -> String {
+    let stats = TRAFFIC_STATS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let Some(stats) = stats else {
+        return "{\"up\":0,\"down\":0,\"udp_up\":0,\"udp_down\":0,\"conns\":0,\"route_direct\":0,\"route_proxy\":0}"
+            .to_string();
+    };
+    use std::sync::atomic::Ordering;
+    format!(
+        "{{\"up\":{},\"down\":{},\"udp_up\":{},\"udp_down\":{},\"conns\":{},\"route_direct\":{},\"route_proxy\":{}}}",
+        stats.tcp_bytes_up.load(Ordering::Relaxed),
+        stats.tcp_bytes_down.load(Ordering::Relaxed),
+        stats.udp_bytes_up.load(Ordering::Relaxed),
+        stats.udp_bytes_down.load(Ordering::Relaxed),
+        stats.tcp_connections.load(Ordering::Relaxed),
+        stats.route_direct.load(Ordering::Relaxed),
+        stats.route_proxy.load(Ordering::Relaxed),
+    )
+}
+
+/// Tell the datapath that the phone's underlying network changed.
+///
+/// Called by the HarmonyOS VPN extension when the OS reports a connectivity
+/// change (Wi-Fi ⇄ cellular, or a new Wi-Fi network). Everything established
+/// over the old link is unusable from that moment on:
+///
+/// * TCP flows born in the previous epoch are reset so the apps retry on the
+///   new link instead of waiting for their own timeouts;
+/// * the shared DNS-over-tunnel flow is dropped so the next query rebuilds it;
+/// * cached QUIC connections are discarded (they are bound to the old source
+///   address);
+/// * failover health counters are cleared, because failures recorded while the
+///   radio was switching say nothing about the servers.
+///
+/// Returns the new epoch so the caller can log it.
+pub fn android_notify_network_change() -> u64 {
+    let epoch = crate::tun::bump_network_epoch();
+    if let Some(dns) = SHARED_DNS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .cloned()
+    {
+        dns.set_tunnel_sender(None);
+    }
+    if let Some(failover) = SHARED_FAILOVER
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .cloned()
+    {
+        failover.reset_health();
+    }
+    if let Some(quic) = SHARED_QUIC
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .cloned()
+    {
+        // The pool is only mutated behind an async lock; a plain blocking
+        // acquire here would need a runtime, so spawn the cleanup instead.
+        let rt = RUNTIME.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(rt) = rt.as_ref() {
+            rt.spawn(async move { quic.clear().await });
+        }
+    }
+    if let Some(tcp_pool) = SHARED_TCP_POOL
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .cloned()
+    {
+        // Same reasoning as the QUIC pool: a handshaked session is bound to the
+        // source address of the network that no longer exists.
+        let rt = RUNTIME.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(rt) = rt.as_ref() {
+            rt.spawn(async move { tcp_pool.clear().await });
+        }
+    }
+    tracing::info!("network changed (epoch {epoch}): tunnel flows invalidated");
+    epoch
+}
+
+/// Enable (`Some(path)`) or disable (`None`) the opt-in TUN trace.
+///
+/// Returns 0 on success, -1 when the file could not be created.
+pub fn android_set_trace_path(path: Option<&str>) -> i32 {
+    match crate::tun_trace::set_path(path) {
+        Ok(()) => {
+            tracing::info!(
+                "TUN trace {}",
+                match path {
+                    Some(p) => format!("enabled -> {p}"),
+                    None => "disabled".to_string(),
+                }
+            );
+            0
+        }
+        Err(e) => {
+            tracing::warn!("TUN trace could not open {:?}: {}", path, e);
+            -1
+        }
+    }
+}
+
 /// Start the tunnel using a `phantom://` URI string and mode.
 ///
 /// # Safety
@@ -245,6 +379,13 @@ fn start_with_config(fd: RawFd, config: ClientConfig) -> i32 {
     // ring buffer so the Kotlin UI can display them.  Only install once.
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
+        // The UI renders raw log text, so ANSI colour escapes would show up as
+        // literal "[2m[32m" garbage. Keep the output plain.
+        .with_ansi(false)
+        .with_target(false)
+        // The phone shows this in a narrow, wrapping log pane; a full RFC3339
+        // timestamp eats half the line. ArkTS prepends a short local HH:MM:SS.
+        .without_time()
         .with_writer(LogBufferWriter::new)
         .try_init();
 
@@ -334,8 +475,14 @@ fn start_with_config(fd: RawFd, config: ClientConfig) -> i32 {
             failover_health.run_health_check_loop().await;
         });
 
+        // Publish for `android_notify_network_change`.
+        *SHARED_FAILOVER.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(std::sync::Arc::clone(&failover));
+
         // Shared counters: SOCKS5 and TUN traffic land in the same instance.
         let stats = crate::stats::TrafficStats::new();
+        // Publish the counters so the UI can show live throughput.
+        *TRAFFIC_STATS.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::sync::Arc::clone(&stats));
 
         // 2. Start local SOCKS5 proxy (listens on loopback).
         let socks5_addr = match config.client.listen.parse() {
@@ -366,6 +513,33 @@ fn start_with_config(fd: RawFd, config: ClientConfig) -> i32 {
             set_status(2); // running
 
             let quic_pool = std::sync::Arc::new(crate::quic_pool::QuicPool::new());
+            *SHARED_QUIC.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(std::sync::Arc::clone(&quic_pool));
+            // Ready-to-use TCP sessions: on the phone the panel is opened in
+            // bursts (a page load, an app launch), and each new flow would
+            // otherwise pay a connect plus a Noise handshake first.
+            let tcp_pool = std::sync::Arc::new(crate::tcp_pool::TcpSessionPool::new());
+            *SHARED_TCP_POOL.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(std::sync::Arc::clone(&tcp_pool));
+            // Warm one session up front: the first page after "connect" is when
+            // a saved round trip is most visible.
+            if let Some(server) = config_clone
+                .servers
+                .first()
+                .filter(|s| s.protocol == phantom_core::TransportProtocol::Tcp)
+                .cloned()
+            {
+                let cipher = phantom_core::CipherPreference::effective_for(
+                    server.cipher,
+                    config_clone.client.cipher,
+                );
+                // The pooled session is a datapath object, not a per-flow
+                // identity: flows keep generating their own key pair below.
+                match phantom_core::crypto::KeyPair::generate() {
+                    Ok(kp) => tcp_pool.spawn_refill(server, kp.secret, cipher),
+                    Err(e) => tracing::warn!("TCP pool prewarm key generation failed: {e}"),
+                }
+            }
             let stats = stats_socks5;
             loop {
                 let (stream, peer) = match listener.accept().await {
@@ -378,6 +552,7 @@ fn start_with_config(fd: RawFd, config: ClientConfig) -> i32 {
                 let cfg = config_clone.clone();
                 let fo = std::sync::Arc::clone(&failover_socks5);
                 let qp = std::sync::Arc::clone(&quic_pool);
+                let tp = std::sync::Arc::clone(&tcp_pool);
                 let st = std::sync::Arc::clone(&stats);
                 tokio::spawn(async move {
                     let local_secret = match phantom_core::crypto::KeyPair::generate() {
@@ -389,6 +564,7 @@ fn start_with_config(fd: RawFd, config: ClientConfig) -> i32 {
                         &cfg,
                         &fo,
                         &qp,
+                        &tp,
                         local_secret,
                         &st,
                     )
@@ -417,7 +593,8 @@ fn start_with_config(fd: RawFd, config: ClientConfig) -> i32 {
             let mut proxy =
                 crate::tun::TunProxy::new(device, socks5_addr)
                     .with_mode(config_tun.client.mode)
-                    .with_stats(stats_tun);
+                    .with_stats(stats_tun)
+                    .with_whitelist(crate::whitelist::shared(&config_tun).whitelist());
 
             if let Some(server) = config_tun.servers.first() {
                 proxy = proxy.with_server(server.clone(), tun_secret);
@@ -431,16 +608,30 @@ fn start_with_config(fd: RawFd, config: ClientConfig) -> i32 {
                 );
             }
 
-            if let Some(dns_addr) = crate::dns::parse_dns_addr(&config_tun.client.dns) {
-                match crate::dns::DnsProxy::new(dns_addr).await {
+            let tunnel_dns = crate::dns::parse_dns_addr(&config_tun.client.dns);
+            let direct_dns = crate::dns::parse_dns_addr(&config_tun.client.dns_direct);
+            if let (Some(tunnel_dns), Some(direct_dns)) = (tunnel_dns, direct_dns) {
+                match crate::dns::DnsProxy::new(tunnel_dns, direct_dns).await {
                     Ok(dns) => {
+                        let dns = std::sync::Arc::new(dns);
+                        *SHARED_DNS.lock().unwrap_or_else(|e| e.into_inner()) = Some(dns.clone());
                         proxy = proxy.with_dns(dns);
-                        tracing::info!("DNS hijack enabled, upstream = {}", dns_addr);
+                        tracing::info!(
+                            "DNS hijack enabled, tunnel resolver = {}, direct resolver = {}",
+                            tunnel_dns,
+                            direct_dns
+                        );
                     }
                     Err(e) => {
                         tracing::warn!("DNS proxy init failed: {}", e);
                     }
                 }
+            } else {
+                tracing::warn!(
+                    "Invalid DNS config (client.dns = '{}', client.dns_direct = '{}'), DNS hijack disabled",
+                    config_tun.client.dns,
+                    config_tun.client.dns_direct
+                );
             }
 
             tracing::info!("Android TUN proxy started on fd {}", fd);
@@ -476,6 +667,13 @@ pub extern "C" fn phantom_android_stop() -> i32 {
     if let Some(rt) = RUNTIME.lock().unwrap().take() {
         rt.shutdown_background();
     }
+    // Drop the shared datapath handles with the runtime: they belong to the
+    // tunnel that just stopped, and a stale DNS/QUIC handle would be applied to
+    // the next session's network change.
+    *SHARED_DNS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *SHARED_QUIC.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *SHARED_TCP_POOL.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    *SHARED_FAILOVER.lock().unwrap_or_else(|e| e.into_inner()) = None;
     set_status(0); // idle
     clear_error();
     tracing::info!("Android tunnel stopped");

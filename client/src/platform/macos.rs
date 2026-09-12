@@ -66,6 +66,50 @@ fn clear_error() {
 /// Single source of truth — Swift queries the port via FFI.
 const DEFAULT_SOCKS5_ADDR: &str = "127.0.0.1:11080";
 
+/// Effective UID of this process.
+///
+/// Both TUN device creation (utun) and `networksetup -setsocksfirewallproxy`
+/// need admin rights on macOS. `sudo open Phantom.app` looks like it should
+/// work but does not: `open` hands the bundle to LaunchServices, which starts
+/// the app as the logged-in user. Launching the executable under sudo
+/// (`sudo Phantom.app/Contents/MacOS/Phantom`) is what actually elevates.
+fn effective_uid() -> u32 {
+    // SAFETY: geteuid() cannot fail.
+    unsafe { libc::geteuid() }
+}
+
+/// Replace the extra proxy-whitelist entries shown in the app's "分流白名单"
+/// editor. Accepts newline/comma/space separated domains; `#` comments and
+/// blank lines are ignored. Call before `phantom_macos_start_with_uri`.
+///
+/// # Safety
+/// `input` must point to `input_len` valid bytes (or be null with len 0).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn phantom_macos_set_proxy_domains(
+    input: *const u8,
+    input_len: usize,
+) -> i32 {
+    if input.is_null() || input_len == 0 {
+        crate::whitelist::preset_extra_domains(Vec::new());
+        return 0;
+    }
+    // SAFETY: caller guarantees `input_len` readable bytes.
+    let bytes = unsafe { std::slice::from_raw_parts(input, input_len) };
+    let text = match std::str::from_utf8(bytes) {
+        Ok(t) => t,
+        Err(_) => return -1,
+    };
+    let domains: Vec<String> = text
+        .split(['\n', '\r', ',', ' ', '\t'])
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && !s.starts_with('#'))
+        .map(|s| s.to_string())
+        .collect();
+    tracing::info!("Proxy whitelist: {} user-supplied entr(ies)", domains.len());
+    crate::whitelist::preset_extra_domains(domains);
+    0
+}
+
 /// Start the tunnel using a `phantom://` URI + mode string.
 ///
 /// The `input` parameter is `"phantom://key@host:port|mode"` where `mode`
@@ -104,7 +148,10 @@ pub unsafe extern "C" fn phantom_macos_start_with_uri(input: *const u8, input_le
         servers: vec![server_entry],
         client: ClientSettings {
             listen: DEFAULT_SOCKS5_ADDR.to_string(),
-            dns: "tls://8.8.8.8:853".to_string(),
+            // Tunnel resolver for whitelisted domains; the URI form keeps the
+            // direct resolver at the `ClientSettings` default (domestic).
+            dns: "8.8.8.8:53".to_string(),
+            dns_direct: phantom_core::ClientSettings::default().dns_direct,
             mode,
             cipher: Default::default(),
             metrics_listen: "127.0.0.1:9150".to_string(),
@@ -150,11 +197,27 @@ fn start_with_config(config: ClientConfig) -> i32 {
     // subsequent calls are no-ops (the global subscriber is already set).
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
+        // The Swift log panel renders raw text, so ANSI colour escapes would
+        // show up as literal "[2m[32m" garbage. Keep the output plain.
+        .with_ansi(false)
+        .with_target(false)
         .with_writer(LogBufferWriter::new)
         .try_init();
 
     set_status(1); // starting
     clear_error();
+    // Rebuild routing state so edited whitelist entries apply on every start.
+    crate::whitelist::rebuild(&config);
+    if effective_uid() != 0 {
+        push_log(
+            "[INFO] Running as a normal user: SOCKS5 + system proxy mode (no admin \
+             rights needed — the system proxy is set with networksetup, exactly \
+             like other menu-bar proxy apps). TUN transparent mode is skipped \
+             because it needs root; relaunch with \
+             `sudo <App>/Contents/MacOS/Phantom` only if you want transparent \
+             proxying.",
+        );
+    }
     push_log(&format!(
         "[INFO] Starting tunnel (mode={:?}) ...",
         config.client.mode
@@ -261,6 +324,21 @@ fn start_with_config(config: ClientConfig) -> i32 {
             let _ = ready_tx2.send(Ok(()));
 
             let quic_pool = std::sync::Arc::new(crate::quic_pool::QuicPool::new());
+            // Ready-to-use TCP sessions, so a page load does not pay a connect
+            // plus a Noise handshake on every new connection.
+            let tcp_pool = std::sync::Arc::new(crate::tcp_pool::TcpSessionPool::new());
+            if let Some(server) = config_clone
+                .servers
+                .first()
+                .filter(|s| s.protocol == phantom_core::TransportProtocol::Tcp)
+                .cloned()
+            {
+                let cipher = phantom_core::CipherPreference::effective_for(
+                    server.cipher,
+                    config_clone.client.cipher,
+                );
+                tcp_pool.spawn_refill(server, local_secret, cipher);
+            }
             let stats = stats_socks5;
             loop {
                 let (stream, peer) = match listener.accept().await {
@@ -274,10 +352,11 @@ fn start_with_config(config: ClientConfig) -> i32 {
                 let fo = std::sync::Arc::clone(&failover_socks5);
                 let secret = local_secret;
                 let qp = std::sync::Arc::clone(&quic_pool);
+                let tp = std::sync::Arc::clone(&tcp_pool);
                 let st = std::sync::Arc::clone(&stats);
                 tokio::spawn(async move {
                     if let Err(e) = crate::http_proxy::handle_inbound(
-                        stream, &cfg, &fo, &qp, secret, &st,
+                        stream, &cfg, &fo, &qp, &tp, secret, &st,
                     )
                     .await
                     {
@@ -289,13 +368,30 @@ fn start_with_config(config: ClientConfig) -> i32 {
 
         // 2. Start TUN transparent proxy.
         let tun_task = tokio::spawn(async move {
+            // Normal menu-bar mode: the app runs as the logged-in user and only
+            // SOCKS5 + the system proxy are used (no TUN, hence no root needed).
+            // Transparent mode is opt-in by launching the executable as root.
+            if effective_uid() != 0 {
+                tracing::info!(
+                    "TUN transparent mode skipped (not root); serving SOCKS5 + system proxy"
+                );
+                return;
+            }
             let device = match crate::tun::TunDevice::create() {
                 Ok(d) => d,
                 Err(e) => {
-                    let msg = format!("TUN creation failed: {}", e);
-                    tracing::error!("{}", msg);
-                    set_error(msg);
-                    let _ = ready_tx.send(Err("TUN creation failed".to_string()));
+                    // Non-fatal on purpose: without TUN the client still serves
+                    // SOCKS5 on 127.0.0.1:11080, which is exactly what the
+                    // system proxy points at. Treating this as fatal used to
+                    // leave the app in an "Error" state — and skip enabling the
+                    // system proxy — even though the tunnel data path was
+                    // perfectly healthy.
+                    let msg = format!(
+                        "TUN unavailable ({}); continuing with SOCKS5 + system proxy",
+                        e
+                    );
+                    tracing::warn!("{}", msg);
+                    push_log(&format!("[WARN] {}", msg));
                     return;
                 }
             };
@@ -311,7 +407,8 @@ fn start_with_config(config: ClientConfig) -> i32 {
             let mut proxy =
                 crate::tun::TunProxy::new(device, socks5_addr)
                     .with_mode(config.client.mode)
-                    .with_stats(stats);
+                    .with_stats(stats)
+                    .with_whitelist(crate::whitelist::shared(&config).whitelist());
 
             if let Some(server) = config.servers.first() {
                 proxy = proxy.with_server(server.clone(), tun_secret);
@@ -325,16 +422,28 @@ fn start_with_config(config: ClientConfig) -> i32 {
                 );
             }
 
-            if let Some(dns_addr) = crate::dns::parse_dns_addr(&config.client.dns) {
-                match crate::dns::DnsProxy::new(dns_addr).await {
+            let tunnel_dns = crate::dns::parse_dns_addr(&config.client.dns);
+            let direct_dns = crate::dns::parse_dns_addr(&config.client.dns_direct);
+            if let (Some(tunnel_dns), Some(direct_dns)) = (tunnel_dns, direct_dns) {
+                match crate::dns::DnsProxy::new(tunnel_dns, direct_dns).await {
                     Ok(dns) => {
-                        proxy = proxy.with_dns(dns);
-                        tracing::info!("DNS hijack enabled, upstream = {}", dns_addr);
+                        proxy = proxy.with_dns(std::sync::Arc::new(dns));
+                        tracing::info!(
+                            "DNS hijack enabled, tunnel resolver = {}, direct resolver = {}",
+                            tunnel_dns,
+                            direct_dns
+                        );
                     }
                     Err(e) => {
                         tracing::warn!("DNS proxy init failed: {}", e);
                     }
                 }
+            } else {
+                tracing::warn!(
+                    "Invalid DNS config (client.dns = '{}', client.dns_direct = '{}'), DNS hijack disabled",
+                    config.client.dns,
+                    config.client.dns_direct
+                );
             }
 
             tracing::info!("TUN proxy started");
@@ -477,9 +586,7 @@ pub extern "C" fn phantom_macos_get_status() -> i32 {
 pub extern "C" fn phantom_macos_get_last_error() -> *mut std::ffi::c_char {
     let msg = LAST_ERROR.lock().unwrap_or_else(|e| e.into_inner()).clone();
     // SAFETY: same contract as `phantom_macos_get_logs`.
-    std::ffi::CString::new(msg)
-        .unwrap_or_default()
-        .into_raw()
+    std::ffi::CString::new(msg).unwrap_or_default().into_raw()
 }
 
 /// Return the utun fd so Swift can optionally inspect it.

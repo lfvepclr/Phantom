@@ -26,6 +26,20 @@ impl QuicPool {
         Self::default()
     }
 
+    /// Drop every cached connection.
+    ///
+    /// Called when the OS reports the underlying network changed (Wi-Fi ⇄
+    /// cellular): a QUIC connection is bound to the old source address, so
+    /// reusing it would keep timing out instead of reconnecting on the new
+    /// link. Tearing the pool down makes the next stream build a fresh one.
+    pub async fn clear(&self) {
+        let mut guard = self.entries.lock().await;
+        if !guard.is_empty() {
+            tracing::info!("QUIC pool cleared ({} connection(s))", guard.len());
+            guard.clear();
+        }
+    }
+
     /// Open a fresh bi-directional stream on the pooled connection for
     /// `server`, connecting (or reconnecting after a close) as needed.
     pub async fn open_bi(
@@ -38,9 +52,9 @@ impl QuicPool {
         let conn = self
             .connection(server, local_secret, cipher, connect_timeout)
             .await?;
-        conn.open_bi().await.map_err(|e| {
-            PhantomError::Io(std::io::Error::new(std::io::ErrorKind::Other, e))
-        })
+        conn.open_bi()
+            .await
+            .map_err(|e| PhantomError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))
     }
 
     async fn connection(
@@ -118,7 +132,10 @@ pub async fn connect_once(
         .await
         .map_err(|_| PhantomError::Timeout)?
         .map_err(|e| {
-            PhantomError::Io(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, e))
+            PhantomError::Io(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                e,
+            ))
         })
 }
 

@@ -11,6 +11,10 @@ pub struct TrafficStats {
     pub udp_bytes_up: AtomicU64,
     pub udp_bytes_down: AtomicU64,
     pub tcp_connections: AtomicU64,
+    /// Routing decisions, so "is my traffic really going direct?" is a metric
+    /// rather than a guess (`phantom_route_direct_total`).
+    pub route_direct: AtomicU64,
+    pub route_proxy: AtomicU64,
     pub udp_datagrams_up: AtomicU64,
     pub udp_datagrams_down: AtomicU64,
 }
@@ -32,6 +36,14 @@ impl TrafficStats {
         self.tcp_connections.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn record_route_direct(&self) {
+        self.route_direct.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_route_proxy(&self) {
+        self.route_proxy.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn record_udp_up(&self, bytes: u64) {
         self.udp_bytes_up.fetch_add(bytes, Ordering::Relaxed);
         self.udp_datagrams_up.fetch_add(1, Ordering::Relaxed);
@@ -50,6 +62,8 @@ impl TrafficStats {
              # HELP phantom_udp_bytes_up Total UDP bytes sent upstream\n# TYPE phantom_udp_bytes_up counter\nphantom_udp_bytes_up {}\n\
              # HELP phantom_udp_bytes_down Total UDP bytes received downstream\n# TYPE phantom_udp_bytes_down counter\nphantom_udp_bytes_down {}\n\
              # HELP phantom_tcp_connections Total TCP connections\n# TYPE phantom_tcp_connections counter\nphantom_tcp_connections {}\n\
+             # HELP phantom_route_direct_total Connections routed directly (bypassing the tunnel)\n# TYPE phantom_route_direct_total counter\nphantom_route_direct_total {}\n\
+             # HELP phantom_route_proxy_total Connections routed through the tunnel\n# TYPE phantom_route_proxy_total counter\nphantom_route_proxy_total {}\n\
              # HELP phantom_udp_datagrams_up Total UDP datagrams sent upstream\n# TYPE phantom_udp_datagrams_up counter\nphantom_udp_datagrams_up {}\n\
              # HELP phantom_udp_datagrams_down Total UDP datagrams received downstream\n# TYPE phantom_udp_datagrams_down counter\nphantom_udp_datagrams_down {}\n",
             self.tcp_bytes_up.load(Ordering::Relaxed),
@@ -57,6 +71,8 @@ impl TrafficStats {
             self.udp_bytes_up.load(Ordering::Relaxed),
             self.udp_bytes_down.load(Ordering::Relaxed),
             self.tcp_connections.load(Ordering::Relaxed),
+            self.route_direct.load(Ordering::Relaxed),
+            self.route_proxy.load(Ordering::Relaxed),
             self.udp_datagrams_up.load(Ordering::Relaxed),
             self.udp_datagrams_down.load(Ordering::Relaxed),
         )

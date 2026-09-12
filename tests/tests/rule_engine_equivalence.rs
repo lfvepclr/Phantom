@@ -296,6 +296,7 @@ fn gen_ruleset(rng: &mut StdRng) -> RulesConfig {
     RulesConfig {
         rules,
         final_action,
+        builtin_proxy_whitelist: true,
     }
 }
 
@@ -435,6 +436,7 @@ fn fuzz_priority_edge_cases() {
         let cfg = RulesConfig {
             rules,
             final_action: RuleAction::Proxy,
+            builtin_proxy_whitelist: true,
         };
         let prod = RuleEngine::from_config(&cfg).unwrap();
         let reference = RefEngine::from_config(&cfg);
@@ -465,6 +467,7 @@ fn empty_ruleset_returns_final_action() {
         let cfg = RulesConfig {
             rules: vec![],
             final_action: action,
+            builtin_proxy_whitelist: true,
         };
         let prod = RuleEngine::from_config(&cfg).unwrap();
         let reference = RefEngine::from_config(&cfg);

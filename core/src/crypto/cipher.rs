@@ -1,5 +1,38 @@
 use cfg_if::cfg_if;
 
+/// Is a hardware AES unit usable in *this* build?
+///
+/// Two independent things have to hold, and confusing them is the classic way
+/// to end up with software-speed AES while believing the CPU is being used:
+///
+/// 1. the `aes` crate ships its ARMv8 intrinsics backend only when the crate is
+///    compiled with `--cfg=aes_armv8` (see `.cargo/config.toml`);
+/// 2. the backend may only *run* where the CPU has the `aes` extension.
+///
+/// Point 2 is usually answered at runtime, but the probe is per-platform, and
+/// `cpufeatures` (used by the `aes`/`polyval` crates) has no implementation for
+/// every target: on anything it does not know — HarmonyOS
+/// (`target_os = "ohos"`) is one — detection reports `false` and the soft
+/// backend is chosen even though the intrinsics are compiled in. Enabling the
+/// feature at compile time (`-C target-feature=+aes`) answers the question
+/// without any probe; that is how the HarmonyOS client reaches the hardware
+/// path, on the grounds that every ARMv8-A SoC running HarmonyOS NEXT ships the
+/// crypto extensions.
+pub fn hardware_aes_available() -> bool {
+    if cfg!(target_feature = "aes") {
+        return true;
+    }
+    cfg_if! {
+        if #[cfg(any(target_arch = "x86_64", target_arch = "x86"))] {
+            std::arch::is_x86_feature_detected!("aes")
+        } else if #[cfg(target_arch = "aarch64")] {
+            std::arch::is_aarch64_feature_detected!("aes")
+        } else {
+            false
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum CipherSuite {
@@ -32,14 +65,14 @@ impl CipherSuite {
             if #[cfg(any(target_arch = "x86_64", target_arch = "x86"))] {
                 // The aes crate's x86 AES-NI backend is enabled by default
                 // (runtime-detected), so the CPU probe alone is sufficient.
-                if is_x86_feature_detected!("aes") {
+                if hardware_aes_available() {
                     return CipherSuite::Aes256Gcm;
                 }
             }
         }
         cfg_if! {
             if #[cfg(target_arch = "aarch64")] {
-                if cfg!(aes_armv8) && std::arch::is_aarch64_feature_detected!("aes") {
+                if cfg!(aes_armv8) && hardware_aes_available() {
                     return CipherSuite::Aes256Gcm;
                 }
             }
@@ -130,6 +163,31 @@ mod tests {
         }
         assert_eq!(CipherSuite::from_u8(0x00), None);
         assert_eq!(CipherSuite::from_u8(0xFF), None);
+    }
+
+    /// `auto_detect` may only promise AES when this build can execute the
+    /// intrinsics: reporting AES without them silently drops to the ~30x slower
+    /// software backend while still looking like a hardware build.
+    #[test]
+    fn auto_detect_never_claims_aes_without_hardware_aes() {
+        match CipherSuite::auto_detect() {
+            CipherSuite::Aes256Gcm => assert!(
+                hardware_aes_available(),
+                "AES was selected although no hardware AES unit is usable"
+            ),
+            CipherSuite::ChaCha20Poly => {}
+            other => panic!("auto_detect must pick AES or ChaCha, got {other}"),
+        }
+    }
+
+    /// Apple silicon always has the crypto extensions, and the macOS build sets
+    /// `--cfg=aes_armv8`, so the local development machine must take the
+    /// hardware path — the same path the HarmonyOS build is pinned to.
+    #[cfg(all(target_vendor = "apple", target_arch = "aarch64", aes_armv8))]
+    #[test]
+    fn apple_silicon_build_selects_hardware_aes() {
+        assert!(hardware_aes_available());
+        assert_eq!(CipherSuite::auto_detect(), CipherSuite::Aes256Gcm);
     }
 
     #[test]

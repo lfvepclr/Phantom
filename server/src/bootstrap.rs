@@ -402,11 +402,8 @@ async fn probe_port(
             // check and the runtime rebinds with the same identity. An ASCON +
             // QUIC combination surfaces here as a clear config error at
             // bootstrap instead of at first connect.
-            let auth = phantom_core::QuicAuth::server(
-                identity.keys.secret,
-                identity.psk.clone(),
-                cipher,
-            );
+            let auth =
+                phantom_core::QuicAuth::server(identity.keys.secret, identity.psk.clone(), cipher);
             let (_listener, bound) =
                 try_bind_quic_with_fallback(start, max_tries, &auth, &QuicConfig::default())
                     .await

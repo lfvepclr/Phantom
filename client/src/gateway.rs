@@ -112,10 +112,7 @@ impl Default for GatewayConfig {
             tun_name: crate::tun::DEFAULT_TUN_NAME.to_string(),
             tun_addr: Ipv4Addr::new(10, 7, 0, 1),
             lan_interfaces: vec!["br0".to_string()],
-            bypass_cidrs: DEFAULT_BYPASS_CIDRS
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            bypass_cidrs: DEFAULT_BYPASS_CIDRS.iter().map(|s| s.to_string()).collect(),
             table_id: DEFAULT_TABLE_ID,
             lan_dns_hijack: true,
             dns_sentinel: Ipv4Addr::new(8, 8, 8, 8),
@@ -135,7 +132,10 @@ impl GatewayConfig {
                 "gateway: at least one --lan-interface is required".to_string(),
             ));
         }
-        if self.table_id == 0 || self.table_id == 253 || self.table_id == 254 || self.table_id == 255
+        if self.table_id == 0
+            || self.table_id == 253
+            || self.table_id == 254
+            || self.table_id == 255
         {
             return Err(PhantomError::Config(format!(
                 "gateway: routing table {} is reserved (default/main/local)",
@@ -494,7 +494,12 @@ mod tests {
     #[test]
     fn default_bypass_set_covers_rfc1918_and_loopback() {
         let lines = plan_lines(&GatewayConfig::default());
-        for cidr in ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8"] {
+        for cidr in [
+            "10.0.0.0/8",
+            "172.16.0.0/12",
+            "192.168.0.0/16",
+            "127.0.0.0/8",
+        ] {
             assert!(
                 lines.iter().any(|l| l.contains(cidr)),
                 "bypass set missing {}",
@@ -509,9 +514,6 @@ mod tests {
         assert_eq!(cmd.program, "ip");
         assert_eq!(cmd.args.len(), 7);
         assert!(!cmd.tolerate_failure);
-        assert_eq!(
-            cmd.display(),
-            "ip route add default dev phantom0 table 200"
-        );
+        assert_eq!(cmd.display(), "ip route add default dev phantom0 table 200");
     }
 }

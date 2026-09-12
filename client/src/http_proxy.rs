@@ -17,11 +17,8 @@
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::{Bytes, BytesMut};
-use phantom_core::protocol::codec::{
-    FrameReader, FrameWriter, MessageRead, MessageWrite,
-};
+use phantom_core::protocol::codec::{FrameReader, FrameWriter, MessageRead, MessageWrite};
 use phantom_core::protocol::{Frame, TargetAddr};
-use phantom_core::transport::tcp::TcpTransport;
 use phantom_core::{ClientConfig, PhantomError, ProxyAuthConfig, Result, TransportProtocol};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -31,6 +28,7 @@ use crate::failover::FailoverManager;
 use crate::quic_pool::QuicPool;
 use crate::socks5;
 use crate::stats::TrafficStats;
+use crate::tcp_pool::TcpSessionPool;
 use std::sync::Arc;
 
 /// Request heads larger than this are rejected (431).
@@ -50,6 +48,7 @@ pub async fn handle_inbound(
     config: &ClientConfig,
     failover: &FailoverManager,
     quic_pool: &QuicPool,
+    tcp_pool: &Arc<TcpSessionPool>,
     local_secret: [u8; 32],
     stats: &Arc<TrafficStats>,
 ) -> Result<()> {
@@ -62,16 +61,14 @@ pub async fn handle_inbound(
     }
     if byte[0] == 0x05 {
         socks5::handle_socks5_connection(
-            stream,
-            config,
-            failover,
-            quic_pool,
-            local_secret,
-            stats,
+            stream, config, failover, quic_pool, tcp_pool, local_secret, stats,
         )
         .await
     } else {
-        handle_http_connection(stream, config, failover, quic_pool, local_secret, stats).await
+        handle_http_connection(
+            stream, config, failover, quic_pool, tcp_pool, local_secret, stats,
+        )
+        .await
     }
 }
 
@@ -88,6 +85,7 @@ async fn handle_http_connection(
     config: &ClientConfig,
     failover: &FailoverManager,
     quic_pool: &QuicPool,
+    tcp_pool: &Arc<TcpSessionPool>,
     local_secret: [u8; 32],
     stats: &Arc<TrafficStats>,
 ) -> Result<()> {
@@ -133,10 +131,45 @@ async fn handle_http_connection(
     };
     tracing::info!(
         "HTTP {} → {} ({})",
-        if request.is_connect { "CONNECT" } else { "proxy" },
+        if request.is_connect {
+            "CONNECT"
+        } else {
+            "proxy"
+        },
         request.target,
-        if request.is_connect { "tunnel" } else { "rewrite" }
+        if request.is_connect {
+            "tunnel"
+        } else {
+            "rewrite"
+        }
     );
+
+    // 3b. Routing decision (default DIRECT — see `crate::whitelist`).
+    let (decision_domain, decision_ip) = match &request.target {
+        TargetAddr::Domain(d, _) => (Some(d.as_str()), None),
+        TargetAddr::IPv4(octets, _) => (None, Some(std::net::IpAddr::from(*octets))),
+        TargetAddr::IPv6(octets, _) => (None, Some(std::net::IpAddr::from(*octets))),
+    };
+    let target_port = match &request.target {
+        TargetAddr::Domain(_, p) | TargetAddr::IPv4(_, p) | TargetAddr::IPv6(_, p) => *p,
+    };
+    let decision =
+        crate::whitelist::shared(config).decide(decision_domain, decision_ip, target_port);
+    tracing::info!(
+        "route {} -> {} ({})",
+        request.target,
+        if decision.is_direct() {
+            "DIRECT"
+        } else {
+            "PROXY"
+        },
+        decision.reason.as_str()
+    );
+    if decision.is_direct() {
+        stats.record_route_direct();
+        return finish_http_direct(stream, request, preloaded, stats).await;
+    }
+    stats.record_route_proxy();
 
     // 4. Select server and establish the tunnel (same plumbing as SOCKS5).
     //    The two transports monomorphize to different frame reader/writer
@@ -144,9 +177,8 @@ async fn handle_http_connection(
     let (server, migration_rx) = failover.select_server_with_migration()?;
     match server.protocol {
         TransportProtocol::Tcp => {
-            let transport = TcpTransport::new(std::time::Duration::from_secs(10));
-            match socks5::establish_tunnel(
-                &transport,
+            match socks5::open_tcp_tunnel(
+                tcp_pool,
                 &server,
                 &local_secret,
                 &request.target,
@@ -187,6 +219,52 @@ async fn handle_http_connection(
             }
         }
     }
+}
+
+/// Serve an HTTP proxy request locally, without touching the tunnel.
+async fn finish_http_direct(
+    mut stream: TcpStream,
+    request: ParsedRequest,
+    preloaded: Vec<u8>,
+    stats: &Arc<TrafficStats>,
+) -> Result<()> {
+    let addr = match socks5::resolve_local(&request.target).await {
+        Ok(a) => a,
+        Err(e) => {
+            tracing::info!("Direct HTTP resolve failed → {}: {}", request.target, e);
+            let _ = stream.write_all(RESP_BAD_GATEWAY).await;
+            return Ok(());
+        }
+    };
+    let mut upstream = match TcpStream::connect(addr).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::info!("Direct HTTP connect failed → {}: {}", request.target, e);
+            let _ = stream.write_all(RESP_BAD_GATEWAY).await;
+            return Ok(());
+        }
+    };
+    crate::net_tune::tune(&upstream);
+
+    if request.is_connect {
+        stream.write_all(RESP_OK).await.map_err(PhantomError::Io)?;
+    }
+    if let Some(head) = &request.forward_head {
+        upstream.write_all(head).await.map_err(PhantomError::Io)?;
+    }
+    if !preloaded.is_empty() {
+        upstream
+            .write_all(&preloaded)
+            .await
+            .map_err(PhantomError::Io)?;
+    }
+    upstream.flush().await.map_err(PhantomError::Io)?;
+    tracing::info!("Direct HTTP connection established → {}", request.target);
+
+    let (up, down) = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await?;
+    stats.record_tcp_up(up);
+    stats.record_tcp_down(down);
+    Ok(())
 }
 
 /// Inject the rewritten head and any preloaded bytes, then hand the stream
@@ -296,7 +374,10 @@ fn parse_request(head: &[u8]) -> Result<ParsedRequest> {
     }
 
     let rest = uri.strip_prefix("http://").ok_or_else(|| {
-        PhantomError::Protocol(format!("proxy requires an absolute http:// URI, got {}", uri))
+        PhantomError::Protocol(format!(
+            "proxy requires an absolute http:// URI, got {}",
+            uri
+        ))
     })?;
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),

@@ -1,0 +1,13 @@
+{
+  "source": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/gfw.txt",
+  "extended": false,
+  "extended_source": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/proxy.txt",
+  "cidr_source": "https://cdn.jsdelivr.net/gh/Loyalsoldier/clash-rules@release/telegramcidr.txt",
+  "generated": "2026-09-12T08:01:29Z",
+  "raw_lines": 4385,
+  "normalised": 4384,
+  "domains": 4365,
+  "cidrs": 12,
+  "fst_bytes": 38383,
+  "fst_sha256": "8edf5b20990e2538488e7efff39b2df7709aae8db1c8a1b935fb29c213d67809"
+}

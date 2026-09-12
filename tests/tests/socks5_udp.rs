@@ -106,12 +106,24 @@ async fn start_socks5_front(
                 Ok(s) => s,
                 Err(_) => break,
             };
-            let (config, failover, pool, stats) =
-                (config.clone(), failover.clone(), pool.clone(), stats.clone());
+            let (config, failover, pool, stats) = (
+                config.clone(),
+                failover.clone(),
+                pool.clone(),
+                stats.clone(),
+            );
+            let tcp_pool = std::sync::Arc::new(phantom_client::tcp_pool::TcpSessionPool::new());
             tokio::spawn(async move {
-                let _ =
-                    handle_socks5_connection(stream, &config, &failover, &pool, client_secret, &stats)
-                        .await;
+                let _ = handle_socks5_connection(
+                    stream,
+                    &config,
+                    &failover,
+                    &pool,
+                    &tcp_pool,
+                    client_secret,
+                    &stats,
+                )
+                .await;
             });
         }
     });
@@ -122,7 +134,9 @@ async fn start_socks5_front(
 /// connection (dropping it ends the association), the client UDP socket,
 /// and the relay address from BND.ADDR/BND.PORT.
 async fn udp_associate(socks5_addr: SocketAddr) -> (TcpStream, UdpSocket, SocketAddr) {
-    let mut tcp = TcpStream::connect(socks5_addr).await.expect("connect socks5");
+    let mut tcp = TcpStream::connect(socks5_addr)
+        .await
+        .expect("connect socks5");
     tcp.write_all(&[0x05, 0x01, 0x00]).await.expect("greeting");
     let mut buf = [0u8; 2];
     tcp.read_exact(&mut buf).await.expect("greeting reply");
@@ -137,10 +151,15 @@ async fn udp_associate(socks5_addr: SocketAddr) -> (TcpStream, UdpSocket, Socket
     assert_eq!(reply[0], 0x05, "bad reply version");
     assert_eq!(reply[1], 0x00, "associate rejected: rep={:#x}", reply[1]);
     assert_eq!(reply[3], 0x01, "expected IPv4 BND.ADDR");
-    let relay_addr = SocketAddr::from(([reply[4], reply[5], reply[6], reply[7]], u16::from_be_bytes([reply[8], reply[9]])));
+    let relay_addr = SocketAddr::from((
+        [reply[4], reply[5], reply[6], reply[7]],
+        u16::from_be_bytes([reply[8], reply[9]]),
+    ));
     assert_ne!(relay_addr.port(), 0, "relay port must be bound");
 
-    let udp = UdpSocket::bind("127.0.0.1:0").await.expect("client udp socket");
+    let udp = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("client udp socket");
     (tcp, udp, relay_addr)
 }
 
@@ -191,7 +210,10 @@ async fn udp_associate_echo_over_tcp() {
     let (_control, udp, relay) = udp_associate(socks5_addr).await;
 
     // Two datagrams to the same target: the second must reuse the flow.
-    for payload in [b"hello udp associate".as_slice(), b"second datagram".as_slice()] {
+    for payload in [
+        b"hello udp associate".as_slice(),
+        b"second datagram".as_slice(),
+    ] {
         udp.send_to(&udp_request(echo.addr, payload), relay)
             .await
             .expect("send datagram");
@@ -286,7 +308,9 @@ async fn udp_associate_multi_target_and_policy_drops() {
 
     // A datagram from a foreign source address must be ignored: the
     // association is bound to the first-seen client address.
-    let stranger = UdpSocket::bind("127.0.0.1:0").await.expect("stranger socket");
+    let stranger = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("stranger socket");
     stranger
         .send_to(&udp_request(echo1.addr, b"intruder"), relay)
         .await
