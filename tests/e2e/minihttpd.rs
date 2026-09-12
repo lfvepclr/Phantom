@@ -1,7 +1,10 @@
 // E2E 测试专用 mini 静态文件服务器（std-only，rustc 单文件编译为 musl 静态二进制）
 // 用途：phantom-net 内部 web 容器，验证「只有经 Phantom 隧道才能访问」。
 // 编译：rustc --edition 2021 -O --target aarch64-unknown-linux-musl -o minihttpd minihttpd.rs
-// 运行：minihttpd /www   （监听 0.0.0.0:8080）
+// 运行：minihttpd /www [port]   （默认监听 0.0.0.0:8080）
+//
+// 端口可选是为了本机回环测速：那边要一个「比客户端快得多」的源站，用 python
+// http.server 会变成在测 python（实测只有 0.4 MB/s），把客户端上限压成噪声。
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -9,8 +12,12 @@ use std::thread;
 
 fn main() {
     let dir = std::env::args().nth(1).unwrap_or_else(|| "/www".to_string());
-    let listener = TcpListener::bind("0.0.0.0:8080").expect("bind :8080");
-    println!("minihttpd serving {} on 0.0.0.0:8080", dir);
+    let port: u16 = std::env::args()
+        .nth(2)
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(8080);
+    let listener = TcpListener::bind(("0.0.0.0", port)).unwrap_or_else(|e| panic!("bind :{port}: {e}"));
+    println!("minihttpd serving {dir} on 0.0.0.0:{port}");
     for stream in listener.incoming().flatten() {
         let d = dir.clone();
         thread::spawn(move || handle(stream, d));

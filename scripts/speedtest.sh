@@ -14,6 +14,9 @@
 #   speedtest.sh --uri "phantom://..." [--rounds N] [--origin cloudflare|vps]
 #                [--check-unblock] [--socks-port 1080] [--vps-host root@HOST]
 #   speedtest.sh --loopback [--rounds N]
+#
+#   --out <file>   append a markdown row (label, medians) to a report,
+#                  e.g. tests/PERF_TUN_PATH_REPORT.md
 
 set -euo pipefail
 
@@ -26,6 +29,8 @@ URI=""
 LOOPBACK=0
 CHECK_UNBLOCK=0
 VPS_HOST=""
+OUT=""
+LABEL=""
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/phantom-speed.XXXXXX")"
 
 while [[ $# -gt 0 ]]; do
@@ -37,6 +42,8 @@ while [[ $# -gt 0 ]]; do
         --loopback) LOOPBACK=1; shift ;;
         --check-unblock) CHECK_UNBLOCK=1; shift ;;
         --vps-host) VPS_HOST="${2:?}"; shift 2 ;;
+        --out) OUT="${2:?}"; shift 2 ;;
+        --label) LABEL="${2:?}"; shift 2 ;;
         -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
         *) echo "unknown flag: $1" >&2; exit 2 ;;
     esac
@@ -55,7 +62,7 @@ cleanup() {
     [[ -n "$SERVER_PID" ]] && kill "$SERVER_PID" >/dev/null 2>&1
     [[ -n "$ORIGIN_PID" ]] && kill "$ORIGIN_PID" >/dev/null 2>&1
     if [[ -n "$REMOTE_ORIGIN" ]]; then
-        ssh -o BatchMode=yes "$VPS_HOST" "pkill -f '/tmp/phantom-origin' || true" >/dev/null 2>&1
+        ssh -o BatchMode=yes "$VPS_HOST" "pkill -f '^/tmp/phantom-origin' || true" >/dev/null 2>&1
     fi
     rm -rf "$WORK"
 }
@@ -72,7 +79,25 @@ wait_for_port() {
 
 start_tunnel() {
     local uri="$1"
-    RUST_LOG=warn "$CLIENT" client --server "$uri" >"$WORK/client.log" 2>&1 &
+    # Mode matters for the VPS-side origin: it lives on 127.0.0.1 *of the
+    # server*, so the request has to be tunneled. Smart mode would classify
+    # 127.0.0.1 as Direct and measure this machine's own loopback instead.
+    local mode="${2:-smart}"
+    # Refuse to measure someone else's proxy: if the port is already taken the
+    # client below fails to bind, `wait_for_port` still succeeds (the other
+    # process answers) and every number after that describes the other tunnel.
+    if lsof -nP -iTCP:"$SOCKS_PORT" -sTCP:LISTEN >/dev/null 2>&1; then
+        echo "ERROR: port $SOCKS_PORT is already in use — pick another with --socks-port" >&2
+        exit 1
+    fi
+    # Pin the client's own listen address (a bare `--server` would use the
+    # compiled-in default, which may not be the port we are measuring).
+    cat > "$WORK/client.toml" <<EOF
+[client]
+listen = "127.0.0.1:$SOCKS_PORT"
+mode = "$mode"
+EOF
+    RUST_LOG=warn "$CLIENT" client -c "$WORK/client.toml" --server "$uri" >"$WORK/client.log" 2>&1 &
     CLIENT_PID=$!
     wait_for_port "$SOCKS_PORT" || { echo "ERROR: SOCKS5 never came up"; tail -20 "$WORK/client.log"; exit 1; }
 }
@@ -85,9 +110,14 @@ run_loopback() {
     echo "=== Loopback: client + server + origin on this machine ==="
     local dir="$WORK/loopback"
     mkdir -p "$dir/www"
-    # 50 MiB deterministic payload served by python3 on 127.0.0.1:18080.
+    # 50 MiB payload served by the Rust test origin (not python http.server:
+    # that caps at ~0.4 MB/s here and would measure the origin, not the client).
     head -c 52428800 /dev/urandom > "$dir/www/50mb.bin"
-    ( cd "$dir/www" && python3 -m http.server 18080 --bind 127.0.0.1 >"$dir/origin.log" 2>&1 ) &
+    local origin_bin="$WORK/minihttpd"
+    if [[ ! -x "$origin_bin" ]]; then
+        rustc --edition 2021 -O "$REPO_ROOT/tests/e2e/minihttpd.rs" -o "$origin_bin"
+    fi
+    "$origin_bin" "$dir/www" 18080 >"$dir/origin.log" 2>&1 &
     ORIGIN_PID=$!
     wait_for_port 18080 || { echo "ERROR: local origin failed to start"; exit 1; }
 
@@ -103,7 +133,8 @@ run_loopback() {
     [[ -n "$uri" ]] || { echo "ERROR: local server never bootstrapped"; tail -20 "$dir/server.log"; exit 1; }
     echo "    loopback URI: $uri"
 
-    start_tunnel "$uri"
+    # Loopback must NOT be tunneled: this is the client's own software ceiling.
+    start_tunnel "$uri" direct
     echo "--- download ${ROUNDS}x 50 MiB (client software ceiling) ---"
     rm -f "$WORK/loop-dl.txt"
     for i in $(seq 1 "$ROUNDS"); do
@@ -119,7 +150,10 @@ run_loopback() {
 run_remote() {
     echo "=== Tunnel through deployed server ==="
     echo "    URI: ${URI%%#*}#..."
-    start_tunnel "$URI"
+    # The VPS-side origin listens on the *server's* 127.0.0.1:8080, so this run
+    # has to tunnel everything (Smart mode would send 127.0.0.1 direct and end
+    # up measuring this machine's own loopback).
+    start_tunnel "$URI" proxy
 
     if [[ "$CHECK_UNBLOCK" == "1" ]]; then
         echo
@@ -140,14 +174,27 @@ run_remote() {
     if [[ "$ORIGIN" == "vps" && -n "$VPS_HOST" ]]; then
         echo "--- origin: VPS-side static file (no third party) ---"
         local origin_bin="$REPO_ROOT/target/x86_64-unknown-linux-musl/release/phantom-origin"
+        # rustc creates its temp files next to the output, so the directory has
+        # to exist before the first cross build on a fresh checkout.
+        mkdir -p "$(dirname "$origin_bin")"
         if [[ ! -x "$origin_bin" ]]; then
-            rustc --edition 2021 -O --target x86_64-unknown-linux-musl \
-                "$REPO_ROOT/tests/e2e/minihttpd.rs" -o "$origin_bin"
+            # `rustc` does not read `.cargo/config.toml`, so the cross linker the
+            # workspace configures has to be handed over explicitly — otherwise
+            # it picks the host `cc` and fails on every flag musl needs.
+            local lld
+            lld="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin/rust-lld"
+            if [[ -x "$lld" ]]; then
+                rustc --edition 2021 -O --target x86_64-unknown-linux-musl -C "linker=$lld" \
+                    "$REPO_ROOT/tests/e2e/minihttpd.rs" -o "$origin_bin"
+            else
+                rustc --edition 2021 -O --target x86_64-unknown-linux-musl \
+                    "$REPO_ROOT/tests/e2e/minihttpd.rs" -o "$origin_bin"
+            fi
         fi
         scp -q -o BatchMode=yes "$origin_bin" "$VPS_HOST:/tmp/phantom-origin"
         ssh -o BatchMode=yes "$VPS_HOST" \
             "mkdir -p /tmp/phantom-www && head -c 10000000 /dev/urandom > /tmp/phantom-www/10mb.bin; \
-             pkill -f /tmp/phantom-origin 2>/dev/null; \
+             pkill -f '^/tmp/phantom-origin' 2>/dev/null; \
              setsid /tmp/phantom-origin /tmp/phantom-www >/tmp/phantom-origin.log 2>&1 < /dev/null & \
              sleep 1; echo started"
         REMOTE_ORIGIN=1
@@ -201,6 +248,22 @@ else
     [[ -n "$URI" ]] || { echo "ERROR: --uri is required (or use --loopback)" >&2; exit 2; }
     run_remote
     run_bare_link
+fi
+
+# ── Optional: append a row to the report ────────────────────────────────────
+if [[ -n "$OUT" ]]; then
+    row_label="${LABEL:-$( [[ "$LOOPBACK" == "1" ]] && echo loopback || echo "$ORIGIN" )}"
+    loopback_median=""
+    [[ -f "$WORK/loopback-dl.txt" ]] && loopback_median="$(median < "$WORK/loopback-dl.txt")"
+    vps_median=""
+    [[ -f "$WORK/vps-dl.txt" ]] && vps_median="$(median < "$WORK/vps-dl.txt")"
+    cf_median=""
+    [[ -f "$WORK/cf-dl.txt" ]] && cf_median="$(median < "$WORK/cf-dl.txt")"
+    {
+        echo ""
+        echo "| $(date '+%Y-%m-%d %H:%M') | $row_label | loopback ${loopback_median:-—} | vps ${vps_median:-—} | cloudflare ${cf_median:-—} |"
+    } >> "$OUT"
+    echo "appended a row to $OUT"
 fi
 
 echo

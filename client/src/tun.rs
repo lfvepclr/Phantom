@@ -11,12 +11,13 @@ use bytes::{Bytes, BytesMut};
 use etherparse::IpNumber;
 use phantom_core::protocol::TargetAddr;
 use phantom_core::{PhantomError, ProxyMode, Result, RuleAction, ServerEntry};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 use crate::dns::{
     DnsCache, DnsProxy, DnsQueryContext, DnsRoute, build_dns_response_packet,
@@ -52,6 +53,35 @@ const MAX_RTO: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// Duplicate ACKs needed before the queue is rewound (RFC 5681 fast retransmit).
 const DUP_ACK_THRESHOLD: u32 = 3;
+
+/// Retransmissions of a single flow are rate-limited by this cooldown.
+///
+/// Three duplicate ACKs mean "one segment is missing", not "send the whole
+/// window again". Without the guard each incoming dup-ACK pair re-injected the
+/// entire unacknowledged window: 7 seconds of a YouTube stream produced 1600
+/// retransmit events and 115 MB of injected duplicates.
+const RETRANSMIT_GUARD: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Consecutive no-progress retransmission rounds tolerated before the flow is
+/// reset so the app can reconnect immediately instead of hanging.
+const MAX_NO_PROGRESS_ROUNDS: u32 = 6;
+
+/// Sliding window and cap for duplicate bytes injected into one flow.
+const DUP_INJECT_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+const DUP_INJECT_WINDOW_BUDGET: u64 = 256 * 1024;
+const DUP_INJECT_TOTAL_BUDGET: u64 = 8 * 1024 * 1024;
+
+/// Trace at most one retransmit line per flow per second.
+const RETRANSMIT_TRACE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// How much outgoing payload may wait in the write queue before producers apply
+/// backpressure. Sized so a stalled queue is visible (and bounded) rather than
+/// an OOM or a silent drop.
+const TUN_WRITE_HIGH_WATER: usize = 4 * 1024 * 1024;
+
+/// A single TUN write that waited longer than this is worth a WARN line: it is
+/// the signature of the reader holding the device while ACKs queue behind it.
+const TUN_WRITE_STALL_WARN: std::time::Duration = std::time::Duration::from_millis(100);
 
 /// How long a direct connection may take before it is retried through the
 /// tunnel. Censored addresses are blackholed rather than refused, so "connect
@@ -269,6 +299,182 @@ impl TunDevice {
             Ok(())
         }
     }
+
+    /// Single **non-blocking** write attempt.
+    ///
+    /// The pump drives reads and writes from one task, so a write must never
+    /// park the task: if the kernel queue is full the packet stays at the head
+    /// of our own queue and is retried after the next read. Returns the number
+    /// of bytes the kernel accepted (which may be short).
+    #[cfg(any(target_os = "android", target_env = "ohos"))]
+    pub fn try_write_packet(&mut self, pkt: &[u8]) -> std::io::Result<usize> {
+        // SAFETY: `pkt` is a valid slice for the duration of the call.
+        let n = unsafe {
+            libc::write(
+                self.inner.get_ref().as_raw_fd(),
+                pkt.as_ptr() as *const libc::c_void,
+                pkt.len(),
+            )
+        };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(n as usize)
+    }
+
+    /// Single **non-blocking** write attempt (self-created utun path).
+    #[cfg(not(any(target_os = "android", target_env = "ohos")))]
+    pub fn try_write_packet(&mut self, pkt: &[u8]) -> std::io::Result<usize> {
+        use std::pin::Pin;
+        use std::task::{Context, Poll, Waker};
+        let mut cx = Context::from_waker(Waker::noop());
+        match Pin::new(&mut self.inner).poll_write(&mut cx, pkt) {
+            Poll::Ready(Ok(n)) => Ok(n),
+            Poll::Ready(Err(e)) => Err(e),
+            Poll::Pending => Err(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+        }
+    }
+}
+
+/// The read/write surface the TUN pump drives.
+///
+/// Exists so the pump can be exercised by a mock device in tests: the failure
+/// mode being fixed is "a read that never becomes ready while writes queue
+/// behind it", and that is impossible to reproduce with a real utun.
+pub trait TunIo: Send {
+    /// Wait for one inbound IP packet.
+    fn read_packet<'a>(
+        &'a mut self,
+        buf: &'a mut BytesMut,
+    ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a;
+
+    /// Try to hand one outbound IP packet to the kernel (never blocks).
+    fn try_write_packet(&mut self, pkt: &[u8]) -> std::io::Result<usize>;
+}
+
+impl TunIo for TunDevice {
+    fn read_packet<'a>(
+        &'a mut self,
+        buf: &'a mut BytesMut,
+    ) -> impl std::future::Future<Output = Result<usize>> + Send + 'a {
+        TunDevice::read_packet(self, buf)
+    }
+
+    fn try_write_packet(&mut self, pkt: &[u8]) -> std::io::Result<usize> {
+        TunDevice::try_write_packet(self, pkt)
+    }
+}
+
+/// Write side of the TUN device.
+///
+/// Producers (SYN-ACK/ACK/RST/PSH/FIN, UDP replies, DNS answers) enqueue here
+/// instead of taking the device lock. That is the whole point: the reader used
+/// to hold the device while awaiting a packet, so an ACK the app needed in
+/// order to unblock itself could not be written until the *next* inbound packet
+/// arrived — a self-inflicted stall that looked like a dead tunnel.
+pub struct TunWriter {
+    queue: std::sync::Mutex<VecDeque<Bytes>>,
+    queued_bytes: AtomicUsize,
+    notify: Notify,
+    stats: Arc<TrafficStats>,
+}
+
+impl TunWriter {
+    pub fn new(stats: Arc<TrafficStats>) -> Arc<Self> {
+        Arc::new(Self {
+            queue: std::sync::Mutex::new(VecDeque::new()),
+            queued_bytes: AtomicUsize::new(0),
+            notify: Notify::new(),
+            stats,
+        })
+    }
+
+    /// Queue one packet, applying backpressure only above the high-water mark.
+    pub async fn send(&self, pkt: Vec<u8>) {
+        self.send_bytes(Bytes::from(pkt)).await;
+    }
+
+    /// Queue one packet that is already a `Bytes` (no copy).
+    pub async fn send_bytes(&self, pkt: Bytes) {
+        if pkt.is_empty() {
+            return;
+        }
+        let mut pending = Some(pkt);
+        loop {
+            // Register interest *before* looking at the queue: a producer that
+            // pushes between the check and the await would otherwise be lost.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            {
+                let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+                if self.queued_bytes.load(Ordering::Relaxed) < TUN_WRITE_HIGH_WATER {
+                    let pkt = pending.take().expect("packet taken once");
+                    self.queued_bytes.fetch_add(pkt.len(), Ordering::Relaxed);
+                    queue.push_back(pkt);
+                }
+            }
+            if pending.is_none() {
+                self.stats
+                    .record_tun_queue_depth(self.queued_bytes.load(Ordering::Relaxed) as u64);
+                // Wake the pump; `notify_waiters` cannot leave a stored permit
+                // behind, which is why the pump re-checks the queue after
+                // registering (see `run_pump`).
+                self.notify.notify_waiters();
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// Take the oldest queued packet, if any.
+    fn pop(&self) -> Option<Bytes> {
+        let mut queue = self.queue.lock().unwrap_or_else(|e| e.into_inner());
+        let pkt = queue.pop_front()?;
+        self.queued_bytes.fetch_sub(pkt.len(), Ordering::Relaxed);
+        Some(pkt)
+    }
+
+    fn queued(&self) -> usize {
+        self.queued_bytes.load(Ordering::Relaxed)
+    }
+
+    // ---- TUN-path accounting -------------------------------------------
+    //
+    // The SOCKS5 path has always counted bytes; the TUN path did not, which is
+    // exactly why "the video is stuck but 115 MB moved" was invisible until we
+    // read the On-device trace by hand.
+    /// Payload accepted from the app (unique bytes).
+    pub fn count_up(&self, bytes: u64) {
+        self.stats.record_tcp_up(bytes);
+    }
+
+    /// Payload injected into the app for the first time.
+    pub fn count_down(&self, bytes: u64) {
+        self.stats.record_tcp_down(bytes);
+    }
+
+    /// Payload injected into the app a second time.
+    pub fn count_dup(&self, bytes: u64) {
+        self.stats.record_tcp_dup(bytes);
+    }
+
+    pub fn count_udp_up(&self, bytes: u64) {
+        self.stats.record_udp_up(bytes);
+    }
+
+    pub fn count_udp_down(&self, bytes: u64) {
+        self.stats.record_udp_down(bytes);
+    }
+
+    pub fn count_connection(&self) {
+        self.stats.record_tcp_connect();
+    }
+
+    pub fn stats(&self) -> &Arc<TrafficStats> {
+        &self.stats
+    }
 }
 
 /// 5-tuple flow identifier.
@@ -314,6 +520,13 @@ fn new_flow_state(
         traced_injections: 0,
         bytes_from_app: 0,
         bytes_to_app: 0,
+        retransmit_cooldown_until: None,
+        retransmit_round: 0,
+        retransmit_una_mark: 0,
+        dup_inject_window_bytes: 0,
+        dup_inject_window_start: std::time::Instant::now(),
+        dup_inject_total: 0,
+        last_retransmit_trace_at: None,
         end_reason: "",
         epoch: network_epoch(),
         src_ip,
@@ -359,6 +572,19 @@ pub struct TcpFlowState {
     /// Payload bytes the app sent us / we delivered to the app.
     bytes_from_app: u64,
     bytes_to_app: u64,
+    /// Earliest instant the next retransmission may be sent (guard/back-off).
+    retransmit_cooldown_until: Option<std::time::Instant>,
+    /// Consecutive retransmit rounds in which SND.UNA did not move.
+    retransmit_round: u32,
+    /// SND.UNA at the last retransmit, used for no-progress detection.
+    retransmit_una_mark: u32,
+    /// Duplicate bytes injected in the current budget window.
+    dup_inject_window_bytes: u64,
+    dup_inject_window_start: std::time::Instant,
+    /// Duplicate bytes injected into this flow since it was created.
+    dup_inject_total: u64,
+    /// Last time a `retransmit` trace line was emitted (rate limit).
+    last_retransmit_trace_at: Option<std::time::Instant>,
     /// Why the flow ended, for the trace summary line.
     end_reason: &'static str,
     /// Network epoch this flow was created in (see [`network_epoch`]); a flow
@@ -552,7 +778,7 @@ async fn deliver_dns_response(
     domain: Option<String>,
     route: DnsRoute,
     cache: DnsCache,
-    device: Arc<Mutex<TunDevice>>,
+    writer: Arc<TunWriter>,
 ) -> Result<()> {
     if let Some(ref domain) = domain {
         let ips = extract_a_records(&payload);
@@ -582,14 +808,21 @@ async fn deliver_dns_response(
         }
     }
     let pkt = build_dns_response_packet(&payload, &ctx)?;
-    let mut dev = device.lock().await;
-    dev.write_packet(&pkt).await?;
+    writer.send(pkt).await;
     Ok(())
 }
 
 /// Main TUN transparent proxy.
-pub struct TunProxy {
-    device: Arc<Mutex<TunDevice>>,
+///
+/// Generic over the device only so tests can drive the pump with a mock; the
+/// platform bridges keep writing `TunProxy::new(device, addr)` and get the
+/// default `TunDevice` instantiation.
+pub struct TunProxy<D: TunIo = TunDevice> {
+    /// The device is owned by the pump task while `run()` is in flight, hence
+    /// the `Option`. Nothing else may touch it — all output goes through
+    /// [`TunWriter`].
+    device: Arc<Mutex<Option<D>>>,
+    writer: Arc<TunWriter>,
     flows: FlowTable,
     udp_flows: UdpFlowTable,
     udp_proxy_flows: UdpProxyFlowTable,
@@ -603,10 +836,12 @@ pub struct TunProxy {
     stats: Arc<TrafficStats>,
 }
 
-impl TunProxy {
-    pub fn new(device: TunDevice, socks5_addr: SocketAddr) -> Self {
+impl<D: TunIo> TunProxy<D> {
+    pub fn new(device: D, socks5_addr: SocketAddr) -> Self {
+        let stats = TrafficStats::new();
         Self {
-            device: Arc::new(Mutex::new(device)),
+            device: Arc::new(Mutex::new(Some(device))),
+            writer: TunWriter::new(Arc::clone(&stats)),
             flows: FlowTable::new(),
             udp_flows: UdpFlowTable::new(),
             udp_proxy_flows: UdpProxyFlowTable::new(),
@@ -622,7 +857,7 @@ impl TunProxy {
             dns_cache: DnsCache::new(),
             config_path: None,
             failover: None,
-            stats: TrafficStats::new(),
+            stats,
         }
     }
 
@@ -683,6 +918,10 @@ impl TunProxy {
     /// Share the caller's stats instance so SOCKS5 and TUN traffic land in the
     /// same counters (the metrics endpoint serves exactly one `TrafficStats`).
     pub fn with_stats(mut self, stats: Arc<TrafficStats>) -> Self {
+        // The writer reports queue depth and byte counts, so it must share the
+        // instance the runtime serves over `/metrics`. Safe here: builders run
+        // before `run()`, so the queue is still empty.
+        self.writer = TunWriter::new(Arc::clone(&stats));
         self.stats = stats;
         self
     }
@@ -735,8 +974,7 @@ impl TunProxy {
                     dst_port,
                 };
                 let pkt = build_dns_response_packet(&refused, &ctx)?;
-                let mut dev = self.device.lock().await;
-                dev.write_packet(&pkt).await?;
+                self.writer.send(pkt).await;
             }
             return Ok(());
         }
@@ -829,7 +1067,7 @@ impl TunProxy {
                 let mut inbound = channels.inbound;
                 let dns_task = Arc::clone(&dns);
                 let cache = self.dns_cache.clone();
-                let device = Arc::clone(&self.device);
+                let device = Arc::clone(&self.writer);
                 tokio::spawn(async move {
                     let mut on_response = move |payload: Bytes,
                                                 ctx: DnsQueryContext,
@@ -873,7 +1111,7 @@ impl TunProxy {
         if let Some(dns) = &self.dns_proxy {
             let dns = Arc::clone(dns);
             let cache = self.dns_cache.clone();
-            let device = Arc::clone(&self.device);
+            let device = Arc::clone(&self.writer);
             tokio::spawn(async move {
                 let mut on_response = move |payload: Bytes,
                                             ctx: DnsQueryContext,
@@ -929,17 +1167,114 @@ impl TunProxy {
         // Metrics are served by the tunnel runtime (`PhantomClient::run` /
         // `run_tun`) over the shared stats instance — nothing to spawn here.
 
+        // Take ownership of the device for the lifetime of the pump. Every
+        // writer goes through `self.writer`, so nothing else needs it.
+        let mut device = {
+            let mut guard = self.device.lock().await;
+            guard
+                .take()
+                .ok_or_else(|| PhantomError::Config("TUN pump already running".to_string()))?
+        };
+        self.run_pump(&mut device).await
+    }
+
+    /// Single task owning one TUN device: reads and writes interleave here, so
+    /// an ACK can always go out while the reader waits for the next packet.
+    ///
+    /// The previous shape locked the device around `read_packet().await`, which
+    /// blocks until the app sends something. Every reply queued behind that
+    /// lock, so a video flow that needed our ACK to continue waiting for its
+    /// own next packet — the deadlock-ish stall behind the 115 MB of duplicate
+    /// injections: the app kept re-ACKing a hole we could not fill because the
+    /// ACK we owed it was stuck behind a read that only that ACK could unblock.
+    async fn run_pump<D2: TunIo>(&self, device: &mut D2) -> Result<()> {
         let mut buf = BytesMut::with_capacity(TUN_MTU);
+        // Packet that is currently blocked on kernel backpressure.
+        let mut pending: Option<Bytes> = None;
+        // When the current packet started waiting for kernel writability.
+        let mut stalled_since: Option<std::time::Instant> = None;
+
         loop {
-            let n = {
-                let mut dev = self.device.lock().await;
-                dev.read_packet(&mut buf).await?
-            };
-            if n == 0 {
-                continue;
+            // 1. Drain the write queue as far as the kernel accepts.
+            loop {
+                if pending.is_none() {
+                    pending = self.writer.pop();
+                }
+                let Some(pkt) = pending.take() else { break };
+                match device.try_write_packet(&pkt) {
+                    Ok(n) if n == pkt.len() => {
+                        if let Some(started) = stalled_since.take() {
+                            let waited = started.elapsed();
+                            self.stats
+                                .record_tun_write_wait(waited.as_millis() as u64);
+                            if waited >= TUN_WRITE_STALL_WARN {
+                                tracing::warn!(
+                                    "tun write stalled {}ms (queue {} bytes)",
+                                    waited.as_millis(),
+                                    self.writer.queued()
+                                );
+                                crate::tun_trace!(
+                                    "tun write stalled {}ms queue={}",
+                                    waited.as_millis(),
+                                    self.writer.queued()
+                                );
+                            }
+                        }
+                    }
+                    Ok(n) if n > 0 => {
+                        // Partial write: keep the tail and retry.
+                        stalled_since.get_or_insert_with(std::time::Instant::now);
+                        pending = Some(pkt.slice(n..));
+                        break;
+                    }
+                    // `0` bytes taken, or the kernel queue is full.
+                    Ok(_) => {
+                        stalled_since.get_or_insert_with(std::time::Instant::now);
+                        pending = Some(pkt);
+                        break;
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        stalled_since.get_or_insert_with(std::time::Instant::now);
+                        pending = Some(pkt);
+                        break;
+                    }
+                    Err(e) => return Err(PhantomError::Io(e)),
+                }
             }
-            if let Err(e) = self.handle_packet(&buf[..n]).await {
-                tracing::debug!("TUN packet error: {}", e);
+
+            // 2. Wait for either a new packet to write or an inbound packet.
+            //
+            // `notified()` is registered (and enabled) *before* the queue is
+            // inspected again, so a producer that pushes in between cannot be
+            // missed — `notify_waiters` stores no permit.
+            let notified = self.writer.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if pending.is_none() {
+                if let Some(pkt) = self.writer.pop() {
+                    pending = Some(pkt);
+                    continue;
+                }
+            }
+
+            // While a write is blocked the kernel queue is full, so retry on a
+            // short timer as well: reads are not guaranteed to arrive.
+            let retry = tokio::time::sleep(std::time::Duration::from_millis(2));
+            tokio::pin!(retry);
+
+            tokio::select! {
+                biased;
+                _ = &mut notified => {}
+                _ = &mut retry, if pending.is_some() => {}
+                result = device.read_packet(&mut buf) => {
+                    let n = result?;
+                    if n == 0 {
+                        continue;
+                    }
+                    if let Err(e) = self.handle_packet(&buf[..n]).await {
+                        tracing::debug!("TUN packet error: {}", e);
+                    }
+                }
             }
         }
     }
@@ -1101,6 +1436,7 @@ impl TunProxy {
                     apply_peer_ack(&mut st, tcp.acknowledgment_number(), tcp.window_size());
                 if !advanced && data.is_empty() && !fin {
                     st.dup_acks = st.dup_acks.saturating_add(1);
+                    self.stats.record_dup_ack();
                     if st.dup_acks >= DUP_ACK_THRESHOLD && st.seq != st.snd_una {
                         st.dup_acks = 0;
                         fast_retransmit = true;
@@ -1108,26 +1444,55 @@ impl TunProxy {
                 }
             }
             if fast_retransmit {
-                crate::tun_trace!(
-                    "3-dup-ACK fast retransmit {}:{} snd_una={} snd_nxt={} queued={} win={}",
-                    dst_ip,
-                    dst_port,
-                    st.snd_una,
-                    st.seq,
-                    st.send_queue.len(),
-                    st.peer_window
-                );
-                st.seq = st.snd_una;
-                flush_send_queue(&mut st, &self.device).await?;
+                let now = std::time::Instant::now();
+                match decide_retransmit(&mut st, now) {
+                    RetransmitDecision::Send { bytes } => {
+                        if should_trace_retransmit(&mut st, now) {
+                            crate::tun_trace!(
+                                "retransmit {}:{} snd_una={} bytes={} snd_nxt={} queued={} win={} round={}",
+                                dst_ip,
+                                dst_port,
+                                st.snd_una,
+                                bytes,
+                                st.seq,
+                                st.send_queue.len(),
+                                st.peer_window,
+                                st.retransmit_round
+                            );
+                        }
+                        retransmit_one_mss(&mut st, &self.writer, bytes).await;
+                        self.stats.record_tcp_dup(bytes as u64);
+                    }
+                    RetransmitDecision::Cooldown => {
+                        // The app keeps re-ACKing the same hole; one retransmit
+                        // per guard window is enough to repair it.
+                        self.stats.record_retransmit_suppressed(1);
+                    }
+                    RetransmitDecision::NothingQueued => {}
+                    RetransmitDecision::GiveUp(reason) => {
+                        self.stats.record_retransmit_budget_rst();
+                        st.end_reason = reason.as_str();
+                        let rst = build_tcp_rst_packet(&st).ok();
+                        drop(st);
+                        if let Some(pkt) = rst {
+                            self.writer.send(pkt).await;
+                        }
+                        crate::tun_trace!(
+                            "flow {}:{} reset after retransmit limit: {}",
+                            dst_ip,
+                            dst_port,
+                            reason.as_str()
+                        );
+                        self.flows.remove(&key).await;
+                        return Ok(());
+                    }
+                }
             }
 
             if fin {
                 st.ack = st.ack.wrapping_add(1);
                 let ack_pkt = build_tcp_ack_packet(&st)?;
-                {
-                    let mut dev = self.device.lock().await;
-                    let _ = dev.write_packet(&ack_pkt).await;
-                }
+                self.writer.send(ack_pkt).await;
                 let _ = flow.tx_to_relay.send(Bytes::new());
                 drop(st);
                 self.flows.remove(&key).await;
@@ -1155,19 +1520,17 @@ impl TunProxy {
                 if !chunk.is_empty() {
                     st.ack = st.ack.wrapping_add(chunk.len() as u32);
                     st.bytes_from_app += chunk.len() as u64;
+                    self.writer.count_up(chunk.len() as u64);
                     let _ = flow.tx_to_relay.send(Bytes::copy_from_slice(chunk));
                 }
 
-                flush_send_queue(&mut st, &self.device).await?;
+                flush_send_queue(&mut st, &self.writer).await?;
 
                 let ack_pkt = build_tcp_ack_packet(&st)?;
-                {
-                    let mut dev = self.device.lock().await;
-                    dev.write_packet(&ack_pkt).await?;
-                }
+                self.writer.send(ack_pkt).await;
             } else if ack {
                 // Pure ACK/window update: whatever was blocked may now flow.
-                flush_send_queue(&mut st, &self.device).await?;
+                flush_send_queue(&mut st, &self.writer).await?;
             }
         }
         Ok(())
@@ -1177,6 +1540,7 @@ impl TunProxy {
         let udp = etherparse::UdpHeaderSlice::from_slice(payload)
             .map_err(|e| PhantomError::Protocol(format!("UDP parse: {:?}", e)))?;
         let data = &payload[udp.slice().len()..];
+        self.writer.count_udp_up(data.len() as u64);
         let src_port = udp.source_port();
         let dst_port = udp.destination_port();
 
@@ -1246,7 +1610,7 @@ impl TunProxy {
                     .map_err(PhantomError::Io)?;
 
                 // Spawn receiver for this UDP flow if not already running.
-                let device = Arc::clone(&self.device);
+                let device = Arc::clone(&self.writer);
                 let udp_flows = self.udp_flows.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 8192];
@@ -1266,13 +1630,8 @@ impl TunProxy {
                                     continue;
                                 }
                             };
-                        {
-                            let mut dev = device.lock().await;
-                            if let Err(e) = dev.write_packet(&pkt).await {
-                                tracing::debug!("TUN write error: {}", e);
-                                break;
-                            }
-                        }
+                        device.count_udp_down(n as u64);
+                        device.send(pkt).await;
                     }
                     udp_flows.remove(&key).await;
                 });
@@ -1327,8 +1686,9 @@ impl TunProxy {
         }
 
         self.spawn_retransmit_supervisor(Arc::clone(&state), key);
+        self.writer.count_connection();
 
-        let device = Arc::clone(&self.device);
+        let device = Arc::clone(&self.writer);
         let flows = self.flows.clone();
         let socks5_addr = self.socks5_addr;
         tokio::spawn(async move {
@@ -1381,7 +1741,7 @@ impl TunProxy {
 
         self.spawn_retransmit_supervisor(Arc::clone(&state), key);
 
-        let device = Arc::clone(&self.device);
+        let device = Arc::clone(&self.writer);
         let flows = self.flows.clone();
         let socks5_addr = self.socks5_addr;
         tokio::spawn(async move {
@@ -1458,7 +1818,7 @@ impl TunProxy {
             .insert(*key, flow.outbound);
 
         // TUN-side inbound pump: tunnel datagrams → UDP packets → TUN device.
-        let device = Arc::clone(&self.device);
+        let device = Arc::clone(&self.writer);
         let udp_proxy_flows = self.udp_proxy_flows.clone();
         let key_clone = *key;
         let src_ip = key.src_ip;
@@ -1471,10 +1831,8 @@ impl TunProxy {
                     Ok(p) => p,
                     Err(_) => continue,
                 };
-                let mut dev = device.lock().await;
-                if dev.write_packet(&pkt).await.is_err() {
-                    break;
-                }
+                device.count_udp_down(data.len() as u64);
+                device.send(pkt).await;
             }
             udp_proxy_flows.flows.lock().await.remove(&key_clone);
         });
@@ -1495,7 +1853,8 @@ impl TunProxy {
     /// killed healthy long downloads after 10 s (20 ticks), because a busy flow
     /// always has unacknowledged bytes in flight.
     fn spawn_retransmit_supervisor(&self, state: Arc<Mutex<TcpFlowState>>, key: FlowKey) {
-        let device = Arc::clone(&self.device);
+        let writer = Arc::clone(&self.writer);
+        let stats = Arc::clone(&self.stats);
         let flows = self.flows.clone();
         tokio::spawn(async move {
             let mut stalled = 0u32;
@@ -1512,8 +1871,7 @@ impl TunProxy {
                     let rst = build_tcp_rst_packet(&st).ok();
                     drop(st);
                     if let Some(pkt) = rst {
-                        let mut dev = device.lock().await;
-                        let _ = dev.write_packet(&pkt).await;
+                        writer.send(pkt).await;
                     }
                     crate::tun_trace!(
                         "flow {}:{} retired: network changed",
@@ -1530,7 +1888,7 @@ impl TunProxy {
                     rto = RETRANSMIT_TICK;
                     last_check = now;
                     if st.fin_queued && !st.fin_sent {
-                        let _ = flush_send_queue(&mut st, &device).await;
+                        let _ = flush_send_queue(&mut st, &writer).await;
                     }
                     continue;
                 }
@@ -1567,20 +1925,62 @@ impl TunProxy {
                     // does while it still believes it is being served.
                     let saved = st.peer_window;
                     st.peer_window = 1;
-                    st.seq = st.snd_una;
                     crate::tun_trace!(
                         "zero-window probe {}:{} queued={}",
                         key.dst_ip,
                         key.dst_port,
                         st.send_queue.len()
                     );
-                    let _ = flush_send_queue(&mut st, &device).await;
+                    let probe = 1.min(st.send_queue.len());
+                    retransmit_one_mss(&mut st, &writer, probe).await;
+                    stats.record_tcp_dup(probe as u64);
                     st.peer_window = saved;
-                    st.seq = st.snd_una;
                 } else {
-                    st.seq = st.snd_una;
-                    let _ = flush_send_queue(&mut st, &device).await;
+                    // A timeout means "the oldest segment is missing", exactly
+                    // like three duplicate ACKs — so it goes through the same
+                    // one-segment, budgeted, back-off path instead of rewinding
+                    // SND.NXT and re-injecting the whole window every tick.
+                    let now = std::time::Instant::now();
+                    match decide_retransmit(&mut st, now) {
+                        RetransmitDecision::Send { bytes } => {
+                            if should_trace_retransmit(&mut st, now) {
+                                crate::tun_trace!(
+                                    "retransmit {}:{} snd_una={} bytes={} queued={} win={} round={} cause=timeout",
+                                    key.dst_ip,
+                                    key.dst_port,
+                                    st.snd_una,
+                                    bytes,
+                                    st.send_queue.len(),
+                                    st.peer_window,
+                                    st.retransmit_round
+                                );
+                            }
+                            retransmit_one_mss(&mut st, &writer, bytes).await;
+                            stats.record_tcp_dup(bytes as u64);
+                        }
+                        RetransmitDecision::Cooldown => stats.record_retransmit_suppressed(1),
+                        RetransmitDecision::NothingQueued => {}
+                        RetransmitDecision::GiveUp(reason) => {
+                            stats.record_retransmit_budget_rst();
+                            st.end_reason = reason.as_str();
+                            let rst = build_tcp_rst_packet(&st).ok();
+                            drop(st);
+                            if let Some(pkt) = rst {
+                                writer.send(pkt).await;
+                            }
+                            crate::tun_trace!(
+                                "flow {}:{} reset after retransmit limit: {}",
+                                key.dst_ip,
+                                key.dst_port,
+                                reason.as_str()
+                            );
+                            flows.remove(&key).await;
+                            return;
+                        }
+                    }
                 }
+                // The cooldown now owns the pacing; keep ticking fast enough to
+                // notice a reopened window promptly.
                 rto = (rto * 2).min(MAX_RTO);
             }
         });
@@ -1613,8 +2013,10 @@ impl TunProxy {
             }
             _ => return Ok(()),
         }
-        let mut dev = self.device.lock().await;
-        let r = dev.write_packet(&pkt).await;
+        let r = {
+            self.writer.send(pkt).await;
+            Ok::<(), PhantomError>(())
+        };
         if r.is_ok() {
             crate::tun_trace!(
                 "SYN-ACK {}:{} seq={} ack={} win={} opts=[mss={}]",
@@ -1652,8 +2054,8 @@ impl TunProxy {
             }
             _ => return Ok(()),
         }
-        let mut dev = self.device.lock().await;
-        dev.write_packet(&pkt).await
+        self.writer.send(pkt).await;
+        Ok(())
     }
 
     async fn send_tcp_rst(
@@ -1689,8 +2091,8 @@ impl TunProxy {
             }
             _ => return Ok(()),
         }
-        let mut dev = self.device.lock().await;
-        dev.write_packet(&pkt).await
+        self.writer.send(pkt).await;
+        Ok(())
     }
 }
 
@@ -1702,7 +2104,7 @@ impl TunProxy {
 /// everything the app already buffered carry over untouched.
 async fn retry_through_tunnel(
     rx_from_tun: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
-    device: Arc<Mutex<TunDevice>>,
+    device: Arc<TunWriter>,
     flows: FlowTable,
     key: FlowKey,
     state: Arc<Mutex<TcpFlowState>>,
@@ -1730,7 +2132,7 @@ async fn retry_through_tunnel(
 
 async fn tcp_relay_task(
     mut rx_from_tun: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
-    device: Arc<Mutex<TunDevice>>,
+    device: Arc<TunWriter>,
     flows: FlowTable,
     key: FlowKey,
     state: Arc<Mutex<TcpFlowState>>,
@@ -1847,7 +2249,7 @@ async fn tcp_relay_task(
 
 async fn tcp_direct_relay_task(
     mut rx_from_tun: tokio::sync::mpsc::UnboundedReceiver<Bytes>,
-    device: Arc<Mutex<TunDevice>>,
+    device: Arc<TunWriter>,
     flows: FlowTable,
     key: FlowKey,
     state: Arc<Mutex<TcpFlowState>>,
@@ -2040,9 +2442,128 @@ fn apply_peer_ack(state: &mut TcpFlowState, ack: u32, window: u16) -> bool {
     true
 }
 
+/// What to do about a "the app is missing a segment" signal.
+#[derive(Debug, PartialEq, Eq)]
+enum RetransmitDecision {
+    /// Re-send this many bytes starting at SND.UNA.
+    Send { bytes: usize },
+    /// Inside the cooldown/back-off window: count it, do not inject anything.
+    Cooldown,
+    /// Nothing is queued to resend (nothing we can do from here).
+    NothingQueued,
+    /// The flow has burned its retransmission budget and must be reset.
+    GiveUp(FlowResetReason),
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum FlowResetReason {
+    /// Six consecutive rounds without SND.UNA moving.
+    NoProgress,
+    /// Duplicate injection exceeded its window or total budget.
+    DuplicateBudget,
+}
+
+impl FlowResetReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NoProgress => "no progress after retransmits",
+            Self::DuplicateBudget => "duplicate injection budget spent",
+        }
+    }
+}
+
+/// Decide whether a retransmission may be sent right now.
+///
+/// Two rules, both learned the hard way from a YouTube stream that stalled
+/// while flooding the TUN device with 115 MB of duplicates:
+///
+/// 1. **One segment, not the window.** Three duplicate ACKs say "a segment is
+///    missing"; re-sending everything from SND.UNA multiplies the loss instead
+///    of repairing it (the app drops most of it, ACKs the same hole, and the
+///    next dup-ACK round starts over).
+/// 2. **Budgeted.** A flow may inject at most `256 KiB/s` and `8 MiB` total of
+///    duplicates; past that it is reset so the app reconnects immediately
+///    instead of watching a spinner forever.
+///
+/// The cooldown also doubles per no-progress round (50→1600 ms), so a truly
+/// wedged flow stops hammering the link.
+fn decide_retransmit(state: &mut TcpFlowState, now: std::time::Instant) -> RetransmitDecision {
+    if state.send_queue.is_empty() {
+        return RetransmitDecision::NothingQueued;
+    }
+
+    // Any forward movement resets both the round counter and the back-off.
+    if state.snd_una != state.retransmit_una_mark {
+        state.retransmit_una_mark = state.snd_una;
+        state.retransmit_round = 0;
+        state.retransmit_cooldown_until = None;
+    }
+
+    if let Some(until) = state.retransmit_cooldown_until {
+        if now < until {
+            return RetransmitDecision::Cooldown;
+        }
+    }
+
+    // Roll the per-second budget window.
+    if now.duration_since(state.dup_inject_window_start) >= DUP_INJECT_WINDOW {
+        state.dup_inject_window_start = now;
+        state.dup_inject_window_bytes = 0;
+    }
+    if state.dup_inject_total >= DUP_INJECT_TOTAL_BUDGET
+        || state.dup_inject_window_bytes >= DUP_INJECT_WINDOW_BUDGET
+    {
+        return RetransmitDecision::GiveUp(FlowResetReason::DuplicateBudget);
+    }
+    if state.retransmit_round >= MAX_NO_PROGRESS_ROUNDS {
+        return RetransmitDecision::GiveUp(FlowResetReason::NoProgress);
+    }
+
+    let window = state.peer_window as usize;
+    let bytes = TCP_MSS.min(state.send_queue.len()).min(window);
+    if bytes == 0 {
+        // Zero window: the supervisor probes that case separately.
+        return RetransmitDecision::NothingQueued;
+    }
+
+    // 50, 100, 200, 400, 800, 1600 ms — capped, so a dead flow still gets an
+    // occasional cheap probe instead of being declared dead on a hunch.
+    let shift = state.retransmit_round.min(5);
+    let backoff = RETRANSMIT_GUARD
+        .checked_mul(1 << shift)
+        .unwrap_or(MAX_RTO)
+        .min(MAX_RTO);
+    state.retransmit_cooldown_until = Some(now + backoff);
+    state.retransmit_round = state.retransmit_round.saturating_add(1);
+    state.dup_inject_window_bytes += bytes as u64;
+    state.dup_inject_total += bytes as u64;
+    RetransmitDecision::Send { bytes }
+}
+
+/// Emit at most one `retransmit` trace line per flow per second.
+fn should_trace_retransmit(state: &mut TcpFlowState, now: std::time::Instant) -> bool {
+    match state.last_retransmit_trace_at {
+        Some(last) if now.duration_since(last) < RETRANSMIT_TRACE_INTERVAL => false,
+        _ => {
+            state.last_retransmit_trace_at = Some(now);
+            true
+        }
+    }
+}
+
+/// Re-send exactly one MSS starting at SND.UNA. SND.NXT is left untouched.
+async fn retransmit_one_mss(state: &mut TcpFlowState, writer: &Arc<TunWriter>, bytes: usize) {
+    let payload = state.send_queue[..bytes].to_vec();
+    let seq = state.snd_una;
+    match build_tcp_psh_packet_at(state, seq, &payload) {
+        Ok(pkt) => writer.send(pkt).await,
+        Err(e) => tracing::debug!("retransmit build failed: {}", e),
+    }
+}
+
 /// Send as much queued payload as the app's receive window allows, segmented to
 /// the MSS, then the FIN once everything is out.
-async fn flush_send_queue(state: &mut TcpFlowState, device: &Arc<Mutex<TunDevice>>) -> Result<()> {
+async fn flush_send_queue(state: &mut TcpFlowState, device: &Arc<TunWriter>) -> Result<()> {
     let mut bursts = 0;
     loop {
         let in_flight = state.seq.wrapping_sub(state.snd_una);
@@ -2076,10 +2597,8 @@ async fn flush_send_queue(state: &mut TcpFlowState, device: &Arc<Mutex<TunDevice
             );
         }
         let pkt = build_tcp_psh_packet(state, &payload)?;
-        {
-            let mut dev = device.lock().await;
-            dev.write_packet(&pkt).await?;
-        }
+        device.send(pkt).await;
+        device.count_down(n as u64);
         state.seq = state.seq.wrapping_add(n as u32);
         state.bytes_to_app += n as u64;
         bursts += 1;
@@ -2092,10 +2611,7 @@ async fn flush_send_queue(state: &mut TcpFlowState, device: &Arc<Mutex<TunDevice
 
     if state.send_queue.is_empty() && state.fin_queued && !state.fin_sent {
         let pkt = build_tcp_fin_packet(state)?;
-        {
-            let mut dev = device.lock().await;
-            dev.write_packet(&pkt).await?;
-        }
+        device.send(pkt).await;
         state.seq = state.seq.wrapping_add(1);
         state.fin_sent = true;
     }
@@ -2106,7 +2622,7 @@ async fn flush_send_queue(state: &mut TcpFlowState, device: &Arc<Mutex<TunDevice
 /// the app has not acknowledged enough yet.
 async fn queue_tunnel_payload(
     state: &Arc<Mutex<TcpFlowState>>,
-    device: &Arc<Mutex<TunDevice>>,
+    device: &Arc<TunWriter>,
     data: &[u8],
 ) -> Result<()> {
     let mut offset = 0;
@@ -2160,11 +2676,17 @@ fn build_tcp_ack_packet(state: &TcpFlowState) -> Result<Vec<u8>> {
 }
 
 fn build_tcp_psh_packet(state: &TcpFlowState, payload: &[u8]) -> Result<Vec<u8>> {
+    build_tcp_psh_packet_at(state, state.seq, payload)
+}
+
+/// Same as [`build_tcp_psh_packet`] but with an explicit sequence number, so a
+/// retransmission can re-send SND.UNA without rewinding SND.NXT.
+fn build_tcp_psh_packet_at(state: &TcpFlowState, seq: u32, payload: &[u8]) -> Result<Vec<u8>> {
     let mut pkt = Vec::with_capacity(128 + payload.len());
     match (state.dst_ip, state.src_ip) {
         (IpAddr::V4(dst), IpAddr::V4(src)) => {
             etherparse::PacketBuilder::ipv4(dst.octets(), src.octets(), 64)
-                .tcp(state.dst_port, state.src_port, state.seq, 65535)
+                .tcp(state.dst_port, state.src_port, seq, 65535)
                 .ack(state.ack)
                 .psh()
                 .write(&mut pkt, payload)
@@ -2483,5 +3005,190 @@ mod tests {
         } else {
             assert_eq!(settings.name, "phantom0");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // TUN write path
+    // -----------------------------------------------------------------------
+
+    /// A device whose reads never complete and which records what is written
+    /// to it. Both behaviours are impossible to arrange with a real utun, and
+    /// both are exactly what the reported stall looked like: the app went quiet,
+    /// so `read_packet` never returned, while replies queued up behind it.
+    struct MockTun {
+        written: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl MockTun {
+        fn new(written: Arc<std::sync::Mutex<Vec<Vec<u8>>>>) -> Self {
+            Self { written }
+        }
+    }
+
+    impl TunIo for MockTun {
+        async fn read_packet(&mut self, _buf: &mut BytesMut) -> Result<usize> {
+            std::future::pending::<()>().await;
+            Ok(0)
+        }
+
+        fn try_write_packet(&mut self, pkt: &[u8]) -> std::io::Result<usize> {
+            self.written
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(pkt.to_vec());
+            Ok(pkt.len())
+        }
+    }
+
+    /// Before the fix the reader held the device for the whole time it waited
+    /// for an inbound packet, so every reply queued behind it: 100 packets took
+    /// far longer than a second (in practice: until the app spoke again) and an
+    /// ACK the app was waiting for could not be delivered at all.
+    #[tokio::test]
+    async fn pump_drains_the_write_queue_while_reads_never_become_ready() {
+        let written: Arc<std::sync::Mutex<Vec<Vec<u8>>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let proxy = Arc::new(TunProxy::new(
+            MockTun::new(Arc::clone(&written)),
+            "127.0.0.1:1080".parse().unwrap(),
+        ));
+
+        let mut device = MockTun::new(Arc::clone(&written));
+        let pump_proxy = Arc::clone(&proxy);
+        let pump = tokio::spawn(async move {
+            let _ = pump_proxy.run_pump(&mut device).await;
+        });
+
+        for i in 0..100u8 {
+            proxy.writer.send(vec![i; 64]).await;
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let count = written.lock().unwrap_or_else(|e| e.into_inner()).len();
+            if count == 100 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "only {count}/100 packets were written within 1 s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // Order is preserved: sequence matters for the TCP stack above us.
+        let sink = written.lock().unwrap_or_else(|e| e.into_inner());
+        for (i, pkt) in sink.iter().enumerate() {
+            assert_eq!(pkt[0], i as u8, "packet {i} written out of order");
+        }
+        drop(sink);
+
+        // The queue drained completely, so a producer is never left waiting.
+        assert_eq!(proxy.writer.queued(), 0);
+        pump.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // Retransmission discipline
+    // -----------------------------------------------------------------------
+
+    fn flow_with_queue(bytes: usize) -> TcpFlowState {
+        let mut state = new_flow_state(
+            "10.7.0.2".parse().unwrap(),
+            "142.251.91.201".parse().unwrap(),
+            40000,
+            443,
+            5000,
+        );
+        state.send_queue = vec![7u8; bytes];
+        state.peer_window = 65535;
+        state
+    }
+
+    #[test]
+    fn retransmit_sends_one_mss_then_respects_the_guard() {
+        let mut state = flow_with_queue(6 * TCP_MSS);
+        let t0 = std::time::Instant::now();
+
+        match decide_retransmit(&mut state, t0) {
+            RetransmitDecision::Send { bytes } => {
+                assert_eq!(bytes, TCP_MSS, "a dup ACK means one segment is missing");
+            }
+            other => panic!("expected a single-segment retransmit, got {other:?}"),
+        }
+
+        // The app keeps re-ACKing the same hole; without the guard this is the
+        // loop that produced 1600 retransmits and 115 MB of duplicates.
+        assert_eq!(
+            decide_retransmit(&mut state, t0 + std::time::Duration::from_millis(10)),
+            RetransmitDecision::Cooldown
+        );
+
+        // Past the guard another single segment may go out.
+        assert!(matches!(
+            decide_retransmit(&mut state, t0 + RETRANSMIT_GUARD + std::time::Duration::from_millis(1)),
+            RetransmitDecision::Send { bytes } if bytes == TCP_MSS
+        ));
+
+        // Spending the budget is bounded: two segments, not a window.
+        assert_eq!(state.dup_inject_total, 2 * TCP_MSS as u64);
+    }
+
+    #[test]
+    fn retransmit_gives_up_after_repeated_no_progress() {
+        let mut state = flow_with_queue(4 * TCP_MSS);
+        let mut now = std::time::Instant::now();
+        let mut sends = 0;
+        let mut give_up = None;
+        for _ in 0..40 {
+            match decide_retransmit(&mut state, now) {
+                RetransmitDecision::Send { .. } => {
+                    sends += 1;
+                    now += MAX_RTO;
+                }
+                RetransmitDecision::Cooldown => now += std::time::Duration::from_millis(10),
+                RetransmitDecision::GiveUp(reason) => {
+                    give_up = Some(reason);
+                    break;
+                }
+                RetransmitDecision::NothingQueued => panic!("queue was filled"),
+            }
+        }
+        assert_eq!(give_up, Some(FlowResetReason::NoProgress));
+        assert_eq!(sends, MAX_NO_PROGRESS_ROUNDS, "back-off rounds are bounded");
+    }
+
+    #[test]
+    fn retransmit_total_budget_stops_the_flood() {
+        let mut state = flow_with_queue(64);
+        let mut now = std::time::Instant::now();
+        let mut injected = 0u64;
+        let mut result = None;
+        for _ in 0..200_000 {
+            match decide_retransmit(&mut state, now) {
+                RetransmitDecision::Send { bytes } => {
+                    injected += bytes as u64;
+                    // Simulate the app draining what we sent, so the flow keeps
+                    // making progress and only the byte budget can stop it.
+                    state.snd_una = state.snd_una.wrapping_add(bytes as u32);
+                    state.send_queue = vec![7u8; 64];
+                    now += std::time::Duration::from_millis(20);
+                }
+                RetransmitDecision::Cooldown => now += std::time::Duration::from_millis(5),
+                RetransmitDecision::GiveUp(reason) => {
+                    result = Some(reason);
+                    break;
+                }
+                RetransmitDecision::NothingQueued => panic!("queue was filled"),
+            }
+        }
+        assert_eq!(result, Some(FlowResetReason::DuplicateBudget));
+        assert!(
+            injected <= DUP_INJECT_TOTAL_BUDGET + TCP_MSS as u64,
+            "injected {injected} bytes, budget is {DUP_INJECT_TOTAL_BUDGET}"
+        );
+        assert!(
+            injected >= DUP_INJECT_TOTAL_BUDGET - DUP_INJECT_WINDOW_BUDGET,
+            "the cap should be reached, not tripped early ({injected} bytes)"
+        );
     }
 }

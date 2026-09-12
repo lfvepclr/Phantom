@@ -17,6 +17,31 @@ pub struct TrafficStats {
     pub route_proxy: AtomicU64,
     pub udp_datagrams_up: AtomicU64,
     pub udp_datagrams_down: AtomicU64,
+
+    // ---- TUN path health -------------------------------------------------
+    //
+    // Only meaningful in TUN mode (the SOCKS5 path never writes IP packets),
+    // and the reason they exist: a stalled video stream and a healthy one look
+    // identical in `down`, because a wedged flow "transfers" a lot of bytes —
+    // all of them retransmissions.
+    /// Bytes injected into the app a second time (retransmissions).
+    pub tcp_dup_bytes: AtomicU64,
+    /// Duplicate-ACK events observed (each one is a "the app is missing
+    /// something" signal).
+    pub dup_acks: AtomicU64,
+    /// Cumulative time spent waiting for the TUN device to accept a write.
+    pub tun_write_wait_ms: AtomicU64,
+    /// Worst single wait for TUN writability, in milliseconds.
+    ///
+    /// This is the number that explains "the tunnel is fine but the app is
+    /// stalled": while the reader held the device, every ACK queued behind it.
+    pub tun_write_wait_max_ms: AtomicU64,
+    /// Peak depth of the TUN write queue, in bytes.
+    pub tun_txq_peak: AtomicU64,
+    /// Retransmissions suppressed by the guard/budget logic.
+    pub retransmit_suppressed: AtomicU64,
+    /// Flows killed because they exceeded the duplicate-injection budget.
+    pub retransmit_budget_rst: AtomicU64,
 }
 
 impl TrafficStats {
@@ -32,7 +57,9 @@ impl TrafficStats {
     /// Unset counters read as `0`, which is what an idle client should report.
     pub fn snapshot_json(&self) -> String {
         format!(
-            "{{\"up\":{},\"down\":{},\"udp_up\":{},\"udp_down\":{},\"conns\":{},\"route_direct\":{},\"route_proxy\":{}}}",
+            "{{\"up\":{},\"down\":{},\"udp_up\":{},\"udp_down\":{},\"conns\":{},\"route_direct\":{},\"route_proxy\":{},\
+             \"tcp_dup\":{},\"dup_acks\":{},\"tun_wq_ms\":{},\"tun_wq_max_ms\":{},\"tun_txq_peak\":{},\
+             \"retx_suppressed\":{},\"retx_budget_rst\":{}}}",
             self.tcp_bytes_up.load(Ordering::Relaxed),
             self.tcp_bytes_down.load(Ordering::Relaxed),
             self.udp_bytes_up.load(Ordering::Relaxed),
@@ -40,6 +67,13 @@ impl TrafficStats {
             self.tcp_connections.load(Ordering::Relaxed),
             self.route_direct.load(Ordering::Relaxed),
             self.route_proxy.load(Ordering::Relaxed),
+            self.tcp_dup_bytes.load(Ordering::Relaxed),
+            self.dup_acks.load(Ordering::Relaxed),
+            self.tun_write_wait_ms.load(Ordering::Relaxed),
+            self.tun_write_wait_max_ms.load(Ordering::Relaxed),
+            self.tun_txq_peak.load(Ordering::Relaxed),
+            self.retransmit_suppressed.load(Ordering::Relaxed),
+            self.retransmit_budget_rst.load(Ordering::Relaxed),
         )
     }
 
@@ -48,7 +82,9 @@ impl TrafficStats {
     /// Used before the first successful start, when no `TrafficStats` instance
     /// exists yet — the UI still wants a well-formed document to parse.
     pub fn zero_snapshot_json() -> String {
-        "{\"up\":0,\"down\":0,\"udp_up\":0,\"udp_down\":0,\"conns\":0,\"route_direct\":0,\"route_proxy\":0}"
+        "{\"up\":0,\"down\":0,\"udp_up\":0,\"udp_down\":0,\"conns\":0,\"route_direct\":0,\"route_proxy\":0,\
+         \"tcp_dup\":0,\"dup_acks\":0,\"tun_wq_ms\":0,\"tun_wq_max_ms\":0,\"tun_txq_peak\":0,\
+         \"retx_suppressed\":0,\"retx_budget_rst\":0}"
             .to_string()
     }
 
@@ -80,6 +116,36 @@ impl TrafficStats {
     pub fn record_udp_down(&self, bytes: u64) {
         self.udp_bytes_down.fetch_add(bytes, Ordering::Relaxed);
         self.udp_datagrams_down.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Payload written into the app a second (or third…) time.
+    pub fn record_tcp_dup(&self, bytes: u64) {
+        self.tcp_dup_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    /// One duplicate ACK seen from the app.
+    pub fn record_dup_ack(&self) {
+        self.dup_acks.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Time a packet spent waiting for the TUN write side.
+    pub fn record_tun_write_wait(&self, millis: u64) {
+        self.tun_write_wait_ms.fetch_add(millis, Ordering::Relaxed);
+        self.tun_write_wait_max_ms
+            .fetch_max(millis, Ordering::Relaxed);
+    }
+
+    /// Observe the current TUN write-queue depth.
+    pub fn record_tun_queue_depth(&self, bytes: u64) {
+        self.tun_txq_peak.fetch_max(bytes, Ordering::Relaxed);
+    }
+
+    pub fn record_retransmit_suppressed(&self, count: u64) {
+        self.retransmit_suppressed.fetch_add(count, Ordering::Relaxed);
+    }
+
+    pub fn record_retransmit_budget_rst(&self) {
+        self.retransmit_budget_rst.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Render stats in Prometheus exposition format.
@@ -181,8 +247,33 @@ mod tests {
         assert_eq!(
             stats.snapshot_json(),
             "{\"up\":1024,\"down\":2048,\"udp_up\":16,\"udp_down\":32,\
-             \"conns\":1,\"route_direct\":2,\"route_proxy\":1}"
+             \"conns\":1,\"route_direct\":2,\"route_proxy\":1,\
+             \"tcp_dup\":0,\"dup_acks\":0,\"tun_wq_ms\":0,\"tun_wq_max_ms\":0,\"tun_txq_peak\":0,\
+             \"retx_suppressed\":0,\"retx_budget_rst\":0}"
         );
+    }
+
+    #[test]
+    fn tun_path_counters_are_reported() {
+        let stats = TrafficStats::new();
+        stats.record_tcp_dup(1400);
+        stats.record_dup_ack();
+        stats.record_dup_ack();
+        stats.record_tun_write_wait(30);
+        stats.record_tun_write_wait(120);
+        stats.record_tun_queue_depth(65536);
+        stats.record_retransmit_suppressed(3);
+        stats.record_retransmit_budget_rst();
+
+        let json = stats.snapshot_json();
+        assert!(json.contains("\"tcp_dup\":1400"), "{json}");
+        assert!(json.contains("\"dup_acks\":2"), "{json}");
+        // Cumulative vs peak — the peak is what exposes a stalled writer.
+        assert!(json.contains("\"tun_wq_ms\":150"), "{json}");
+        assert!(json.contains("\"tun_wq_max_ms\":120"), "{json}");
+        assert!(json.contains("\"tun_txq_peak\":65536"), "{json}");
+        assert!(json.contains("\"retx_suppressed\":3"), "{json}");
+        assert!(json.contains("\"retx_budget_rst\":1"), "{json}");
     }
 
     #[test]

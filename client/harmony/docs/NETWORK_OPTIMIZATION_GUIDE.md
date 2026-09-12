@@ -961,3 +961,38 @@ QUIC（同一端口 UDP/443）监听并更新连接串，顺带消除 TCP-over-T
 
 反向约束同样成立：`net_tune` 这类「所有客户端都受益」的修正不要写进 `client/harmony`；而 cipher 判定日志这种
 只有鸿蒙才需要的诊断，也不要写进 `client/src/platform/`（否则 Android 客户端会继承一份与它无关的理由）。
+
+## 13.7 TUN 写路径与重传纪律（2026-09-12 晚，YouTube 卡顿复盘）
+
+视频「一直转圈」的直接证据来自真机 trace（`phantom_tun_trace.log`）：YouTube CDN
+（`142.251.91.201:443`）在 7 秒内触发 **1600 次 3-dup-ACK 快速重传**，往 `vpn-tun` 写入
+115 MB 几乎全是重复数据，期间有效下行只有 0.45 MB，内核还因 `txqueuelen 500` 溢出丢了
+58,814 个上行包。同一时段 Mac SOCKS5 隧道 333 KB/s、裸链路 310–362 KB/s —— 服务端上行
+3 Mbps 才是真上限，客户端本不该慢。
+
+### 两个数据面缺陷（都在共享的 `client/src/tun.rs`）
+
+| 缺陷 | 表现 | 根因 |
+|---|---|---|
+| F1 读包持锁 | ACK 发不出去，App 与客户端互相等 | `run()` 在 `read_packet().await` 期间持有 `Mutex<TunDevice>`，而该调用直到 App 发包才返回；所有写路径排在它后面 |
+| F2 dup-ACK 整窗重传 | 重传风暴，110+ MB 重复注入 | 3 个重复 ACK 触发 `st.seq = st.snd_una` 后 `flush_send_queue`，把整个未确认窗口重发一遍；App 丢弃重复、继续 ACK 同一个空洞，几毫秒后又来一轮 |
+
+### 修复与验收方法
+
+- **F1**：单一 pump 任务用 `select!` 同时驱动读包与写队列；所有写入方投递到 `TunWriter`
+  （4 MiB 高水位背压）。设备锁不再出现在热路径上。
+- **F2**：dup-ACK/超时只重发 1 个 MSS（`SND.NXT` 不回退），50 ms 冷却 + 指数退避
+  （50/100/200/400/800/1600 ms），每流重复注入预算 256 KiB/s 与 8 MiB 封顶，
+  连续 6 轮无进展直接 RST 让 App 重连。
+- **怎么复测**：`scripts/harmony-bench.sh --label "video 1080p" --seconds 60`
+  （每秒采 `ifconfig vpn-tun` + 拉 trace + `scripts/tun-trace-report.py` 判定）；
+  Mac 侧对照 `scripts/speedtest.sh`。阈值：重传 ≤ 5 次/分钟、重复注入 ≤ 1.2 × 有效字节、
+  单流有效下行 ≥ 5 MB、`vpn-tun` TX dropped 增量 0、TUN 平均下行 ≥ 250 KB/s。
+- **回归保护**：`client/src/tun.rs` 新增 mock 设备用例（`read_packet` 永不就绪时 100 个包
+  必须 1 s 内写完）与重传限幅/退避/预算用例；数值留档在 `tests/PERF_TUN_PATH_REPORT.md`。
+
+### 不在本轮（触发式后续）
+
+窗口缩放协商：当前 SYN-ACK 不带 wscale、手机窗口被限在 64 KB。按 40 ms RTT 计算
+64 KB/0.04 s ≈ 1.6 MB/s，远高于本节点的 375 KB/s 上限，所以只有在复测出现
+「inflight 长期顶在 64 KB 且 App 每 2 段不足一次 ACK」时才值得做。
