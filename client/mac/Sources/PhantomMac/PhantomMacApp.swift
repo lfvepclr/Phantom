@@ -74,13 +74,26 @@ final class WindowBridge {
 /// used to leave the system SOCKS proxy pointing at a listener that no longer
 /// exists, which looked like "the Mac lost its network" until the operator
 /// reset the proxy by hand.
+@MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupCrashLogger()
         // First run: with no connection configured there is nothing to see in
         // the menu bar, so open the window that explains what to do.
-        if PhantomTunnel.shared.serverURI.isEmpty {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+        guard PhantomTunnel.shared.serverURI.isEmpty else { return }
+        // The opener is published by the menu bar label the first time it
+        // appears, which can land after this hook — retry briefly instead of
+        // silently doing nothing on a fresh install.
+        openMainWindowWhenAvailable(attemptsLeft: 8)
+    }
+
+    private func openMainWindowWhenAvailable(attemptsLeft: Int) {
+        guard attemptsLeft > 0 else { return }
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(500))
+            if WindowBridge.shared.openMain == nil {
+                self.openMainWindowWhenAvailable(attemptsLeft: attemptsLeft - 1)
+            } else {
                 WindowBridge.shared.showMain()
             }
         }
