@@ -210,21 +210,12 @@ pub fn android_get_logs(since_cursor: u64) -> (Vec<String>, u64) {
 /// All zeroes when no tunnel has been started yet.
 pub fn android_get_stats_json() -> String {
     let stats = TRAFFIC_STATS.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    let Some(stats) = stats else {
-        return "{\"up\":0,\"down\":0,\"udp_up\":0,\"udp_down\":0,\"conns\":0,\"route_direct\":0,\"route_proxy\":0}"
-            .to_string();
-    };
-    use std::sync::atomic::Ordering;
-    format!(
-        "{{\"up\":{},\"down\":{},\"udp_up\":{},\"udp_down\":{},\"conns\":{},\"route_direct\":{},\"route_proxy\":{}}}",
-        stats.tcp_bytes_up.load(Ordering::Relaxed),
-        stats.tcp_bytes_down.load(Ordering::Relaxed),
-        stats.udp_bytes_up.load(Ordering::Relaxed),
-        stats.udp_bytes_down.load(Ordering::Relaxed),
-        stats.tcp_connections.load(Ordering::Relaxed),
-        stats.route_direct.load(Ordering::Relaxed),
-        stats.route_proxy.load(Ordering::Relaxed),
-    )
+    // The JSON shape lives in `TrafficStats` so every platform bridge (JNI,
+    // NAPI, macOS C FFI) reports the same keys in the same order.
+    match stats {
+        Some(stats) => stats.snapshot_json(),
+        None => crate::stats::TrafficStats::zero_snapshot_json(),
+    }
 }
 
 /// Tell the datapath that the phone's underlying network changed.

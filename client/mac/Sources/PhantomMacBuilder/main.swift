@@ -249,22 +249,10 @@ struct PhantomMacBuilder {
             }
         }
 
-        // 3.6 Install SPM's resource bundle (PhantomMac_PhantomMac.bundle)
-        // into Contents/Resources/ only. We do NOT create the root symlink
-        // here — it will be added AFTER codesign (step 6) to avoid
-        // "unsealed contents present in the bundle root" rejection from
-        // `codesign --deep`. Bundle.module finds the bundle via
-        // Bundle.main.resourceURL (→ Contents/Resources/), so the root
-        // symlink is only needed as a fallback for SPM's candidate list.
-        let rbName = "PhantomMac_PhantomMac.bundle"
-        let rbSrc = "\(buildDir)/\(rbName)"
-        if fm.fileExists(atPath: rbSrc) {
-            let rbDst = "\(resourcesDir)/\(rbName)"
-            try fm.copyItem(atPath: rbSrc, toPath: rbDst)
-            print("✅ Installed SPM resource bundle into Contents/Resources/")
-        } else {
-            print("⚠️  SPM resource bundle missing: \(rbSrc) — MenuBarExtra may not find MenuBarIcon")
-        }
+        // 3.6 No SPM resource bundle to install: the menu bar icon is drawn in
+        // code (MenuBarGlyph) and the window icon comes from AppIcon.icns, so
+        // the app no longer needs MenuBarIcon.png or the Bundle.module symlink
+        // dance that used to go with it.
 
         // 4. Write a complete Info.plist (merged from defaults + package-root
         // overlay). Without CFBundleExecutable / CFBundlePackageType /
@@ -350,7 +338,7 @@ struct PhantomMacBuilder {
         print("")
         print("✅ Built Phantom.app")
         print("   Path  : \(appPath)")
-        print("   Launch: sudo open \(appPath)  # sudo required for TUN device")
+        print("   Launch: open \(appPath)   # no sudo — SOCKS5 + system proxy mode")
 
         // 8. Stage the .app + Applications symlink for DMG creation.
         print("")

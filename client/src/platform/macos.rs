@@ -30,6 +30,13 @@ const LOG_BUFFER_CAPACITY: usize = 200;
 static LOG_BUFFER: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static LOG_CURSOR: Mutex<u64> = Mutex::new(0);
 
+/// Traffic counters of the running tunnel, published by `start_with_config`.
+///
+/// The tunnel task owns the only instance that matters; the UI polls a clone
+/// through `phantom_macos_get_stats_json`. `None` until the first successful
+/// start, which the UI renders as an all-zero snapshot.
+static TRAFFIC_STATS: Mutex<Option<std::sync::Arc<crate::stats::TrafficStats>>> = Mutex::new(None);
+
 /// Append a log line to the ring buffer.
 fn push_log(line: &str) {
     let mut buf = LOG_BUFFER.lock().unwrap();
@@ -301,6 +308,10 @@ fn start_with_config(config: ClientConfig) -> i32 {
 
         // Shared counters: SOCKS5 and TUN traffic land in the same instance.
         let stats = crate::stats::TrafficStats::new();
+        // Publish the counters so the Swift UI can show live throughput and
+        // the tunnel/direct split without keeping its own bookkeeping.
+        *TRAFFIC_STATS.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(std::sync::Arc::clone(&stats));
 
         // 1. Start local SOCKS5 proxy.
         let config_clone = config.clone();
@@ -578,6 +589,25 @@ pub unsafe extern "C" fn phantom_macos_free_logs(ptr: *mut std::ffi::c_char) {
 #[unsafe(no_mangle)]
 pub extern "C" fn phantom_macos_get_status() -> i32 {
     get_status()
+}
+
+/// Traffic counters as a flat JSON object, for the Swift UI's 连接信息 panel.
+///
+/// Shape (stable, mirrored by the Android/HarmonyOS bridges):
+/// `{"up":…,"down":…,"udp_up":…,"udp_down":…,"conns":…,"route_direct":…,
+///   "route_proxy":…}` — all zeroes before the first successful start.
+///
+/// The caller must free the returned pointer with `phantom_macos_free_logs`
+/// (it is the same `CString::into_raw` contract as the log buffer).
+#[unsafe(no_mangle)]
+pub extern "C" fn phantom_macos_get_stats_json() -> *mut std::ffi::c_char {
+    let stats = TRAFFIC_STATS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let json = match stats {
+        Some(stats) => stats.snapshot_json(),
+        None => crate::stats::TrafficStats::zero_snapshot_json(),
+    };
+    // SAFETY: same contract as `phantom_macos_get_logs`.
+    std::ffi::CString::new(json).unwrap_or_default().into_raw()
 }
 
 /// Return the last error message when status == 3, or an empty string.

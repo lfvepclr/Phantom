@@ -24,6 +24,34 @@ impl TrafficStats {
         Arc::new(Self::default())
     }
 
+    /// Snapshot the counters as a flat JSON object.
+    ///
+    /// Single source of truth for every UI bridge (Android JNI, HarmonyOS NAPI,
+    /// macOS C FFI): the shape is stable and positional parsing is unnecessary,
+    /// so a new counter can be added without touching the platform shells.
+    /// Unset counters read as `0`, which is what an idle client should report.
+    pub fn snapshot_json(&self) -> String {
+        format!(
+            "{{\"up\":{},\"down\":{},\"udp_up\":{},\"udp_down\":{},\"conns\":{},\"route_direct\":{},\"route_proxy\":{}}}",
+            self.tcp_bytes_up.load(Ordering::Relaxed),
+            self.tcp_bytes_down.load(Ordering::Relaxed),
+            self.udp_bytes_up.load(Ordering::Relaxed),
+            self.udp_bytes_down.load(Ordering::Relaxed),
+            self.tcp_connections.load(Ordering::Relaxed),
+            self.route_direct.load(Ordering::Relaxed),
+            self.route_proxy.load(Ordering::Relaxed),
+        )
+    }
+
+    /// The same JSON shape with every counter at zero.
+    ///
+    /// Used before the first successful start, when no `TrafficStats` instance
+    /// exists yet — the UI still wants a well-formed document to parse.
+    pub fn zero_snapshot_json() -> String {
+        "{\"up\":0,\"down\":0,\"udp_up\":0,\"udp_down\":0,\"conns\":0,\"route_direct\":0,\"route_proxy\":0}"
+            .to_string()
+    }
+
     pub fn record_tcp_up(&self, bytes: u64) {
         self.tcp_bytes_up.fetch_add(bytes, Ordering::Relaxed);
     }
@@ -136,5 +164,38 @@ mod tests {
         stats.record_tcp_connect();
         let output = stats.render_prometheus();
         assert!(output.contains("phantom_tcp_connections 3"));
+    }
+
+    #[test]
+    fn snapshot_json_reports_every_counter() {
+        let stats = TrafficStats::new();
+        stats.record_tcp_up(1024);
+        stats.record_tcp_down(2048);
+        stats.record_udp_up(16);
+        stats.record_udp_down(32);
+        stats.record_tcp_connect();
+        stats.record_route_proxy();
+        stats.record_route_direct();
+        stats.record_route_direct();
+
+        assert_eq!(
+            stats.snapshot_json(),
+            "{\"up\":1024,\"down\":2048,\"udp_up\":16,\"udp_down\":32,\
+             \"conns\":1,\"route_direct\":2,\"route_proxy\":1}"
+        );
+    }
+
+    #[test]
+    fn zero_snapshot_matches_live_shape() {
+        let live = TrafficStats::new().snapshot_json();
+        let zero = TrafficStats::zero_snapshot_json();
+        // Same keys in the same order — only the values differ.
+        let keys = |json: &str| {
+            json.trim_matches(['{', '}'])
+                .split(',')
+                .map(|kv| kv.split(':').next().unwrap_or_default().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(&live), keys(&zero));
     }
 }

@@ -3,7 +3,9 @@ import PackageDescription
 
 // Phantom macOS SwiftUI menu-bar client.
 //
-// Two executable targets:
+// One library plus two executables:
+//   - PhantomMacKit    — pure logic (URI parsing, log view, whitelist, probes,
+//                        menu-bar glyph). No UI state, so it is unit-testable.
 //   - PhantomMac       — the menu-bar app (links the Rust cdylib via -l phantom_client)
 //   - PhantomMacBuilder — bundler that packages PhantomMac into Phantom.app
 //
@@ -17,14 +19,14 @@ let package = Package(
         .executable(name: "PhantomMacBuilder", targets: ["PhantomMacBuilder"]),
     ],
     targets: [
+        .target(
+            name: "PhantomMacKit",
+            path: "Sources/PhantomMacKit"
+        ),
         .executableTarget(
             name: "PhantomMac",
+            dependencies: ["PhantomMacKit"],
             path: "Sources/PhantomMac",
-            resources: [
-                // Bundle MenuBarIcon.png (+ @2x) into PhantomMac_PhantomMac.bundle
-                // so MenuBarExtra can load it via Bundle.module.
-                .process("Resources"),
-            ],
             linkerSettings: [
                 // Link client/mac/PhantomLibs/libphantom_client.dylib (cargo output
                 // is copied there by scripts/build-mac.sh).
@@ -38,6 +40,11 @@ let package = Package(
                     "-Xlinker", "@executable_path/../Frameworks",
                 ])
             ]
+        ),
+        .testTarget(
+            name: "PhantomMacKitTests",
+            dependencies: ["PhantomMacKit"],
+            path: "Tests/PhantomMacKitTests"
         ),
         .executableTarget(
             name: "PhantomMacBuilder",

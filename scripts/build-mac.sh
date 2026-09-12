@@ -10,14 +10,17 @@
 # Usage:
 #   scripts/build-mac.sh             # 默认 release
 #   scripts/build-mac.sh --debug     # debug profile
+#   scripts/build-mac.sh --install   # 额外装到 /Applications 并刷新图标缓存
 
 set -euo pipefail
 
 PROFILE_FLAG="--release"
+INSTALL=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --debug) PROFILE_FLAG=""; shift ;;
-    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    --install) INSTALL=1; shift ;;
+    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 2 ;;
   esac
 done
@@ -55,6 +58,24 @@ echo "[3/4] swift build -c release ..."
 # Step 4: 跑 bundler 生成 Phantom.app
 echo "[4/4] swift run PhantomMacBuilder ..."
 ( cd "$MAC_DIR" && xcrun swift run -c release PhantomMacBuilder )
+
+# The Swift side now owns real logic (URI parsing, log filtering, whitelist
+# validation, probes, menu bar glyph). Run its tests so a broken icon or a
+# collapsed log pane cannot ship unnoticed.
+echo "[5/5] swift test ..."
+( cd "$MAC_DIR" && xcrun swift test )
+
+if [[ "$INSTALL" == "1" ]]; then
+    echo "[install] Copying to /Applications and refreshing the icon cache ..."
+    rm -rf /Applications/Phantom.app
+    cp -R "$MAC_DIR/.build/Phantom.app" /Applications/Phantom.app
+    # Finder caches icons per bundle id, so a replaced bundle with a new
+    # AppIcon.icns keeps showing the old artwork until LaunchServices is poked.
+    touch /Applications/Phantom.app
+    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+        -f /Applications/Phantom.app || true
+    echo "  Installed /Applications/Phantom.app (run 'killall Dock' if the old icon lingers)"
+fi
 
 echo ""
 echo "════════════════════════════════════════════════"

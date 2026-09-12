@@ -1,6 +1,28 @@
 # Phantom macOS Client
 
-Native macOS menu-bar 客户端。隧道引擎全部运行在 Rust cdylib 中，SwiftUI 仅做菜单栏控制壳。
+Native macOS menu-bar 客户端。隧道引擎全部运行在 Rust cdylib 中，SwiftUI 只做控制面：
+**菜单栏只负责状态与快捷开关**，主界面和日志分别是可缩放的独立窗口。
+
+## 界面结构
+
+| 区域 | 内容 | 说明 |
+|------|------|------|
+| 菜单栏图标 | 状态 / 启动·断开 / 打开主界面 / 日志窗口 / 退出 | 模板图，按**轮廓**区分状态（见下） |
+| 主窗口 | 服务器卡片、启动按钮、模式、连接串、连接信息、分流白名单、日志、退出 | 默认 460×780，最小 420×620，可缩放 |
+| 日志窗口 | 同一份日志 + 同一套控件 | 默认 760×460，独立可缩放 |
+
+菜单栏图标是**模板图**（`isTemplate = true`）：macOS 会把菜单栏附加项按单色渲染，
+彩色图形会被压成一个看不清的黑块，所以四个状态用**形状**区分，而不是颜色：
+
+| 状态 | 图标 |
+|------|------|
+| 未连接 | 空心幽灵轮廓 |
+| 连接中 | 轮廓 + 中央实心圆点 |
+| 已连接 | 实心幽灵 |
+| 错误 | 实心幽灵 + 右上角挖空感叹号 |
+
+日志面板只渲染**最近 200 行**（内存保留 1000 行，磁盘日志由 Rust 侧保留），单行不折行、
+等宽字体、连续重复折叠成 `×N`；`仅隧道 / 全部` 切换用来隐藏 `-> Direct (` 的直连记录。
 
 ## PRD 功能 → 技术架构映射
 
@@ -166,10 +188,16 @@ graph LR
 
 | 文件 | 职责 | 关键技术点 |
 |------|------|------------|
-| `PhantomMacApp.swift` | SwiftUI 入口 + MenuBarExtra + 图标状态 | `MenuBarExtra`、`NSImage` |
-| `PhantomTunnel.swift` | 隧道状态管理 + 日志轮询 | 500ms/1000ms Timer |
+| `PhantomMacApp.swift` | SwiftUI 入口 + MenuBarExtra + 窗口 + 退出钩子 | `MenuBarExtra`、`Window`、`NSApplicationDelegate` |
+| `MainWindowView.swift` | 主窗口布局（对齐鸿蒙版信息层级） | 高度测量 + 日志卡自适应 |
+| `LogViews.swift` | 日志卡片与日志窗口 | 过滤 / 暂停 / 清空 / 单行不折行 |
+| `InfoPanel.swift` | 连接信息与探针入口 | `TrafficRates`、`TunnelProbe` |
+| `ConnectionCard.swift` | 连接串输入、历史、分享二维码 | `QRCode`（CoreImage） |
+| `WhitelistEditor.swift` | 分流白名单列表编辑 | 逐条校验 + 批量导入 |
+| `PhantomTunnel.swift` | 隧道状态管理 + 日志/统计轮询 | 200ms 状态、500ms 日志、1s 统计 |
 | `Bridge.swift` | C FFI 声明与封装 | `@_silgen_name` |
 | `SystemProxy.swift` | 系统代理开关 | `networksetup -setsocksfirewallproxy` |
+| `PhantomMacKit/` | 纯逻辑库（可单测，无 UI 状态） | URI 解析、日志视图、白名单校验、SOCKS5 探针、菜单栏图标 |
 | `platform/macos.rs` | C-ABI + 状态机 + 日志缓冲 | `AtomicI32`、`Vec<String>` 环形缓冲、ready channel |
 | `tun.rs` | TUN 透明代理 | `tun` crate (utun) / `AsyncFd` (Android/ohos) |
 | `socks5.rs` | 本地 SOCKS5 代理 | RFC 1928、连接级加密 |
@@ -207,6 +235,7 @@ cargo xtask build mac --debug   # debug 构建
 cd <repo-root>
 scripts/build-mac.sh              # 默认 release (Apple Silicon)
 scripts/build-mac.sh --debug      # debug 构建
+scripts/build-mac.sh --install    # 额外装到 /Applications 并刷新图标缓存
 ```
 
 脚本会：
@@ -214,6 +243,11 @@ scripts/build-mac.sh --debug      # debug 构建
 2. 复制 dylib → `client/mac/.build/lib/`
 3. `xcrun swift build -c release` → SPM 编译 Swift
 4. `xcrun swift run PhantomMacBuilder` → 打包 `Phantom.app` + `dist/Phantom.dmg`
+5. `xcrun swift test` → 跑 `PhantomMacKit` 的纯逻辑测试（图标、过滤、校验、协议编解码）
+
+`--install` 会把产物复制到 `/Applications/Phantom.app`，`touch` 一次并调用
+`lsregister -f` 刷新 LaunchServices 的图标缓存 —— 换过 `appicon.png` 之后 Finder
+仍显示旧图标，就是这层缓存造成的（必要时 `killall Dock`）。
 
 ### 构建产物
 
@@ -286,7 +320,9 @@ scripts/build-mac.sh
 |------|------|------|
 | `permissionDenied` | 沙箱里裸 `swift` 受限 | 改用 `xcrun swift` |
 | `dyld: Library not loaded` | 签名缺失 | 重跑 `PhantomMacBuilder` |
-| `No image named 'MenuBarIcon'` | SPM asset catalog 问题 | 改用 `NSImage(contentsOf:)` |
+| 菜单栏只有黑块 / 看不出状态 | 用彩色 `Shape` 当菜单栏图标，被模板渲染抹平 | 图标已改为 `MenuBarGlyph` 绘制的模板图，按形状区分状态 |
+| Finder 里还是旧图标 | LaunchServices 图标缓存 | `scripts/build-mac.sh --install` 或 `lsregister -f` 后 `killall Dock` |
+| 主窗口图标是旧彩色插图 | 曾硬编码 `MenuBarIcon.png` | 已改用 `NSApplication.shared.applicationIconImage`（即 `AppIcon.icns`） |
 | DMG 双击闪退 | Gatekeeper 隔离 | `xattr -dr com.apple.quarantine /Applications/Phantom.app` |
 
 ## 打包与签名
@@ -301,14 +337,21 @@ scripts/build-mac.sh
 
 ```bash
 # Rust 单元测试
-cargo test -p phantom-client
+cargo test -p phantom-client --lib
+
+# Swift 纯逻辑测试（图标渲染 / 日志过滤 / 白名单校验 / SOCKS5 探针编解码）
+cd client/mac && xcrun swift test
+
+# 导出四种菜单栏状态 PNG 做人工确认（可选）
+PHANTOM_GLYPH_DUMP=/tmp/phantom-glyph xcrun swift test --filter MenuBarGlyphTests
 
 # 手动验证
 # 正常模式（推荐，与 ClashX / SpeedCat 等一致：普通用户运行，无需 sudo）
 open client/mac/.build/Phantom.app
-# 菜单栏出现图标 → 输入 URI → 选模式 → Start
+# 菜单栏出现幽灵图标 → 「打开主界面」→ 输入 URI → 选模式 → 启动
 # 验证 Hello 探测成功 → 显示 "Connected"，系统 SOCKS5 自动指向 127.0.0.1:11080
 # Stop 时自动还原（networksetup 以当前用户身份执行，无需授权弹窗）
+# 退出（底部按钮 / ⋯ 菜单 / ⌘Q）都会先断开隧道并还原系统代理
 ```
 
 ## 安装与部署
@@ -364,5 +407,6 @@ client/mac/
 
 - [ ] DMG 打包自动化优化
 - [ ] Ad-hoc 签名 / 开发者签名
-- [ ] 菜单栏交互优化（快捷键、通知）
+- [ ] 连接状态通知（菜单栏图标之外的系统提示）
+- [ ] 测延迟 / 测速的历史曲线
 - [ ] 自动更新检查

@@ -81,6 +81,16 @@ func phantomMacosGetLastError() -> String? {
     return msg.isEmpty ? nil : msg
 }
 
+/// Live traffic counters of the running tunnel as the bridge's flat JSON.
+///
+/// Never fails: an unparsable/absent document yields `{}`, which
+/// `TrafficSnapshot` reads as all-zero counters.
+func phantomMacosGetStatsJson() -> String {
+    guard let cStr = phantom_macos_get_stats_json() else { return "{}" }
+    defer { phantom_macos_free_logs(cStr) }
+    return String(cString: cStr)
+}
+
 // MARK: - C FFI Declarations
 
 @_silgen_name("phantom_macos_start_with_uri")
@@ -106,3 +116,6 @@ func phantom_macos_get_status() -> Int32
 
 @_silgen_name("phantom_macos_get_last_error")
 func phantom_macos_get_last_error() -> UnsafeMutablePointer<CChar>?
+
+@_silgen_name("phantom_macos_get_stats_json")
+func phantom_macos_get_stats_json() -> UnsafeMutablePointer<CChar>?
