@@ -50,6 +50,17 @@
       {
         // Keep the embedded server alive while the app is backgrounded.
         "name": "ohos.permission.KEEP_BACKGROUND_RUNNING"
+      },
+      {
+        // In-app QR scanner (pages/ScanPage.ets) drives the camera directly.
+        "name": "ohos.permission.CAMERA",
+        "reason": "$string:camera_permission_reason",
+        "usedScene": {
+          "abilities": [
+            "EntryAbility"
+          ],
+          "when": "inuse"
+        }
       }
     ]
   }

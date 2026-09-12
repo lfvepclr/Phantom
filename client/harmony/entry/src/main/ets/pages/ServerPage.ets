@@ -117,7 +117,11 @@ export struct ServerPage {
   }
 
   build() {
-    Column({ space: 16 }) {
+    // Same shape as the dashboard: a single column that starts at the top.
+    // `Scroll` keeps the QR block and the copy button reachable on short windows
+    // (unfolded landscape), where the fixed-height column used to be clipped.
+    Scroll() {
+      Column({ space: 16 }) {
       Text('Phantom Server')
         .fontSize(24)
         .fontWeight(FontWeight.Bold)
@@ -186,7 +190,11 @@ export struct ServerPage {
       }
     }
     .width('100%')
+    .padding({ left: 0, right: 0, bottom: 24 })
+    }
+    .width('100%')
     .height('100%')
+    .align(Alignment.Top)
     .backgroundColor('#FFFFFF')
   }
 }

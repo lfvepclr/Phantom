@@ -175,6 +175,7 @@ graph LR
 | `socks5.rs` | 本地 SOCKS5 代理 | RFC 1928、连接级加密 |
 | `dns.rs` | DNS 劫持 | DoT 上游 |
 | `rules.rs` | 规则引擎 | Smart 模式 |
+| `whitelist.rs` | 代理白名单（默认直连） | 内置被墙域名 FST + 用户条目 |
 | `hello.rs` | Hello 验证 | 端到端探测 |
 
 ## 使用的框架
@@ -303,20 +304,26 @@ scripts/build-mac.sh
 cargo test -p phantom-client
 
 # 手动验证
-sudo open client/mac/.build/Phantom.app
+# 正常模式（推荐，与 ClashX / SpeedCat 等一致：普通用户运行，无需 sudo）
+open client/mac/.build/Phantom.app
 # 菜单栏出现图标 → 输入 URI → 选模式 → Start
-# 验证 Hello 探测成功 → 显示 "Connected"
+# 验证 Hello 探测成功 → 显示 "Connected"，系统 SOCKS5 自动指向 127.0.0.1:11080
+# Stop 时自动还原（networksetup 以当前用户身份执行，无需授权弹窗）
 ```
 
 ## 安装与部署
 
 ```bash
 # TUN 需要 root：
-sudo open client/mac/.build/Phantom.app
+# 普通模式（SOCKS5 + 系统代理）：普通用户即可
+open client/mac/.build/Phantom.app
 
 # 或复制到 /Applications
 sudo cp -r client/mac/.build/Phantom.app /Applications/
-sudo open /Applications/Phantom.app
+open /Applications/Phantom.app
+
+# 需要 TUN 透明代理时才用 root 启动可执行文件
+sudo /Applications/Phantom.app/Contents/MacOS/Phantom
 
 # 清除 Gatekeeper 隔离
 xattr -dr com.apple.quarantine /Applications/Phantom.app

@@ -18,6 +18,42 @@ BUILD_MODE="${BUILD_MODE:-release}"
 
 cd "$RUST_DIR"
 
+# The OHOS clang lives inside the DevEco Studio SDK, and its path differs
+# between the IDE install and the standalone command-line tools. `.cargo/config.toml`
+# carries the classic IDE path; override it here so any layout works.
+if [[ -z "${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_LINKER:-}" ]]; then
+  CANDIDATE_ROOTS=(
+    "${DEVECO_SDK_HOME:-}"
+    "/Applications/DevEco-Studio.app/Contents/sdk"
+    "$HOME/Applications/DevEco-Studio.app/Contents/sdk"
+    "${OHOS_SDK_HOME:-}"
+    "$HOME/Library/OpenHarmony/Sdk"
+    "/opt/ohos-sdk"
+  )
+  for root in "${CANDIDATE_ROOTS[@]}"; do
+    [[ -n "$root" ]] || continue
+    candidate="$(find "$root" -maxdepth 6 -type f -name 'aarch64-unknown-linux-ohos-clang' 2>/dev/null | head -1)"
+    if [[ -n "$candidate" ]]; then
+      export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_LINKER="$candidate"
+      echo "[build-harmony] OHOS linker: $candidate"
+      break
+    fi
+  done
+fi
+
+if [[ -z "${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_LINKER:-}" ]]; then
+  cat >&2 <<'MSG'
+ERROR: HarmonyOS native toolchain not found (aarch64-unknown-linux-ohos-clang).
+
+Install DevEco Studio (which bundles the HarmonyOS SDK) or the DevEco command
+line tools, then either:
+  export DEVECO_SDK_HOME=/Applications/DevEco-Studio.app/Contents/sdk
+or point directly at the linker:
+  export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_OHOS_LINKER=<sdk>/native/llvm/bin/aarch64-unknown-linux-ohos-clang
+MSG
+  exit 1
+fi
+
 CARGO_ARGS=()
 if [[ "$BUILD_MODE" == "release" ]]; then
     CARGO_ARGS+=(--release)

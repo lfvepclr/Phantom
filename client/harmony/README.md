@@ -56,6 +56,174 @@ graph TB
 | `phantom_harmony_get_last_error()` | ArkTS ← Rust | 状态 3 时 | 错误信息 |
 | `phantom_harmony_get_logs(since)` | ArkTS ← Rust | 1000ms | 批量日志 + cursor |
 
+### VPN 能力接入（HarmonyOS 6.0 / 7.0）
+
+系统「钥匙」图标与「允许使用 VPN」授权弹窗只由 **VpnExtensionAbility** 触发。
+普通 UIAbility 里直接建连（例如只开一个本地 SOCKS5 端口）不会注册到系统 VPN
+框架，因此既没有授权弹窗，也没有状态栏图标。两代系统的模型一致：
+
+| 步骤 | API | 起始版本 | 说明 |
+|------|-----|----------|------|
+| 1. 声明扩展 | `module.json5` → `extensionAbilities[type=vpn]` | API 11 | 安装后 `bm dump` 里 `type=502` |
+| 2. 请求启动 | `vpnExtension.startVpnExtensionAbility(want)` | API 11 | **系统在此弹出授权框**，用户同意后才真正拉起扩展进程 |
+| 3. 建 vNIC | `createVpnConnection(context).create(config)` | API 11 | 返回 TUN fd；成功后状态栏出现 VPN 图标 |
+| 4. 保护自身 socket | `protectProcessNet()` / `protect(fd)` | 22 / 11 | 隧道流量走物理网卡，不回灌 TUN |
+| 5. 停止 | `stopVpnExtensionAbility(want)` 或 `destroy()` | 11 | 扩展 `onDestroy` 中销毁 vNIC，图标消失 |
+
+HarmonyOS 7.0（API 26）额外提供 `vpnExtension.createVpnObserver()` +
+`onAuthorizationResult(cb)`，可以拿到用户"允许/拒绝"的回调；6.0（API 20）没有，
+只能通过扩展进程是否成功 `create()` 来推断。另外 6.0 起支持
+`RouteInfo.isExcludedRoute`（服务器 IP 排除在隧道外）和 `generateVpnId()`
+（多 VPN 共存），7.0 起 `create()` 的 fd 语义不变，`Want.parameters` 可在首次
+启动时携带参数（22+）。
+
+Phantom 的实现分工：
+
+```
+UIAbility 进程 (pages/Index.ets)          VpnExtensionAbility 进程
+────────────────────────────────          ─────────────────────────────
+publishStart(filesDir, uri, mode)  ──▶    onCreate → readStart() → create(vNIC)
+startVpnExtensionAbility(want)            → phantomHarmonyStart(tunFd, uri, mode)
+                                          → publishStatus()/appendLog()  ──▶ 
+readStatus()/readLog()             ◀──    （1 Hz 把 Rust 状态写成文件）
+```
+
+两个进程不共享内存（`preferences` 的内存缓存也各自独立），所以状态与日志通过
+`filesDir` 下的普通文件交换，见 `ets/common/VpnBridge.ets`：
+
+| 文件 | 写入方 | 内容 |
+|------|--------|------|
+| `phantom_vpn_start.txt` | UI | `mode\nuri` |
+| `phantom_vpn_status.txt` | 扩展 | `status\nupdatedAt\nerror` |
+| `phantom_vpn.log` | 扩展 | Rust 日志（磁盘保留最后 400 行） |
+
+### TUN 数据面
+
+**TCP 终结**：TUN 里的应用把客户端当作对端，所以 `tun.rs` 必须实现一个够用的
+TCP 发送方。当前实现要点（此前这里是大坑：序列号恒定、从不看 ACK，导致任何大于
+一个 MSS 的响应都被对端当成重复而丢弃，TLS 握手必然失败）：
+
+| 维度 | 实现 |
+|------|------|
+| 序号 | 每个流维护 `SND.UNA / SND.NXT / RCV.NXT`，SYN、数据、FIN 各自占用序号 |
+| 分段 | 按 `TCP_MSS = 1400` 切分后写入 TUN |
+| ACK | 解析应用回包的 ACK 与窗口，滑动 `send_queue`，窗口不足时暂停读取隧道 |
+| 重传 | 500 ms 的 go-back-N 监管任务：`SND.NXT := SND.UNA` 后重发，20 次后放弃 |
+| 去重 | 应用重传的重叠数据按 `RCV.NXT` 裁剪，避免重复注入隧道 |
+| 背压 | 未确认队列超过 512 KiB 时停止从隧道读取，ACK 释放后经 `Notify` 唤醒 |
+
+**代理直通**：TUN 决定走隧道后，会以内部 `ATYP_PREROUTED`（仅接受 loopback 来源）
+向本地 SOCKS5 入口发起请求，明确表示"策略已判定"，避免 relay 用只剩 IP 的目标
+再判一次而回退成直连。
+
+### DNS 分流（TUN 模式）
+
+应用的所有 DNS 查询都会进入 TUN，由客户端按域名分流决定用哪个解析器：
+
+| 场景 | 解析器 | 传输 |
+|------|--------|------|
+| Smart 模式命中白名单（被墙域名） | `client.dns`（默认 `8.8.8.8:53`） | 经 `udp_relay` 在隧道内解析，服务端出口在 HK，无污染 |
+| Smart 模式未命中（国内域名） | `client.dns_direct`（默认 `223.5.5.5:53`） | 物理网卡直连解析，CDN 节点最优 |
+| Proxy 模式 | `client.dns` | 全部经隧道 |
+| Direct 模式 | `client.dns_direct` | 全部本地 |
+
+两个关键实现点：
+
+- 解析出的 A 记录会写入 `DnsCache`（IP → 域名），TUN 的 TCP 路径据此命中白名单，
+  所以「域名走隧道解析 → TCP 走隧道」是一条闭环链路。
+- 直接解析用的 socket 属于被 `protectProcessNet()` 保护的扩展进程，并且
+  它的源端口在 `handle_udp` 中被排除在劫持之外；扩展还会把直连解析器地址
+  作为 `isExcludedRoute` 加入VPN 路由，保证 6.0（无 protectProcessNet）也不回环。
+
+### 日志与扫码
+
+- 日志：Rust 侧关闭 ANSI（`with_ansi(false)`）、target 前缀与时间戳，由 ArkTS
+  统一加上本地 `HH:MM:SS`；UI 每行不换行（单行 + 省略号），只渲染最后
+  **200 行**（`LOG_UI_LINES`），并提供「暂停 / 显示直连 / 清空」。
+- 日志过滤默认是「仅隧道」：`route … -> Direct (…)` 与
+  `route <域名>:53 -> Direct (dns local)` 都带 `-> Direct (`，所以一个开关就能
+  同时滤掉国内 DNS 与国内直连两类噪音；切到「全部」才看明细。
+- 连续重复的同一行（同一域名反复解析、同一目标反复重连）在界面上合并为一行并
+  追加 `×N`，避免 200 行窗口被刷空；磁盘文件保持原始逐行记录。
+- 磁盘日志是**滚动**的：默认保留最后 **2000 行**（`LOG_MAX_LINES`），不会无限堆积，
+  排查问题时即使界面上隐藏了直连流量，文件里仍然完整。
+- `route … -> PROXY|DIRECT`、`dns … via tunnel|local` 均为 INFO 级，便于直接核对分流。
+- 「记录 TUN 追踪」开关（详情面板，默认关，**重启隧道后生效**）会把用户态 TCP 栈的
+  报文级细节写到 `<filesDir>/phantom_tun_trace.log`（上限 5000 行）：对端 SYN 选项
+  （MSS / wscale / SACK / TS）、我们发出的 SYN-ACK、每个注入分段的
+  seq/len/窗口、零窗口探测、3 次重复 ACK 快速重传、流结束原因与上下行字节数。
+  排查「某个 App 连不上」时先开它，再 `hdc file recv` 取回文件。追踪**不进入**界面日志。
+- 扫码：`pages/ScanPage.ets` 自绘取景框（CameraKit 预览 → `ImageReceiver` 逐帧），
+  每 350 ms 把一帧交给 HMS Scan Kit（`detectBarcode.decode({uri})`，失败时退化为
+  `decodeImage` + NV21），识别到 `phantom://` 即写入 `phantom_ui` preferences 并返回。
+  需要 `ohos.permission.CAMERA`；拒绝授权或识别失败时可从相册选择或手动粘贴。
+- 扫码页跟随重力：订阅 `display.on('change')`，用
+  `previewOutput.getPreviewRotation(displayRotation)` / `setPreviewRotation()` 让硬件预览
+  在 0/90/180/270 四个方向都正立；软件回退路径同步 `pixelMap.rotate()`。
+  进入扫码页时开启沉浸式全屏（`setWindowLayoutFullScreen` + 清空系统栏）并在退出时恢复，
+  根容器带 `expandSafeArea`，因此上下不再有黑边。
+
+### 直连失败回退到隧道
+
+分流判断依赖 `DnsCache`（IP → 域名）。如果一个 App 自己解析域名（内置 DoH、或使用上次
+会话缓存下来的 IP），我们看不到那条 DNS 查询，白名单就无法命中——Google Earth / Google
+Maps 正是这种形态：它们直接用自己解析出来的 Google IP 建连。
+
+这类连接只满足「没有任何规则命中、按 `final_action = direct` 放行」，是一个**猜测**。
+因此这类直连如果在 2.5 s 内连不上（被墙的地址是被黑洞丢弃，而不是 refuse），
+`tcp_direct_relay_task` 会把**同一条流**交给隧道重新中继：App 侧的 TCP 状态、序列号、
+已缓冲的 payload 全部沿用，App 完全感知不到换过上游。日志会出现：
+
+```
+route 142.250.197.238:443 -> Proxy (direct connect timed out; retrying through the tunnel)
+```
+
+约束：只有 `RouteReason::Final` 的 Direct 才允许回退——`mode = direct` 是用户的明确指令，
+用户规则里的 Direct 也不允许被改写（见 `RouteDecision::allows_tunnel_fallback` 与其单测）。
+
+### 网络切换自愈
+
+Wi-Fi ⇄ 移动数据切换会让隧道里所有 socket 失效（源地址变了），旧版本表现为「界面显示已连接
+但什么都不通」。现在：
+
+- `PhantomVpnExtensionAbility` 通过 `connection.createNetConnection()` 订阅
+  `netAvailable` / `netLost` / `netCapabilitiesChange`，1 s 去抖后重新
+  `protectProcessNet()` 并调用 NAPI `phantomHarmonyOnNetworkChange()`。
+- Rust 侧 `android_notify_network_change()` 递增网络 epoch：epoch 过期的 TCP 流会被**立即
+  RST**（让 App 尽快重连，而不是等自己的超时）、共享的 DNS-over-tunnel 流被丢弃（下次查询
+  自动重建）、QUIC 池清空、failover 健康计数清零。
+- 隧道 socket 开 TCP keepalive（15 s 空闲 + 3 次探测），避免「假连接」长期存在。
+- 扩展进程被杀时，UI 按 3 s / 10 s / 30 s 退避自动重启，最多 3 次，之后提示手动重连；
+  切换发生时界面顶部显示「网络已切换，正在自动重建隧道」。
+
+### 首页信息架构
+
+自上而下：标题 → 服务器卡片（**地址**、状态徽标、协议与加密、实时速率与分流统计，整卡
+可点开详情）→ 主按钮（启动/停止 + 一行提示）→ 模式段控件（全局/智能/直连）→
+可折叠的连接卡（已保存 N 个连接 · 扫码图标 · 历史下拉）→ 日志卡。
+
+- 颜色统一走 `common/Theme.ets`，不再散落硬编码 `#007DFF/#999999`。
+- **不展示连接名**：`phantom://…` 的 `#fragment`（服务器自举时写的 `default`）对用户没有
+  信息量，卡片、详情标题、历史下拉一律显示 `host:port`（`linkAddress()`）。
+- 顶部不再单独放「详情」按钮：整张服务器卡片就是详情入口，少一个和卡片重复的点击目标。
+- **可折叠屏必须显式顶对齐**：`Scroll` 在子内容比视口矮时会把子组件**垂直居中**——Pura X Max
+  展开后竖屏（内屏 1828×2584）时整页因此悬在中间（实测上下各留 ~270 px）。仪表盘与「服务端」
+  页的 `Scroll` 都必须带 `.align(Alignment.Top)`，让内容从顶部向下依次堆叠。
+- **日志卡按窗口高度自适应**：卡片高度 = `视口高 − 上方内容高 − 间距`，下限
+  `LOG_CARD_MIN_HEIGHT = 220 vp`；展开内屏时日志区顺势变高，窗口矮时保持 220 vp、页面整体滚动。
+  尺寸由 `onAreaChange`（单位 vp）实测后写入 `logCardHeight`，**不要**改用 `layoutWeight`：
+  权重会把子组件压到比下限还小（实测横屏时被压到 178 vp）。
+- **没有底部 Tab 栏**：连接/服务端用一个紧凑分段控件放在标题栏右侧（`topBar()`），
+  省下的约 56 vp + 系统导航条留白全部给日志区（展开竖屏实测日志列表 358 px → 1283 px）。
+- 日志工具栏顺序是 **标题 + 放大图标 →（弹性空白）→ 仅隧道/全部 → 暂停 → 清空**：
+  放大与清空必须分开，否则「想放大」很容易点到「清空」。
+- 日志卡右上角有**全屏**图标（`ic_expand` / `ic_collapse`）：点开后日志铺满整页（Tabs 之上
+  的覆盖层），长域名和错误堆栈不用再横向截断；再点一次收起。
+- 分享（二维码 + 复制 + 系统分享）移到详情面板；连接历史存在 `phantom_ui` 的
+  `serverHistory`（`uri\tlastUsedMs\tverifiedMs`，新→旧、去重、上限 20），
+  条目显示地址 + 相对时间，左侧**绿点**表示本机成功连接过（`verifiedMs > 0`）、灰点是
+  只存过没连过；点历史条目只填入不自动连接。
+
 ### 运行面设计（零 per-packet NAPI）
 
 | 技术点 | 实现 |
@@ -70,7 +238,8 @@ graph TB
 
 ```mermaid
 sequenceDiagram
-    participant A as ArkTS UI
+    participant UI as ArkTS UI (UIAbility 进程)
+    participant A as VpnExtensionAbility
     participant N as NAPI
     participant R as Rust (lib.rs → android.rs)
     participant H as Hello 验证
@@ -79,6 +248,8 @@ sequenceDiagram
     participant D as DNS 劫持
     participant Srv as Phantom Server
 
+    UI->>A: publishStart(uri, mode) + startVpnExtensionAbility(want)
+    A->>A: createVpnConnection().create(config) → tunFd
     A->>N: phantom_harmony_start(fd, uri, mode)
     N->>R: android_start_with_uri(fd, uri, mode)
     R->>H: verify_server_connection()
@@ -110,6 +281,7 @@ sequenceDiagram
         end
     end
 
+    UI->>A: stopVpnExtensionAbility(want)
     A->>N: phantom_harmony_stop()
     N->>R: android_stop()
 ```
@@ -242,6 +414,26 @@ cp ../../target/aarch64-unknown-linux-ohos/release/libphantom_harmony.so \
 ```
 
 ## 打包与签名
+
+> 推荐做法：在 DevEco Studio 里打开 `client/harmony`，连接真机后勾选
+> **File → Project Structure → Signing Configs → Automatically generate signature**
+> （需登录华为开发者账号；IDE 会自动生成 p12/cer/p7b 并把设备 UDID 写进调试
+> profile，同时补全 `build-profile.json5` 的 `signingConfigs`）。之后直接：
+>
+> ```bash
+> hdc list targets                                   # 确认设备已连接
+> hdc install entry/build/default/outputs/default/entry-default-signed.hap
+> hdc shell aa start -a EntryAbility -b co.phantom.harmony
+> ```
+
+下面的手工签名流程保留给没有 IDE 自动签名的场景（证书文件在 `signing/`，已 gitignore）。
+
+> **不要把自动签名结果提交进 git。** 勾选自动签名后 IDE 会把 `keyPassword` /
+> `storePassword` 明文（仅十六进制混淆）和本机绝对路径写进
+> `client/harmony/build-profile.json5`。该文件的 `signingConfigs` 属于**本机
+> 私有状态**：仓库里的版本保持为 `[]`，本机已用
+> `git update-index --skip-worktree client/harmony/build-profile.json5` 屏蔽改动，
+> 换机器 / 重新 clone 后需要在 DevEco 里再点一次自动签名。
 
 ### 构建签名 APP（真机安装）
 

@@ -21,7 +21,27 @@ use std::sync::{Mutex, MutexGuard};
 /// `mode` must be one of `proxy`, `smart`, or `direct`.
 #[napi]
 pub fn phantom_harmony_start(fd: i32, uri: String, mode: String) -> i32 {
-    phantom_android::android_start_with_uri(fd as std::os::unix::io::RawFd, &uri, &mode)
+    let rc = phantom_android::android_start_with_uri(fd as std::os::unix::io::RawFd, &uri, &mode);
+    // Which cipher `cipher=auto` resolves to on *this* device.
+    //
+    // HarmonyOS needs this in the app log because the answer is build- and
+    // platform-dependent in a way it is not elsewhere: RustCrypto picks its
+    // backend from a `cpufeatures` runtime probe, and that crate implements
+    // detection for Linux/Android/Apple only — on `target_os = "ohos"` it
+    // reports "no AES unit" unless the build enables the feature at compile
+    // time (see the ohos entry in `.cargo/config.toml`). Without this line the
+    // two cases — "intrinsics missing" and "intrinsics present but unused" —
+    // look identical from the outside.
+    tracing::info!(
+        "cipher auto = {} (hardware AES: {})",
+        phantom_core::CipherSuite::auto_detect(),
+        if phantom_core::crypto::cipher::hardware_aes_available() {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    rc
 }
 
 /// Start the tunnel with a TOML config string.
@@ -54,6 +74,41 @@ pub fn phantom_harmony_get_last_error() -> String {
 pub fn phantom_harmony_get_logs(since_cursor: i64) -> (Vec<String>, i64) {
     let (lines, cursor) = phantom_android::android_get_logs(since_cursor as u64);
     (lines, cursor as i64)
+}
+
+/// Snapshot of the live traffic counters as a JSON string.
+///
+/// The VPN extension process polls this once a second and stores it in the
+/// sandbox so the UI process can render live throughput:
+/// `{"up":…,"down":…,"udp_up":…,"udp_down":…,"conns":…,"route_direct":…,
+///   "route_proxy":…}`.
+#[napi]
+pub fn phantom_harmony_get_stats() -> String {
+    phantom_android::android_get_stats_json()
+}
+
+/// Tell the datapath that the phone's network changed (Wi-Fi ⇄ cellular).
+///
+/// In-flight TCP flows are reset, the shared DNS tunnel flow is dropped and
+/// cached QUIC connections are discarded, so apps retry on the new link
+/// instead of hanging on sockets bound to the old one. Returns the new epoch.
+#[napi]
+pub fn phantom_harmony_on_network_change() -> i64 {
+    phantom_android::android_notify_network_change() as i64
+}
+
+/// Enable the opt-in TUN trace (pass an empty string to disable).
+///
+/// The trace records SYN options, every injected segment, retransmissions and
+/// flow endings for the on-device TCP stack. Returns 0 on success.
+#[napi]
+pub fn phantom_harmony_set_trace(path: String) -> i32 {
+    let path = path.trim();
+    if path.is_empty() {
+        phantom_android::android_set_trace_path(None)
+    } else {
+        phantom_android::android_set_trace_path(Some(path))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -141,9 +196,7 @@ fn start_server_inner(
     }
     let start_port = match port {
         0 => None,
-        p => Some(
-            u16::try_from(p).map_err(|_| napi_err(format!("port {p} out of range")))?,
-        ),
+        p => Some(u16::try_from(p).map_err(|_| napi_err(format!("port {p} out of range")))?),
     };
     let cipher = match cipher {
         "" | "auto" => None,

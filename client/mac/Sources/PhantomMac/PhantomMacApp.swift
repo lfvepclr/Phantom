@@ -114,22 +114,92 @@ private struct MenuBarLabel: View {
     let state: PhantomState
 
     var body: some View {
-        // Use Image(nsImage:) so we can use the original branded icon as a template.
-        if let base = PhantomMacApp.loadMenuBarIcon(template: true) {
-            Image(nsImage: base)
-                .overlay(alignment: .topTrailing) {
-                    Circle()
-                        .fill(state.indicatorColor)
-                        .frame(width: 6, height: 6)
-                        .overlay(Circle().stroke(Color.black.opacity(0.15), lineWidth: 0.5))
-                        .offset(x: 1, y: -1)
-                        .opacity(state.indicatorOpacity)
-                }
-        } else {
-            // Fallback SF Symbol
-            Image(systemName: state.iconName)
-                .foregroundStyle(state.indicatorColor)
+        // Vector ghost, tinted by state. Drawn rather than loaded from a PNG:
+        // the previous asset was a full-colour illustration, and forcing it to
+        // `isTemplate` flattened the dark plate into the "black square" the
+        // menu bar used to show.
+        ZStack(alignment: .topTrailing) {
+            switch state {
+            case .running:
+                GhostGlyph()
+                    .fill(state.indicatorColor, style: FillStyle(eoFill: true))
+            case .connecting:
+                GhostGlyph()
+                    .stroke(state.indicatorColor, lineWidth: 1.3)
+            case .error:
+                GhostGlyph()
+                    .stroke(state.indicatorColor, lineWidth: 1.3)
+                Image(systemName: "exclamationmark.circle.fill")
+                    .font(.system(size: 7, weight: .bold))
+                    .foregroundStyle(state.indicatorColor)
+                    .offset(x: 3, y: -3)
+            case .idle:
+                GhostGlyph()
+                    .stroke(state.indicatorColor, lineWidth: 1.2)
+            }
         }
+        .frame(width: 16, height: 16)
+        .help("Phantom — \(state.title)")
+    }
+}
+
+/// Minimal ghost silhouette with cut-out eyes.
+///
+/// One `Path` holding the body plus the two eye circles, filled with the
+/// even-odd rule so the eyes come out as holes; stroking the same path gives
+/// the "off" outline look.
+struct GhostGlyph: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        let w = rect.width
+        let h = rect.height
+        let r = w * 0.5
+        let bodyBottom = h * 0.82
+
+        // Head: semicircle (left-mid → top → right-mid).
+        path.move(to: CGPoint(x: rect.minX, y: rect.minY + r))
+        path.addArc(
+            center: CGPoint(x: rect.minX + r, y: rect.minY + r),
+            radius: r,
+            startAngle: .degrees(180),
+            endAngle: .degrees(0),
+            clockwise: false
+        )
+        // Right flank down to the hem.
+        path.addLine(to: CGPoint(x: rect.maxX, y: rect.minY + bodyBottom))
+        // Three hem scallops, right → left.
+        let scallop = w / 3
+        var x = rect.maxX
+        var up = true
+        for _ in 0..<3 {
+            let next = max(rect.minX, x - scallop)
+            path.addQuadCurve(
+                to: CGPoint(x: next, y: rect.minY + bodyBottom),
+                control: CGPoint(
+                    x: (x + next) / 2,
+                    y: rect.minY + bodyBottom + (up ? -h * 0.14 : h * 0.10)
+                )
+            )
+            x = next
+            up.toggle()
+        }
+        path.addLine(to: CGPoint(x: rect.minX, y: rect.minY + r))
+        path.closeSubpath()
+
+        // Eyes (holes under even-odd fill).
+        let eyeR = w * 0.09
+        let eyeY = rect.minY + r * 0.95
+        for dx in [rect.minX + w * 0.34, rect.minX + w * 0.66] {
+            path.addEllipse(
+                in: CGRect(
+                    x: dx - eyeR,
+                    y: eyeY - eyeR,
+                    width: eyeR * 2,
+                    height: eyeR * 2
+                )
+            )
+        }
+        return path
     }
 }
 
@@ -353,6 +423,34 @@ private struct InputSection: View {
                 .pickerStyle(.segmented)
                 .labelsHidden()
                 .disabled(tunnel.isRunning || state == .connecting)
+            }
+
+            // Proxy whitelist (Smart mode): only these destinations are
+            // tunnelled; everything else goes direct.
+            DisclosureGroup {
+                VStack(alignment: .leading, spacing: 4) {
+                    TextEditor(text: $tunnel.proxyDomainsText)
+                        .font(.system(size: 11, design: .monospaced))
+                        .frame(height: 72)
+                        .padding(4)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .fill(Color(nsColor: .textBackgroundColor))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .strokeBorder(Color.secondary.opacity(0.18), lineWidth: 0.5)
+                        )
+                        .disabled(tunnel.isRunning || state == .connecting)
+                    Text("One domain per line (subdomains included). 内置被墙清单已启用，这里只填额外需要走代理的域名。")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.top, 4)
+            } label: {
+                Text("分流白名单")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundStyle(.secondary)
             }
 
             // Primary action button

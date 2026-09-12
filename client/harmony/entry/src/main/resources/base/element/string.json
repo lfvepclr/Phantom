@@ -11,6 +11,10 @@
     {
       "name": "EntryAbility_label",
       "value": "Phantom"
+    },
+    {
+      "name": "camera_permission_reason",
+      "value": "用于扫描 Phantom 连接串二维码"
     }
   ]
 }

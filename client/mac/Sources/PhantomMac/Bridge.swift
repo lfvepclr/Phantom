@@ -24,6 +24,18 @@ func phantomMacosStop() -> Int32 {
     return phantom_macos_stop()
 }
 
+/// Replace the extra proxy-whitelist entries (newline/comma separated domains).
+/// Must be called before `phantomMacosStartWithURI`.
+@discardableResult
+func phantomMacosSetProxyDomains(_ domains: String) -> Int32 {
+    let byteCount = domains.utf8.count
+    return domains.withCString { cStr in
+        cStr.withMemoryRebound(to: UInt8.self, capacity: byteCount) { uintPtr in
+            phantom_macos_set_proxy_domains(uintPtr, byteCount)
+        }
+    }
+}
+
 /// Returns the local SOCKS5 listen port that the Rust side is using.
 /// Swift uses this to set the system proxy to the correct port.
 func phantomMacosSocks5Port() -> UInt16 {
@@ -76,6 +88,9 @@ func phantom_macos_start_with_uri(_ input: UnsafePointer<UInt8>?, _ len: Int) ->
 
 @_silgen_name("phantom_macos_stop")
 func phantom_macos_stop() -> Int32
+
+@_silgen_name("phantom_macos_set_proxy_domains")
+func phantom_macos_set_proxy_domains(_ input: UnsafePointer<UInt8>?, _ len: Int) -> Int32
 
 @_silgen_name("phantom_macos_get_socks5_port")
 func phantom_macos_get_socks5_port() -> UInt16
