@@ -123,7 +123,7 @@ Mac 不回归（硬门，相对基线下降 ≤ 5%）：
   所以「相对基线下降 ≤ 5%」不能用原始数字直接判定：隧道吞吐一直贴在**同轮**裸链路上限，
   即在 3 Mbps 上行下已到极限。四轮原始值都在计划记录的 310–362 KB/s 区间内。
 - `--check-unblock` 全绿：`google/generate_204` = 204、`gstatic/generate_204` = 204、
-  `youtube.com` = 200、`cdn-cgi/trace` 返回 `ip=203.0.113.10 colo=HKG loc=HK`（出口确实是香港节点）。
+  `youtube.com` = 200、`cdn-cgi/trace` 返回 `ip=<VPS 出口 IP> colo=HKG loc=HK`（出口确实是香港节点）。
 
 > 测量前提（`scripts/speedtest.sh` 本轮修掉的三处陷阱，否则数字不可信）：
 > ① 客户端必须绑定自己的 `--socks-port`，否则 1080 被别人占着时 `wait_for_port` 会"成功"、
