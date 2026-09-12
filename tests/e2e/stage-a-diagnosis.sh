@@ -3,7 +3,7 @@
 #   L1: VM 内直连容器（绕过 gvproxy）QUIC + TCP 吞吐
 #   对照: 宿主机经 gvproxy（gvproxy 转发层开销）
 set -u
-cd /Users/<user>/workspace/qoder/phantom
+cd "$(dirname "$0")/../.."
 
 KEY='cGhhbnRvbS1lMmUtdGVzdC1zZXJ2ZXIta2V5LTMyYiE=='
 PSK='cGhhbnRvbS1lMmUtcHJlLXNoYXJlZC1rZXktMzJiISE=='  # 原样 base64（与自举输出一致，uri.rs 按 & 分隔解析）

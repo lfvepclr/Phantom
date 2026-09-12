@@ -2,8 +2,8 @@
 [[servers]]
 name = "lan-server"
 address = "<内网主机IP>:8443"
-public_key = "<server-public-key-base64>="
-psk = "MLiTCSI2S0XXQNtJD1QcNtnfchv+mgeUPfp2AekATns="
+public_key = "<server-public-key-base64>"
+psk = "<server-psk-base64>"
 cipher = "aes256-gcm"
 protocol = "tcp"
 
@@ -12,4 +12,4 @@ listen = "0.0.0.0:1080"
 
 [client.proxy_auth]
 username = "router"
-password = "phantom-lan-2026"
+password = "change-me"

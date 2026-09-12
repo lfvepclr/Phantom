@@ -1,12 +1,115 @@
-# Phantom 服务端容器（musl 静态二进制 → scratch，零系统依赖）
-# 构建时 context 指向二进制所在目录，避免传输整个 target/：
-#   podman build -f deploy/Containerfile -t localhost/phantom-server \
-#     target/aarch64-unknown-linux-musl/release
-# 运行（I/O 型低配）：
-#   podman run -d --name phantom-server --network phantom-net \
-#     -p 443:443/tcp -p 443:443/udp --cpus 1 --memory 256m \
-#     -v "$PWD/.e2e-data:/data:Z" localhost/phantom-server
-FROM scratch
-COPY phantom-server /usr/local/bin/phantom-server
-WORKDIR /data
-ENTRYPOINT ["/usr/local/bin/phantom-server", "/data/server.toml"]
+# syntax=docker/dockerfile:1
+#
+# Phantom server packaging image — pinned build environment, no host toolchain
+# changes, and a verification stage that runs in the *same* Alpine release as
+# the production host (3.18).
+#
+# Works with both Podman and Docker (same syntax):
+#
+#   # 1) export the static binary (linux/amd64 by default)
+#   podman build -f deploy/Containerfile --target artifact \
+#     --build-arg TARGETARCH=amd64 -o type=local,dest=dist/stage .
+#
+#   # 2) run the artifact in an alpine:3.18 userland (the production OS)
+#   podman build -f deploy/Containerfile --target verify .
+#
+#   # 3) optional: a runnable OCI image for containerised deployments
+#   podman build -f deploy/Containerfile --target runtime -t phantom-server:0.1.0 .
+#
+# Cross-compilation, not QEMU: the builder stage runs on the *host* architecture
+# (--platform=$BUILDPLATFORM) and emits foreign-architecture code with rust-lld
+# plus the toolchain's self-contained musl CRT. Only the short `verify` run is
+# emulated, so the slow part (fat-LTO Rust) never runs under emulation.
+#
+# Network: toolchains and crates come from RsProxy (rsproxy.cn); the crate
+# registry mirror itself lives in .cargo/config.toml, which is copied in below.
+
+ARG RUST_VERSION=1.96
+ARG ALPINE_VERSION=3.18
+
+# ── builder ──────────────────────────────────────────────────────────────────
+# Deliberately based on Alpine 3.18 (the production release) so the musl
+# headers/version the toolchain sees match the target host.
+FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION}-alpine${ALPINE_VERSION} AS builder
+
+ARG TARGETARCH=amd64
+ARG TARGETVARIANT=
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    RUSTUP_DIST_SERVER=https://rsproxy.cn \
+    RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup \
+    CARGO_NET_GIT_FETCH_WITH_CLI=true \
+    CARGO_TERM_COLOR=never
+
+# binutils: explicit `strip --strip-all` (an explicit strip step avoids
+# depending on a target-prefixed `strip` being present for the cross target).
+RUN apk add --no-cache binutils
+
+# TARGETARCH → Rust target triple.
+RUN set -eux; \
+    case "$TARGETARCH" in \
+      amd64) triple=x86_64-unknown-linux-musl ;; \
+      arm64) triple=aarch64-unknown-linux-musl ;; \
+      arm)   [ "$TARGETVARIANT" = "v7" ] || { echo "arm variants other than v7 unsupported" >&2; exit 1; }; \
+             triple=armv7-unknown-linux-musleabihf ;; \
+      *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1 ;; \
+    esac; \
+    echo "$triple" > /tmp/rust-target; \
+    rustup target add "$triple"
+
+WORKDIR /src
+COPY . .
+
+# Cache mounts keep the registry + incremental artefacts inside the engine
+# across rebuilds without ever touching the host.
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/src/target \
+    set -eux; \
+    triple="$(cat /tmp/rust-target)"; \
+    cargo build --release -p phantom-cli --target "$triple"; \
+    mkdir -p /out; \
+    cp "target/$triple/release/phantom" /out/phantom; \
+    strip --strip-all /out/phantom; \
+    ls -l /out/phantom
+
+# ── test-artifacts ───────────────────────────────────────────────────────────
+# Offline end-to-end origin (tests/e2e/minihttpd.rs): a std-only static file
+# server used as a controllable "google.com" stand-in for pre-deployment tests.
+# Never part of the deployable bundle.
+FROM builder AS test-artifacts
+RUN set -eux; \
+    triple="$(cat /tmp/rust-target)"; \
+    rustc --edition 2021 -O --target "$triple" tests/e2e/minihttpd.rs -o /out/minihttpd; \
+    ls -l /out/minihttpd
+
+# ── artifact ─────────────────────────────────────────────────────────────────
+# Bare static binary, extractable with `podman build -o type=local,dest=...`.
+FROM scratch AS artifact
+COPY --from=builder /out/phantom /phantom
+
+# ── test-origin ──────────────────────────────────────────────────────────────
+FROM scratch AS test-origin
+COPY --from=test-artifacts /out/minihttpd /minihttpd
+
+# ── verify ───────────────────────────────────────────────────────────────────
+# Runs the produced binary inside the production Alpine release. `ldd` on a
+# static binary reports "not a dynamic executable" (busybox ldd may instead
+# fail outright); executing `--version` is the authoritative check.
+FROM alpine:3.18 AS verify
+COPY --from=builder /out/phantom /usr/local/bin/phantom
+RUN set -eux; \
+    ldd /usr/local/bin/phantom 2>&1 || true; \
+    /usr/local/bin/phantom --version; \
+    /usr/local/bin/phantom server --help >/dev/null
+
+# ── runtime ──────────────────────────────────────────────────────────────────
+# Optional OCI image for hosts that prefer containers over OpenRC. The Hong Kong
+# VPS (1 vCPU / 1 GB, no container runtime) uses the bare binary instead.
+FROM alpine:3.18 AS runtime
+COPY --from=builder /out/phantom /usr/local/bin/phantom
+WORKDIR /var/lib/phantom
+VOLUME ["/var/lib/phantom"]
+EXPOSE 443/tcp 443/udp
+ENTRYPOINT ["/usr/local/bin/phantom"]
+CMD ["server", "--port", "443", "--proto", "tcp"]

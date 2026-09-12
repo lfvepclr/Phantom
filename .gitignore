@@ -1,5 +1,6 @@
 # === Rust ===
 /target
+/dist
 Cargo.lock
 
 # === Secrets / Keys ===
@@ -12,6 +13,10 @@ Cargo.lock
 *.p7b
 *.keystore
 *.jks
+
+# === Packet captures (may contain real traffic / hostnames) ===
+*.pcap
+*.pcapng
 
 # === macOS ===
 .DS_Store

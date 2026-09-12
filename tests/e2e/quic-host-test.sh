@@ -1,7 +1,7 @@
 #!/bin/bash
 # E2E: QUIC 数据面（宿主机 → 8443 → phantom-server-quic 容器）
 set -u
-cd /Users/<user>/workspace/qoder/phantom
+cd "$(dirname "$0")/../.."
 
 URI_QUIC='phantom://cGhhbnRvbS1lMmUtdGVzdC1zZXJ2ZXIta2V5LTMyYiE==@127.0.0.1:8443?psk=cGhhbnRvbS1lMmUtcHJlLXNoYXJlZC1rZXktMzJiISE==&cipher=auto&proto=quic#default'
 

@@ -9,7 +9,7 @@ Phantom 是一个基于 Rust 的加密代理隧道，使用 Noise IK 协议认�
 - **零额外往返**: 密码协商嵌入 Noise 握手消息
 - **透明代理**: macOS / Android / Linux TUN 模式，无需手动配置应用代理
 - **路由器网关**: 华硕 RT-AX86U Pro 等 ARMv8 路由器上作为透明网关，LAN 全屋设备零配置
-- **智能分流**: 域名/IP/端口/GeoIP 规则引擎，全局/自动/直连三种模式
+- **白名单分流（默认直连）**: 智能模式只把**被墙域名清单**里的目标送进隧道，其余全部直连；清单用预构建 FST 索引（4.3k 域名 ≈ 37 KiB，零解析加载），可用 `cargo xtask rules update` 更新，并在 macOS 客户端里自行增补。规则引擎同时支持域名/IP/端口/GeoIP 自定义规则；全局/自动/直连三种模式
 - **DNS 劫持**: TUN 模式自动拦截 DNS 查询，防止 DNS 泄露
 - **UDP Relay**: TUN 模式 UDP 流量通过帧协议隧道转发
 - **系统代理自启**: macOS 启动后自动设置系统 SOCKS5 代理
@@ -33,6 +33,13 @@ cargo xtask build router   # 仅构建路由器客户端（aarch64 musl 静态�
 cargo xtask build mac      # 仅构建 macOS 客户端
 cargo xtask build android  # 仅构建 Android 客户端
 cargo xtask build harmony  # 仅构建 HarmonyOS 客户端
+
+# 服务端打包 / 部署 / 测速（服务器零编译，见 deploy/README.md）
+cargo xtask package server --platform linux/amd64   # 固定容器环境出包（+校验和）
+cargo xtask verify  server --platform linux/amd64   # alpine:3.18 容器内离线端到端验证
+cargo xtask deploy  server --host root@HOST         # 上传 + 安装 + 回显 phantom:// URI
+cargo xtask speedtest --uri "<URI>" --check-unblock # 吞吐 + 解锁断言
+cargo xtask speedtest --loopback                    # 客户端软件上限（本机回环）
 
 # 检查依赖状态
 cargo xtask check-deps
@@ -82,7 +89,10 @@ scripts/build-mac.sh              # 默认 Apple Silicon release
 - `.build/Phantom.app` — macOS 应用包
 - `.build/dist/Phantom.dmg` — DMG 安装镜像
 
-TUN 需要 root，请用 `sudo open client/mac/.build/Phantom.app` 启动。完整说明见 `client/mac/README.md`。
+普通模式无需 sudo：`open client/mac/.build/Phantom.app` 启动后点 Start，客户端以普通用户监听
+SOCKS5 `127.0.0.1:11080` 并用 `networksetup` 自动设置/还原系统代理（与其它菜单栏代理软件一致）。
+可选的 TUN 透明模式才需要 root，且 `sudo open X.app` 不会提权，需直接运行可执行文件：
+`sudo client/mac/.build/Phantom.app/Contents/MacOS/Phantom`。完整说明见 `client/mac/README.md`。
 
 macOS 原生客户端启动后，系统代理自动生效，无需手动配置。
 
@@ -98,7 +108,7 @@ cargo xtask build router
 bash deploy/router/install.sh <路由器IP> "phantom://KEY@vpn.example.com:443"
 ```
 
-完整说明（前置条件、路由原理、DNS 取舍、故障排查）见 [deploy/router/README.md](file:///Users/<user>/workspace/qoder/phantom/deploy/router/README.md)。
+完整说明（前置条件、路由原理、DNS 取舍、故障排查）见 [deploy/router/README.md](deploy/router/README.md)。
 
 ---
 
@@ -135,6 +145,26 @@ cargo xtask build all      # 所有可用目标
 > 国内用户：项目已配置字节跳动 rsproxy 镜像源（`.cargo/config.toml`），无需额外设置。
 
 ### 2. 服务端部署
+
+#### 2.0 一键打包 + 部署（推荐，服务器零编译）
+
+开发机出包、容器内验证、远端只解包安装：
+
+```bash
+cargo xtask package server --platform linux/amd64
+# dist/phantom-server-<version>-linux-amd64.tar.gz (+ .sha256)
+
+cargo xtask verify server --platform linux/amd64      # 需要 docker/podman
+
+cargo xtask deploy server \
+  --host root@203.0.113.10 --public-host 203.0.113.10 \
+  --port 443 --proto tcp
+# 结束时打印 phantom:// URI
+```
+
+默认在 `deploy/Containerfile`（`rust:1.96-alpine3.18`）里构建，宿主机不装交叉 target；
+没有容器引擎时加 `--no-container` 走宿主机 `rust-lld` 交叉。Alpine/OpenRC 的安装细节、
+无 Google 直连环境下的验证目标表，见 [deploy/README.md](deploy/README.md)。
 
 #### 2.1 自举模式（零配置）
 
@@ -216,7 +246,7 @@ name = "bob-phone"
 
 #### 2.3 服务端配置（load 模式）
 
-`phantom server -c <toml>` 时读取 TOML。模板见 [config/server.toml](file:///Users/<user>/workspace/qoder/phantom/config/server.toml)，`install.sh` 会自动拷贝到 `/etc/phantom/server.toml`。典型内容（精简版）：
+`phantom server -c <toml>` 时读取 TOML。模板见 [config/server.toml](config/server.toml)，`install.sh` 会自动拷贝到 `/etc/phantom/server.toml`。典型内容（精简版）：
 
 ```toml
 bind = "0.0.0.0:443"
@@ -309,7 +339,8 @@ public_key = "服务端公钥Base64"
 
 [client]
 listen = "127.0.0.1:1080"             # SOCKS5+HTTP 同端口（首字节嗅探）；0.0.0.0 即局域网共享
-dns = "tls://8.8.8.8:853"
+dns = "8.8.8.8:53"                    # 走隧道的解析器（被墙域名 / proxy 模式）
+dns_direct = "223.5.5.5:53"           # 直连解析器（smart 模式下未命中白名单的域名）
 mode = "smart"
 cipher = "auto"
 # metrics_listen = "127.0.0.1:9150"   # Prometheus /metrics 端点
@@ -405,7 +436,7 @@ macOS 客户端菜单栏提供 Global / Auto / Direct 三种模式切换，实�
 |---|---|
 | `[[rules]]` / `rules.final_action` | 重建规则引擎；新规则集解析失败时保留旧规则并告警 |
 | `client.mode` | smart ↔ proxy ↔ direct 切换 |
-| `client.dns` | DNS 上游重定向；不重建 socket，飞行中的查询不丢 |
+| `client.dns` / `client.dns_direct` | 重定向隧道/直连两个解析器；隧道侧会丢弃旧 UDP 流并在下次查询时重建，飞行中的查询不丢 |
 | `[[servers]]` | 替换服务器池；**当前活跃服务器若仍在新列表中则保持不动**，避免无必要的切换 |
 | `[failover]` | 健康检查间隔 / 超时 / 阀值即时生效 |
 

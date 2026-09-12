@@ -76,7 +76,7 @@ QUIC cipher 约束：AEAD 由 Noise pattern 固定（AESGCM 或 ChaChaPoly），
 
 ## 7. Phase E 真机验证（已完成）
 
-**环境**：本机 Mac（<本机内网IP>）↔ 第二台 MacBook Pro M1 Max/32GB（<内网主机IP>，<user>）。两端均为 WiFi 6（802.11ax）、5GHz 信道 149、80MHz，经同一台 AP（RT-AX86U Pro <路由器IP>）互传。
+**环境**：本机 Mac（<本机内网IP>）↔ 第二台 MacBook Pro M1 Max/32GB（<内网主机IP>）。两端均为 WiFi 6（802.11ax）、5GHz 信道 149、80MHz，经同一台 AP（RT-AX86U Pro <路由器IP>）互传。
 
 ### 7.1 裸链路天花板（不经 phantom）
 

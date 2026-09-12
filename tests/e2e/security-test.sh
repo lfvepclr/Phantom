@@ -1,7 +1,7 @@
 #!/bin/bash
 # E2E 阶段 5: 安全边界 —— 裸扫描静默丢弃 / 篡改 PSK / 篡改公钥
 set -u
-cd /Users/<user>/workspace/qoder/phantom
+cd "$(dirname "$0")/../.."
 
 GOOD_PSK='cGhhbnRvbS1lMmUtcHJlLXNoYXJlZC1rZXktMzJiISE=='
 GOOD_KEY='cGhhbnRvbS1lMmUtdGVzdC1zZXJ2ZXIta2V5LTMyYiE=='

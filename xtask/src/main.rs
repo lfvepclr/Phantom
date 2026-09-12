@@ -2,11 +2,18 @@
 //!
 //! Usage:
 //!   cargo xtask build [all|server|cli|router|mac|android|harmony] [--release|--debug]
+//!   cargo xtask package server [--platform linux/amd64] [--engine auto|podman|docker|none]
+//!   cargo xtask verify server
+//!   cargo xtask deploy server --host root@HOST
+//!   cargo xtask speedtest --uri <phantom://...>
 //!   cargo xtask check-deps
 //!   cargo xtask icons
 //!   cargo xtask clean
 
-use anyhow::{bail, Context, Result};
+mod pack;
+mod rules;
+
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::env;
 use std::fs;
@@ -40,6 +47,98 @@ enum Commands {
         #[arg(long)]
         features: Vec<String>,
     },
+    /// Build a deployable server bundle (pinned container build by default).
+    Package {
+        /// Target(s): server (alias: server-amd64)
+        target: Vec<String>,
+        /// Target platform: linux/amd64 or linux/arm64
+        #[arg(long, default_value = "linux/amd64")]
+        platform: String,
+        /// Container engine: auto | docker | podman | none
+        #[arg(long, default_value = "auto")]
+        engine: String,
+        /// Build with the host toolchain instead of the pinned container
+        #[arg(long)]
+        no_container: bool,
+        /// Skip the offline end-to-end verification
+        #[arg(long)]
+        no_verify: bool,
+        /// Also build a runnable OCI image (container builds only)
+        #[arg(long)]
+        runtime_image: bool,
+    },
+    /// Run the offline end-to-end verification of a packaged bundle
+    Verify {
+        /// Target(s): server (alias: server-amd64)
+        target: Vec<String>,
+        /// Target platform: linux/amd64 or linux/arm64
+        #[arg(long, default_value = "linux/amd64")]
+        platform: String,
+        /// Container engine: auto | docker | podman
+        #[arg(long, default_value = "auto")]
+        engine: String,
+    },
+    /// Upload a bundle and install it on a remote Alpine/OpenRC host
+    Deploy {
+        /// Target(s): server (alias: server-amd64)
+        target: Vec<String>,
+        /// SSH target, e.g. root@203.0.113.10
+        #[arg(long)]
+        host: String,
+        /// Target platform: linux/amd64 or linux/arm64
+        #[arg(long, default_value = "linux/amd64")]
+        platform: String,
+        /// Container engine: auto | docker | podman | none
+        #[arg(long, default_value = "auto")]
+        engine: String,
+        /// Starting listen port
+        #[arg(long, default_value_t = 443)]
+        port: u16,
+        /// Transport: tcp or quic
+        #[arg(long, default_value = "tcp")]
+        proto: String,
+        /// Host written into the phantom:// URI (defaults to the deploy host)
+        #[arg(long)]
+        public_host: Option<String>,
+        /// Build with the host toolchain instead of the pinned container
+        #[arg(long)]
+        no_container: bool,
+        /// Skip the offline end-to-end verification
+        #[arg(long)]
+        no_verify: bool,
+    },
+    /// Throughput + unblock verification against a deployed server
+    Speedtest {
+        /// Server URI (omit with --loopback for a local client-ceiling run)
+        #[arg(long)]
+        uri: Option<String>,
+        /// Rounds per measurement
+        #[arg(long, default_value_t = 3)]
+        rounds: u32,
+        /// Throughput origin: loopback | vps | cloudflare
+        #[arg(long, default_value = "cloudflare")]
+        origin: String,
+        /// Assert google/gstatic/cloudflare/youtube reachability through the tunnel
+        #[arg(long)]
+        check_unblock: bool,
+        /// Local SOCKS5 port used by the temporary CLI client
+        #[arg(long, default_value_t = 1080)]
+        socks_port: u16,
+        /// Measure the client's local software ceiling (no remote server)
+        #[arg(long)]
+        loopback: bool,
+        /// Upload a test origin to this host (enables `--origin vps`)
+        #[arg(long)]
+        vps_host: Option<String>,
+    },
+    /// Proxy-whitelist data: regenerate the built-in FST index / verify it
+    Rules {
+        /// update (fetch + rebuild index) or verify (checks + micro-benchmark)
+        action: String,
+        /// Also merge the extended list (Netflix/OpenAI/Telegram style services)
+        #[arg(long)]
+        extended: bool,
+    },
     /// Check dependencies and print status table
     CheckDeps,
     /// Generate platform icons from source appicon.png
@@ -69,6 +168,11 @@ const ROUTER_TARGET: &str = "aarch64-unknown-linux-musl";
 /// e.g. older Broadcom/Qualcomm boxes). Also statically linked via musl and
 /// linked with the toolchain's own rust-lld, so no C toolchain is needed.
 const ROUTER_ARMV7_TARGET: &str = "armv7-unknown-linux-musleabihf";
+
+/// Rust target triple for x86_64 Linux servers (the Hong Kong VPS and most
+/// cloud hosts). Statically linked musl so the binary runs on any Alpine
+/// release without a libc match — see `cargo xtask package server`.
+const SERVER_AMD64_TARGET: &str = "x86_64-unknown-linux-musl";
 
 // ── Probe helpers ───────────────────────────────────────────────────────
 
@@ -131,8 +235,8 @@ fn check_deps() -> Vec<DepStatus> {
     // Android NDK
     let ndk_home = env::var("ANDROID_NDK_HOME").unwrap_or_default();
     let ndk_ok = if ndk_home.is_empty() {
-        let default_ndk = PathBuf::from(env::var("HOME").unwrap_or_default())
-            .join("Library/Android/sdk/ndk");
+        let default_ndk =
+            PathBuf::from(env::var("HOME").unwrap_or_default()).join("Library/Android/sdk/ndk");
         if default_ndk.exists() {
             // Found NDK at default location
             true
@@ -165,9 +269,7 @@ fn check_deps() -> Vec<DepStatus> {
     });
 
     // DevEco Studio (check for ohos clang)
-    let deveco_ok = root
-        .join(".cargo/config.toml")
-        .exists()
+    let deveco_ok = root.join(".cargo/config.toml").exists()
         && fs::read_to_string(root.join(".cargo/config.toml"))
             .map(|c| c.contains("aarch64-unknown-linux-ohos-clang"))
             .unwrap_or(false);
@@ -199,10 +301,7 @@ fn check_deps() -> Vec<DepStatus> {
     });
 
     // sips (macOS icon generation)
-    let sips_ok = Command::new("sips")
-        .args(["--version"])
-        .output()
-        .is_ok();
+    let sips_ok = Command::new("sips").args(["--version"]).output().is_ok();
     deps.push(DepStatus {
         name: "sips (icon generation)",
         installed: sips_ok,
@@ -224,6 +323,32 @@ fn check_deps() -> Vec<DepStatus> {
         name: "Rust armv7-unknown-linux-musleabihf",
         installed: rustup_target_installed(ROUTER_ARMV7_TARGET),
         hint: "Install: rustup target add armv7-unknown-linux-musleabihf",
+    });
+
+    // x86_64 Linux servers (Alpine VPS): needed by the `--no-container` host
+    // cross build; the container path installs it inside the image instead.
+    deps.push(DepStatus {
+        name: "Rust x86_64-unknown-linux-musl",
+        installed: rustup_target_installed(SERVER_AMD64_TARGET),
+        hint: "Auto-installed by `cargo xtask package server --no-container`",
+    });
+
+    // Pinned container build environment (preferred packaging path).
+    let engine = pack::detect_engine("auto").ok().flatten();
+    deps.push(DepStatus {
+        name: "Container engine (docker/podman)",
+        installed: engine.is_some(),
+        hint: "Preferred for `cargo xtask package server`; --no-container works without it",
+    });
+
+    // Crate registry mirror: rsproxy.cn (reachable) vs crates.io (slow/blocked).
+    let rsproxy_ok = fs::read_to_string(root.join(".cargo/config.toml"))
+        .map(|c| c.contains("rsproxy.cn"))
+        .unwrap_or(false);
+    deps.push(DepStatus {
+        name: "Cargo mirror (rsproxy.cn)",
+        installed: rsproxy_ok,
+        hint: "Set [source.crates-io] replace-with = 'rsproxy-sparse'",
     });
 
     deps
@@ -260,12 +385,26 @@ fn run_cmd(cmd: &mut Command, label: &str) -> Result<()> {
 fn is_available(target: &str) -> bool {
     let deps = check_deps();
     match target {
-        "cli" => deps.iter().find(|d| d.name == "Rust (rustc)").unwrap().installed,
-        "server" => deps.iter().find(|d| d.name == "Rust (rustc)").unwrap().installed,
+        "cli" => {
+            deps.iter()
+                .find(|d| d.name == "Rust (rustc)")
+                .unwrap()
+                .installed
+        }
+        "server" => {
+            deps.iter()
+                .find(|d| d.name == "Rust (rustc)")
+                .unwrap()
+                .installed
+        }
         // The arm64 server is pure Rust (no C shims since ring was dropped),
         // so rust-lld alone suffices — no clang probe needed here.
         "server-arm64" => {
-            let rustc = deps.iter().find(|d| d.name == "Rust (rustc)").unwrap().installed;
+            let rustc = deps
+                .iter()
+                .find(|d| d.name == "Rust (rustc)")
+                .unwrap()
+                .installed;
             let target = deps
                 .iter()
                 .find(|d| d.name == "Rust aarch64-unknown-linux-musl")
@@ -273,16 +412,38 @@ fn is_available(target: &str) -> bool {
                 .installed;
             rustc && target
         }
-        "router" => {
-            deps
+        // x86_64 server: either the host target or a container engine suffices.
+        "server-amd64" => {
+            let rustc = deps
                 .iter()
+                .find(|d| d.name == "Rust (rustc)")
+                .unwrap()
+                .installed;
+            let target = deps
+                .iter()
+                .find(|d| d.name == "Rust x86_64-unknown-linux-musl")
+                .unwrap()
+                .installed;
+            let container = deps
+                .iter()
+                .find(|d| d.name == "Container engine (docker/podman)")
+                .unwrap()
+                .installed;
+            rustc && (target || container)
+        }
+        "router" => {
+            deps.iter()
                 .find(|d| d.name == "Rust aarch64-unknown-linux-musl")
                 .unwrap()
                 .installed
         }
         // Pure-Rust dependency tree: rust-lld alone links the armv7 build.
         "router-armv7" => {
-            let rustc = deps.iter().find(|d| d.name == "Rust (rustc)").unwrap().installed;
+            let rustc = deps
+                .iter()
+                .find(|d| d.name == "Rust (rustc)")
+                .unwrap()
+                .installed;
             let target = deps
                 .iter()
                 .find(|d| d.name == "Rust armv7-unknown-linux-musleabihf")
@@ -290,13 +451,18 @@ fn is_available(target: &str) -> bool {
                 .installed;
             rustc && target
         }
-        "mac" => deps
-            .iter()
-            .find(|d| d.name == "Xcode CLI (swift)")
-            .unwrap()
-            .installed,
+        "mac" => {
+            deps.iter()
+                .find(|d| d.name == "Xcode CLI (swift)")
+                .unwrap()
+                .installed
+        }
         "android" => {
-            let ndk = deps.iter().find(|d| d.name == "Android NDK").unwrap().installed;
+            let ndk = deps
+                .iter()
+                .find(|d| d.name == "Android NDK")
+                .unwrap()
+                .installed;
             let target = deps
                 .iter()
                 .find(|d| d.name == "Rust aarch64-linux-android")
@@ -453,6 +619,76 @@ fn build_server_arm64(release: bool, features: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Build the statically-linked x86_64 Linux server (Alpine VPS, most cloud
+/// hosts). Host cross build through rust-lld; the pinned container build is
+/// `cargo xtask package server` (default), which needs no host target at all.
+fn build_server_amd64(release: bool) -> Result<()> {
+    if !release {
+        bail!("debug cross builds are unsupported for server-amd64 — use --release");
+    }
+    let root = project_root();
+    let spec = pack::resolve_platform("linux/amd64")?;
+    let bin = pack::build_on_host(&root, &spec)?;
+    println!();
+    println!("  Binary: {}", bin.display());
+    if let Ok(meta) = fs::metadata(&bin) {
+        println!("  Size:   {:.1} MiB", meta.len() as f64 / (1024.0 * 1024.0));
+    }
+    println!("  Bundle: cargo xtask package server [--platform linux/amd64]");
+    println!("  Deploy: cargo xtask deploy server --host root@HOST");
+    Ok(())
+}
+
+/// Build (host or container) + static checks + bundle assembly + optional
+/// offline verification. Returns the tarball path.
+fn build_bundle(
+    spec: &pack::TargetSpec,
+    engine_arg: &str,
+    no_container: bool,
+    no_verify: bool,
+    runtime_image: bool,
+) -> Result<PathBuf> {
+    let root = project_root();
+    let engine = if no_container {
+        None
+    } else {
+        pack::detect_engine(engine_arg)?
+    };
+
+    let bin = match &engine {
+        Some(e) => {
+            println!("Using container engine '{}' (pinned build environment)", e);
+            pack::build_in_container(&root, spec, e, runtime_image)?
+        }
+        None => {
+            if !no_container {
+                println!(
+                    "NOTE: no container engine available — falling back to the host toolchain \
+                     (rust-lld cross build). Install docker/podman for the pinned container path."
+                );
+            }
+            pack::build_on_host(&root, spec)?
+        }
+    };
+
+    pack::check_static(&bin, spec)?;
+    let tarball = pack::assemble_bundle(&root, spec, &bin)?;
+
+    if !no_verify {
+        match &engine {
+            Some(e) => pack::verify(&root, &tarball, spec, e)?,
+            None => println!(
+                "\nSKIP offline verification: it needs a container engine \
+                 (run `cargo xtask verify server` once docker/podman is available).\n\
+                 The deployed host itself is the amd64/alpine:3.18 target environment, so \
+                 `cargo xtask deploy server` still verifies the real artefact end to end."
+            ),
+        }
+    }
+
+    Ok(tarball)
+}
+
 /// Build the statically-linked client for legacy 32-bit ARMv7 routers.
 /// Same pure-Rust story as `server-arm64`: rust-lld links, no clang probe.
 fn build_router_armv7(release: bool) -> Result<()> {
@@ -545,7 +781,10 @@ fn build_harmony(release: bool) -> Result<()> {
         .join(profile)
         .join("libphantom_harmony.so");
     if !so_src.exists() {
-        bail!("Rust .so not found: {}. Build may have failed.", so_src.display());
+        bail!(
+            "Rust .so not found: {}. Build may have failed.",
+            so_src.display()
+        );
     }
     let libs_dir = harmony_dir.join("entry/libs/arm64-v8a");
     fs::create_dir_all(&libs_dir)?;
@@ -560,7 +799,10 @@ fn build_harmony(release: bool) -> Result<()> {
         .unwrap_or_else(|_| "/Applications/DevEco-Studio.app/Contents/tools/node".to_string());
     let hvigorw = "/Applications/DevEco-Studio.app/Contents/tools/hvigor/bin/hvigorw";
     if !Path::new(hvigorw).exists() {
-        bail!("hvigorw not found at {}. Install DevEco Studio NEXT.", hvigorw);
+        bail!(
+            "hvigorw not found at {}. Install DevEco Studio NEXT.",
+            hvigorw
+        );
     }
 
     let build_mode = if release { "release" } else { "debug" };
@@ -580,14 +822,17 @@ fn build_harmony(release: bool) -> Result<()> {
     run_cmd(&mut cmd, "hvigor assembleHap")?;
 
     // ── Step 4: Sign HAP with hap-sign-tool.jar ──
-    let hap_sign_tool = Path::new(&deveco_sdk)
-        .join("default/openharmony/toolchains/lib/hap-sign-tool.jar");
+    let hap_sign_tool =
+        Path::new(&deveco_sdk).join("default/openharmony/toolchains/lib/hap-sign-tool.jar");
     if !hap_sign_tool.exists() {
-        bail!("hap-sign-tool.jar not found at {}. Check DEVECO_SDK_HOME.", hap_sign_tool.display());
+        bail!(
+            "hap-sign-tool.jar not found at {}. Check DEVECO_SDK_HOME.",
+            hap_sign_tool.display()
+        );
     }
 
-    let unsigned_hap = harmony_dir
-        .join("entry/build/default/outputs/default/entry-default-unsigned.hap");
+    let unsigned_hap =
+        harmony_dir.join("entry/build/default/outputs/default/entry-default-unsigned.hap");
     if !unsigned_hap.exists() {
         bail!("Unsigned HAP not found: {}", unsigned_hap.display());
     }
@@ -813,10 +1058,7 @@ fn clean_all() -> Result<()> {
     }
 
     // Test targets
-    for dir in [
-        root.join("tests/target"),
-        root.join("tests/bench/target"),
-    ] {
+    for dir in [root.join("tests/target"), root.join("tests/bench/target")] {
         if dir.exists() {
             println!("  Removing {} ...", dir.display());
             fs::remove_dir_all(&dir)?;
@@ -833,10 +1075,25 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Build { target, debug, features, .. } => {
+        Commands::Build {
+            target,
+            debug,
+            features,
+            ..
+        } => {
             let release = !debug;
             let targets = if target.is_empty() || target.contains(&"all".to_string()) {
-                vec!["server", "server-arm64", "cli", "router", "router-armv7", "mac", "android", "harmony"]
+                vec![
+                    "server",
+                    "server-arm64",
+                    "server-amd64",
+                    "cli",
+                    "router",
+                    "router-armv7",
+                    "mac",
+                    "android",
+                    "harmony",
+                ]
             } else {
                 target.iter().map(|s| s.as_str()).collect()
             };
@@ -860,12 +1117,16 @@ fn main() -> Result<()> {
                     "cli" => build_cli(release)?,
                     "server" => build_server(release)?,
                     "server-arm64" => build_server_arm64(release, &features)?,
+                    "server-amd64" => build_server_amd64(release)?,
                     "router" => build_router(release)?,
                     "router-armv7" => build_router_armv7(release)?,
                     "mac" => build_mac(release)?,
                     "android" => build_android(release)?,
                     "harmony" => build_harmony(release)?,
-                    other => bail!("Unknown target: {}. Valid: all, server, server-arm64, cli, router, router-armv7, mac, android, harmony", other),
+                    other => bail!(
+                        "Unknown target: {}. Valid: all, server, server-amd64, server-arm64, cli, router, router-armv7, mac, android, harmony",
+                        other
+                    ),
                 }
                 built += 1;
             }
@@ -873,6 +1134,98 @@ fn main() -> Result<()> {
             println!();
             println!("{:=<60}", "  Build Summary  ");
             println!("  Built: {}, Skipped: {}", built, skipped);
+        }
+        Commands::Package {
+            target,
+            platform,
+            engine,
+            no_container,
+            no_verify,
+            runtime_image,
+        } => {
+            let _ = target;
+            let spec = pack::resolve_platform(&platform)?;
+            let tarball = build_bundle(&spec, &engine, no_container, no_verify, runtime_image)?;
+            println!();
+            println!("Packaged: {}", tarball.display());
+            println!("Next:     cargo xtask deploy server --host root@HOST");
+        }
+        Commands::Verify {
+            target,
+            platform,
+            engine,
+        } => {
+            let _ = target;
+            let root = project_root();
+            let spec = pack::resolve_platform(&platform)?;
+            let name = format!(
+                "phantom-server-{}-linux-{}",
+                env!("CARGO_PKG_VERSION"),
+                spec.arch
+            );
+            let tarball = root.join("dist").join(format!("{}.tar.gz", name));
+            if !tarball.exists() {
+                bail!(
+                    "{} not found — run `cargo xtask package server --platform {}` first",
+                    tarball.display(),
+                    spec.platform
+                );
+            }
+            let engine = pack::detect_engine(&engine)?
+                .context("`cargo xtask verify` needs docker or podman")?;
+            pack::verify(&root, &tarball, &spec, &engine)?;
+        }
+        Commands::Deploy {
+            target,
+            host,
+            platform,
+            engine,
+            port,
+            proto,
+            public_host,
+            no_container,
+            no_verify,
+        } => {
+            let _ = target;
+            let spec = pack::resolve_platform(&platform)?;
+            let tarball = build_bundle(&spec, &engine, no_container, no_verify, false)?;
+
+            // Default the URI host to the SSH host's address part.
+            let default_host = host.rsplit('@').next().unwrap_or(&host).to_string();
+            let public_host = public_host.unwrap_or(default_host);
+            let uri = pack::deploy(&project_root(), &tarball, &host, port, &proto, &public_host)?;
+            println!();
+            println!("Client:");
+            println!("  ./target/release/phantom client --server \"{}\"", uri);
+        }
+        Commands::Speedtest {
+            uri,
+            rounds,
+            origin,
+            check_unblock,
+            socks_port,
+            loopback,
+            vps_host,
+        } => {
+            let root = project_root();
+            pack::speedtest(
+                &root,
+                uri.as_deref(),
+                rounds,
+                &origin,
+                check_unblock,
+                socks_port,
+                loopback,
+                vps_host.as_deref(),
+            )?;
+        }
+        Commands::Rules { action, extended } => {
+            let root = project_root();
+            match action.as_str() {
+                "update" => rules::update(&root, extended)?,
+                "verify" => rules::verify(&root)?,
+                other => bail!("Unknown rules action '{}': use update or verify", other),
+            }
         }
         Commands::CheckDeps => {
             let deps = check_deps();
@@ -894,7 +1247,9 @@ fn main() -> Result<()> {
                             if status.success() {
                                 println!("    OK!");
                             } else {
-                                println!("    FAILED — install manually: rustup target add aarch64-linux-android");
+                                println!(
+                                    "    FAILED — install manually: rustup target add aarch64-linux-android"
+                                );
                             }
                         }
                         "Rust aarch64-unknown-linux-ohos" => {
@@ -905,7 +1260,9 @@ fn main() -> Result<()> {
                             if status.success() {
                                 println!("    OK!");
                             } else {
-                                println!("    FAILED — install manually: rustup target add aarch64-unknown-linux-ohos");
+                                println!(
+                                    "    FAILED — install manually: rustup target add aarch64-unknown-linux-ohos"
+                                );
                             }
                         }
                         "Rust aarch64-unknown-linux-musl" => {
@@ -923,13 +1280,22 @@ fn main() -> Result<()> {
                             }
                         }
                         "Xcode CLI (swift)" => {
-                            println!("  Cannot auto-install {}. Run: xcode-select --install", dep.name);
+                            println!(
+                                "  Cannot auto-install {}. Run: xcode-select --install",
+                                dep.name
+                            );
                         }
                         "Android NDK" => {
-                            println!("  Cannot auto-install {}. Set ANDROID_NDK_HOME or install via Android Studio.", dep.name);
+                            println!(
+                                "  Cannot auto-install {}. Set ANDROID_NDK_HOME or install via Android Studio.",
+                                dep.name
+                            );
                         }
                         "DevEco Studio / OHOS SDK" => {
-                            println!("  Cannot auto-install {}. Download from Huawei Developer.", dep.name);
+                            println!(
+                                "  Cannot auto-install {}. Download from Huawei Developer.",
+                                dep.name
+                            );
                         }
                         _ => {
                             println!("  Cannot auto-install {}. {}", dep.name, dep.hint);

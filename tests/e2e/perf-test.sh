@@ -1,7 +1,7 @@
 #!/bin/bash
 # E2E 阶段 6: 性能 —— TCP/QUIC 隧道吞吐、延迟、直连基准、三方字节对账
 set -u
-cd /Users/<user>/workspace/qoder/phantom
+cd "$(dirname "$0")/../.."
 
 URI_BASE='phantom://cGhhbnRvbS1lMmUtdGVzdC1zZXJ2ZXIta2V5LTMyYiE==@127.0.0.1'
 PSK='psk=cGhhbnRvbS1lMmUtcHJlLXNoYXJlZC1rZXktMzJiISE==&cipher=auto'

@@ -1,0 +1,44 @@
+#!/sbin/openrc-run
+#
+# Phantom server (Alpine / OpenRC).
+# Installed to /etc/init.d/phantom by deploy/alpine/install.sh.
+
+name="phantom"
+description="Phantom encrypted proxy server"
+
+# Auto-bootstrap mode: the server writes ./server.key and ./server.toml into
+# its working directory on first start and reuses them afterwards, so the
+# phantom:// URI stays stable across restarts and upgrades.
+command="/usr/local/bin/phantom"
+command_args="server --port ${PHANTOM_PORT:-443} --proto ${PHANTOM_PROTO:-tcp} --cipher ${PHANTOM_CIPHER:-auto} --public-host ${PHANTOM_PUBLIC_HOST}"
+directory="/var/lib/phantom"
+
+# Run unprivileged but keep the right to bind a low port (443).
+#
+# NOTE (verified on Alpine 3.18 / OpenRC 0.48): the capability hand-off is not
+# supported by this OpenRC build — `start-stop-daemon --capabilities` starts the
+# process but the bind still fails, so install.sh automatically falls back to
+# PHANTOM_USER="root". That is the normal arrangement for VPN/proxy daemons on
+# Alpine. Systems that do support capabilities can set PHANTOM_USER=phantom and
+# drop "root" from /etc/conf.d/phantom.
+command_user="${PHANTOM_USER:-phantom}:${PHANTOM_USER:-phantom}"
+capabilities="^cap_net_bind_service"
+
+# Restart on crash.
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+respawn_period=60
+output_log="/var/log/phantom.log"
+error_log="/var/log/phantom.log"
+
+rc_ulimit="-n 65535"
+
+depend() {
+	need net
+	after firewall
+}
+
+start_pre() {
+	checkpath --directory --owner "${PHANTOM_USER:-phantom}:${PHANTOM_USER:-phantom}" --mode 0750 /var/lib/phantom
+}

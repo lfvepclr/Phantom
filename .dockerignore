@@ -1,0 +1,37 @@
+# Build context hygiene: keep the context a few MB even though target/ is >1 GB.
+# The container build needs source only — never host build artifacts.
+
+target/
+dist/
+
+.git/
+.gitignore
+
+# macOS client build output (Phantom.app / DMG / SPM scratch)
+client/mac/.build/
+
+# Client build outputs
+client/android/build/
+client/android/app/build/
+client/android/app/src/main/jniLibs/
+client/harmony/build/
+client/harmony/entry/build/
+client/harmony/entry/libs/
+client/harmony/rust/target/
+
+# Test build outputs / scratch
+tests/target/
+tests/bench/target/
+tests/.e2e-boot/
+tests/.e2e-ctx/
+tests/.e2e-data/
+
+# Editor / AI tool scratch dirs
+.qoder/
+.claude/
+.agents/
+.codex/
+
+*.dmg
+*.hap
+*.apk

@@ -6,3 +6,6 @@ edition.workspace = true
 [dependencies]
 clap = { workspace = true }
 anyhow = { workspace = true }
+# Proxy-whitelist index generation (cargo xtask rules update|verify).
+fst = "0.4"
+ipnet = "2.9"

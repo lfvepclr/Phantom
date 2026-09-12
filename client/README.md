@@ -210,8 +210,10 @@ graph LR
 
 | 技术点 | 实现 |
 |--------|------|
-| 拦截 | TUN 收到 UDP:53 包 → `DnsProxy::forward()` |
-| 上游 | 可配 DoT (`tls://8.8.8.8:853`) / 普通 UDP |
+| 拦截 | TUN 收到 UDP:53 包 → 按分流结果选传输 → `DnsProxy::forward()` |
+| 上游（隧道） | `client.dns`（默认 `8.8.8.8:53`）：白名单域名 / proxy 模式，经 `udp_relay` 在隧道内解析 |
+| 上游（直连） | `client.dns_direct`（默认 `223.5.5.5:53`）：其余域名，走物理网卡，避免国内 CDN 被解析到海外 |
+| 自环防护 | 直接解析 socket 自身发出的 53 端口包不再被劫持 |
 | 缓存 | `DnsCache` — `HashMap<Ipv4Addr, String>` (A 记录反查域名) |
 | 响应构建 | `etherparse::PacketBuilder` 构造 IPv4+UDP 包写回 TUN |
 

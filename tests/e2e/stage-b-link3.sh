@@ -1,7 +1,7 @@
 #!/bin/bash
 # 阶段 B 链路级 v3: 用 TOML serde 枚举名（aes256-gcm/aes128-gcm/ascon128/cha-cha20-poly1305）
 set -u
-cd /Users/<user>/workspace/qoder/phantom
+cd "$(dirname "$0")/../.."
 
 KEY='cGhhbnRvbS1lMmUtdGVzdC1zZXJ2ZXIta2V5LTMyYiE=='
 PSK='cGhhbnRvbS1lMmUtcHJlLXNoYXJlZC1rZXktMzJiISE=='

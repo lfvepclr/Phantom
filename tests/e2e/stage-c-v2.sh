@@ -2,7 +2,7 @@
 # 阶段 C v2: 弱网矩阵
 #   QUIC: lossy_proxy(UDP) 真丢包+延迟 | TCP: lossy_proxy(TCP) 仅延迟 | 限速: VM 内 tbf
 set -u
-cd /Users/<user>/workspace/qoder/phantom
+cd "$(dirname "$0")/../.."
 
 KEY='cGhhbnRvbS1lMmUtdGVzdC1zZXJ2ZXIta2V5LTMyYiE=='
 PSK='cGhhbnRvbS1lMmUtcHJlLXNoYXJlZC1rZXktMzJiISE=='

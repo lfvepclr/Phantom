@@ -25,36 +25,36 @@
 
 | 文件 | 改动 |
 |---|---|
-| [client/cli/src/main.rs](file:///Users/<user>/workspace/qoder/phantom/client/cli/src/main.rs) | 删除 `Keygen` 变体；重写 `Server` 变体支持 `-c <file>` / `-i` / `--public-host` / `--port` / `--cipher` / `--proto` |
-| [core/src/uri.rs](file:///Users/<user>/workspace/qoder/phantom/core/src/uri.rs) | 新增 `build_phantom_uri()` 反序列化函数 + 单元测试 |
-| [core/src/lib.rs](file:///Users/<user>/workspace/qoder/phantom/core/src/lib.rs) | `pub use uri::build_phantom_uri;` |
-| [core/src/transport/tcp.rs](file:///Users/<user>/workspace/qoder/phantom/core/src/transport/tcp.rs) | 新增 `try_bind_tcp_with_fallback()` 端口探测 |
-| [core/src/transport/quic.rs](file:///Users/<user>/workspace/qoder/phantom/core/src/transport/quic.rs) | 新增 `try_bind_quic_with_fallback()` 端口探测 |
-| [server/src/lib.rs](file:///Users/<user>/workspace/qoder/phantom/server/src/lib.rs) | 新增 `BootstrapOptions` 结构；拆分 `run()` 为 `run()`（薄壳）/`run_with_options()`/`run_from_uri()` |
-| **新增** [server/src/bootstrap.rs](file:///Users/<user>/workspace/qoder/phantom/server/src/bootstrap.rs) | `run_auto` / `run_interactive` / `run_from_uri` 三个公开函数；密钥/白名单/URI 文件管理；公网 IP 探测 |
+| [client/cli/src/main.rs](client/cli/src/main.rs) | 删除 `Keygen` 变体；重写 `Server` 变体支持 `-c <file>` / `-i` / `--public-host` / `--port` / `--cipher` / `--proto` |
+| [core/src/uri.rs](core/src/uri.rs) | 新增 `build_phantom_uri()` 反序列化函数 + 单元测试 |
+| [core/src/lib.rs](core/src/lib.rs) | `pub use uri::build_phantom_uri;` |
+| [core/src/transport/tcp.rs](core/src/transport/tcp.rs) | 新增 `try_bind_tcp_with_fallback()` 端口探测 |
+| [core/src/transport/quic.rs](core/src/transport/quic.rs) | 新增 `try_bind_quic_with_fallback()` 端口探测 |
+| [server/src/lib.rs](server/src/lib.rs) | 新增 `BootstrapOptions` 结构；拆分 `run()` 为 `run()`（薄壳）/`run_with_options()`/`run_from_uri()` |
+| **新增** [server/src/bootstrap.rs](server/src/bootstrap.rs) | `run_auto` / `run_interactive` / `run_from_uri` 三个公开函数；密钥/白名单/URI 文件管理；公网 IP 探测 |
 
 ### 测试
 
 | 文件 | 改动 |
 |---|---|
-| [tests/tests/cli_system.rs](file:///Users/<user>/workspace/qoder/phantom/tests/tests/cli_system.rs) | 删除 `cli_keygen`；新增 auto/port-fallback/interactive/keygen-removed 4 个集成测试 |
+| [tests/tests/cli_system.rs](tests/tests/cli_system.rs) | 删除 `cli_keygen`；新增 auto/port-fallback/interactive/keygen-removed 4 个集成测试 |
 
 ### 部署与文档
 
 | 文件 | 改动 |
 |---|---|
-| **新增** [deploy/README.md](file:///Users/<user>/workspace/qoder/phantom/deploy/README.md) | 部署说明（自举、systemd、密钥管理、端口冲突） |
-| [deploy/phantom.service](file:///Users/<user>/workspace/qoder/phantom/deploy/phantom.service) | 新增 `WorkingDirectory=/var/lib/phantom` 与对应 `ReadWritePaths` |
-| [deploy/install.sh](file:///Users/<user>/workspace/qoder/phantom/deploy/install.sh) | 删除 `keygen` 步骤；改为 auto 模式提示 |
-| [README.md](file:///Users/<user>/workspace/qoder/phantom/README.md) | 删除 keygen 章节；新增自举 / 交互模式文档 |
-| [PROJECT_PLAN.md](file:///Users/<user>/workspace/qoder/phantom/PROJECT_PLAN.md) | 更新 §2.4 CLI 描述、§3 测试计数、§7.3 配置 |
-| [ARCHITECTURE.md](file:///Users/<user>/workspace/qoder/phantom/ARCHITECTURE.md) | 更新 §3 crate 矩阵、§11 测试覆盖 |
+| **新增** [deploy/README.md](deploy/README.md) | 部署说明（自举、systemd、密钥管理、端口冲突） |
+| [deploy/phantom.service](deploy/phantom.service) | 新增 `WorkingDirectory=/var/lib/phantom` 与对应 `ReadWritePaths` |
+| [deploy/install.sh](deploy/install.sh) | 删除 `keygen` 步骤；改为 auto 模式提示 |
+| [README.md](README.md) | 删除 keygen 章节；新增自举 / 交互模式文档 |
+| [PROJECT_PLAN.md](PROJECT_PLAN.md) | 更新 §2.4 CLI 描述、§3 测试计数、§7.3 配置 |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | 更新 §3 crate 矩阵、§11 测试覆盖 |
 
 ---
 
 ## 关键设计要点
 
-### 1. CLI 子命令重构（[client/cli/src/main.rs](file:///Users/<user>/workspace/qoder/phantom/client/cli/src/main.rs#L13-L34)）
+### 1. CLI 子命令重构（[client/cli/src/main.rs](client/cli/src/main.rs#L13-L34)）
 
 `Server` 变体从 `{ config: String }` 扩展为：
 
@@ -85,7 +85,7 @@ Server {
 - `interactive` → `phantom_server::bootstrap::run_interactive(opts)`
 - 其他 → `phantom_server::bootstrap::run_auto(opts)`
 
-### 2. 统一启动结构（[server/src/lib.rs](file:///Users/<user>/workspace/qoder/phantom/server/src/lib.rs)）
+### 2. 统一启动结构（[server/src/lib.rs](server/src/lib.rs)）
 
 新增 `BootstrapOptions`：
 ```rust
@@ -105,7 +105,7 @@ pub struct BootstrapOptions {
 - `run_with_options(opts)` — 原 `run_tcp` / `run_quic` 分派逻辑
 - `run_from_uri(uri, key_path)` — `parse_phantom_uri` → 一致性校验（URI 公钥 == 本地公钥）→ 解析 address → 构造 opts → `run_with_options`
 
-### 3. Bootstrap 流程（[server/src/bootstrap.rs](file:///Users/<user>/workspace/qoder/phantom/server/src/bootstrap.rs)）
+### 3. Bootstrap 流程（[server/src/bootstrap.rs](server/src/bootstrap.rs)）
 
 **`run_auto` 核心顺序**（端口探测必须先于 URI 生成）：
 
@@ -122,7 +122,7 @@ pub struct BootstrapOptions {
 
 **`run_interactive`**：端口/IP/算法/协议均通过 stdin 询问（每个 prompt 提供默认值），端口冲突不退出而回到询问循环；非 TTY 报错提示用 auto 模式。
 
-### 4. URI 构建（[core/src/uri.rs](file:///Users/<user>/workspace/qoder/phantom/core/src/uri.rs)）
+### 4. URI 构建（[core/src/uri.rs](core/src/uri.rs)）
 
 新增 `build_phantom_uri(key, addr, cipher, protocol, name) -> String`，与 `parse_phantom_uri` 完全对称。生成格式：
 ```
@@ -131,7 +131,7 @@ phantom://<key>@<addr>?cipher=<c>&proto=<p>[#<name>]
 
 `cipher_to_str` / `protocol_to_str` 反向映射与 kebab-case 一致。
 
-### 5. 端口探测（[core/src/transport/tcp.rs](file:///Users/<user>/workspace/qoder/phantom/core/src/transport/tcp.rs) 与 quic.rs）
+### 5. 端口探测（[core/src/transport/tcp.rs](core/src/transport/tcp.rs) 与 quic.rs）
 
 `try_bind_*_with_fallback(start_addr, max_attempts)`：
 - 保持 IP 不变，从 `start_addr.port()` 开始
@@ -156,24 +156,24 @@ QUIC 版本在循环内每次重新调用 `QuicListener::bind`（cert/key 重新
 - `cli_server_keygen_subcommand_removed`：执行 `phantom keygen`，断言 clap "unrecognized subcommand" 错误
 
 ### 新增（单元）
-- [core/src/uri.rs](file:///Users/<user>/workspace/qoder/phantom/core/src/uri.rs)：5 个（`build_minimal_uri` / `build_full_uri` / `build_uri_no_name` / `build_uri_roundtrip` / `cipher_to_str_kebab_case`）
-- [core/src/transport/tcp.rs](file:///Users/<user>/workspace/qoder/phantom/core/src/transport/tcp.rs)：1 个端口递增
-- [core/src/transport/quic.rs](file:///Users/<user>/workspace/qoder/phantom/core/src/transport/quic.rs)：1 个端口递增
-- [server/src/bootstrap.rs](file:///Users/<user>/workspace/qoder/phantom/server/src/bootstrap.rs)：白名单解析 2 个 + 默认值 1 个
+- [core/src/uri.rs](core/src/uri.rs)：5 个（`build_minimal_uri` / `build_full_uri` / `build_uri_no_name` / `build_uri_roundtrip` / `cipher_to_str_kebab_case`）
+- [core/src/transport/tcp.rs](core/src/transport/tcp.rs)：1 个端口递增
+- [core/src/transport/quic.rs](core/src/transport/quic.rs)：1 个端口递增
+- [server/src/bootstrap.rs](server/src/bootstrap.rs)：白名单解析 2 个 + 默认值 1 个
 
 ---
 
 ## 执行顺序
 
-1. **基础工具层**：[core/src/uri.rs](file:///Users/<user>/workspace/qoder/phantom/core/src/uri.rs) 加 `build_phantom_uri` + 单测 → `cargo test -p phantom-core` 绿
-2. **传输层**：[core/src/transport/tcp.rs](file:///Users/<user>/workspace/qoder/phantom/core/src/transport/tcp.rs) 与 quic.rs 加端口探测 + 单测
-3. **服务端重构**：[server/src/lib.rs](file:///Users/<user>/workspace/qoder/phantom/server/src/lib.rs) 拆分 `run` 为三函数 → 原 `phantom-server` 二进制仍可 TOML 启动
-4. **Bootstrap 模块**：新增 [server/src/bootstrap.rs](file:///Users/<user>/workspace/qoder/phantom/server/src/bootstrap.rs) + 单测
-5. **CLI 改造**：[client/cli/src/main.rs](file:///Users/<user>/workspace/qoder/phantom/client/cli/src/main.rs) 删除 Keygen、重写 Server 分发
-6. **集成测试**：[tests/tests/cli_system.rs](file:///Users/<user>/workspace/qoder/phantom/tests/tests/cli_system.rs) 删旧加新 → `cargo test -p phantom-e2e --test cli_system --release`
-7. **部署**：改 [deploy/phantom.service](file:///Users/<user>/workspace/qoder/phantom/deploy/phantom.service) + [deploy/install.sh](file:///Users/<user>/workspace/qoder/phantom/deploy/install.sh)
-8. **新增 deploy 文档**：[deploy/README.md](file:///Users/<user>/workspace/qoder/phantom/deploy/README.md)
-9. **三份主文档**：[README.md](file:///Users/<user>/workspace/qoder/phantom/README.md) / [PROJECT_PLAN.md](file:///Users/<user>/workspace/qoder/phantom/PROJECT_PLAN.md) / [ARCHITECTURE.md](file:///Users/<user>/workspace/qoder/phantom/ARCHITECTURE.md) 同步
+1. **基础工具层**：[core/src/uri.rs](core/src/uri.rs) 加 `build_phantom_uri` + 单测 → `cargo test -p phantom-core` 绿
+2. **传输层**：[core/src/transport/tcp.rs](core/src/transport/tcp.rs) 与 quic.rs 加端口探测 + 单测
+3. **服务端重构**：[server/src/lib.rs](server/src/lib.rs) 拆分 `run` 为三函数 → 原 `phantom-server` 二进制仍可 TOML 启动
+4. **Bootstrap 模块**：新增 [server/src/bootstrap.rs](server/src/bootstrap.rs) + 单测
+5. **CLI 改造**：[client/cli/src/main.rs](client/cli/src/main.rs) 删除 Keygen、重写 Server 分发
+6. **集成测试**：[tests/tests/cli_system.rs](tests/tests/cli_system.rs) 删旧加新 → `cargo test -p phantom-e2e --test cli_system --release`
+7. **部署**：改 [deploy/phantom.service](deploy/phantom.service) + [deploy/install.sh](deploy/install.sh)
+8. **新增 deploy 文档**：[deploy/README.md](deploy/README.md)
+9. **三份主文档**：[README.md](README.md) / [PROJECT_PLAN.md](PROJECT_PLAN.md) / [ARCHITECTURE.md](ARCHITECTURE.md) 同步
 
 ---
 

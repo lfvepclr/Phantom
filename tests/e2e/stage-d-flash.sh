@@ -1,7 +1,7 @@
 #!/bin/bash
 # 阶段 D: 闪断测试 —— 服务端重启 / 进程冻结(网络黑洞近似) / 双服务器 failover
 set -u
-cd /Users/<user>/workspace/qoder/phantom
+cd "$(dirname "$0")/../.."
 
 KEY='cGhhbnRvbS1lMmUtdGVzdC1zZXJ2ZXIta2V5LTMyYiE=='
 PSK='cGhhbnRvbS1lMmUtcHJlLXNoYXJlZC1rZXktMzJiISE=='

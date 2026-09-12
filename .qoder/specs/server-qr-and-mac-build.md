@@ -20,26 +20,26 @@ Phantom 已实现 `phantom server` 命令行的零配置自举：启动时打印
 
 | 文件 | 改动类型 | 说明 |
 |---|---|---|
-| [Cargo.toml](file:///Users/<user>/workspace/qoder/phantom/Cargo.toml) | 编辑 | `[workspace.dependencies]` 段加 `qr2term = "0.3"` |
-| [server/Cargo.toml](file:///Users/<user>/workspace/qoder/phantom/server/Cargo.toml) | 编辑 | `[dependencies]` 段加 `qr2term = { workspace = true }` |
-| [server/src/bootstrap.rs](file:///Users/<user>/workspace/qoder/phantom/server/src/bootstrap.rs) | 编辑 | 新增 `pub fn print_qr_code(uri: &str)`；改 `print_summary` 在 URI 行后调用 |
-| [server/src/lib.rs](file:///Users/<user>/workspace/qoder/phantom/server/src/lib.rs) | 编辑 | `run()` 函数捕获公钥、构造 URI、调用 `print_qr_code`（load 模式也要 QR） |
+| [Cargo.toml](Cargo.toml) | 编辑 | `[workspace.dependencies]` 段加 `qr2term = "0.3"` |
+| [server/Cargo.toml](server/Cargo.toml) | 编辑 | `[dependencies]` 段加 `qr2term = { workspace = true }` |
+| [server/src/bootstrap.rs](server/src/bootstrap.rs) | 编辑 | 新增 `pub fn print_qr_code(uri: &str)`；改 `print_summary` 在 URI 行后调用 |
+| [server/src/lib.rs](server/src/lib.rs) | 编辑 | `run()` 函数捕获公钥、构造 URI、调用 `print_qr_code`（load 模式也要 QR） |
 
 ### 任务 2：macOS 客户端自动化构建
 
 | 文件 | 改动类型 | 说明 |
 |---|---|---|
-| [client/Cargo.toml](file:///Users/<user>/workspace/qoder/phantom/client/Cargo.toml) | 编辑 | **前置**：加 `[lib] crate-type = ["rlib", "cdylib"]`，否则 dylib 产不出来 |
-| [scripts/build-mac.sh](file:///Users/<user>/workspace/qoder/phantom/scripts/build-mac.sh) | 新建 | 自动化脚本（cargo + swiftc + Bundle + ad-hoc 签名） |
-| [client/mac/README.md](file:///Users/<user>/workspace/qoder/phantom/client/mac/README.md) | 编辑 | Build 段改写，推荐脚本方式，保留手动备选 |
-| [README.md](file:///Users/<user>/workspace/qoder/phantom/README.md) | 编辑 | macOS 客户端一句话前补构建指引段 |
+| [client/Cargo.toml](client/Cargo.toml) | 编辑 | **前置**：加 `[lib] crate-type = ["rlib", "cdylib"]`，否则 dylib 产不出来 |
+| [scripts/build-mac.sh](scripts/build-mac.sh) | 新建 | 自动化脚本（cargo + swiftc + Bundle + ad-hoc 签名） |
+| [client/mac/README.md](client/mac/README.md) | 编辑 | Build 段改写，推荐脚本方式，保留手动备选 |
+| [README.md](README.md) | 编辑 | macOS 客户端一句话前补构建指引段 |
 
 ### 任务 3：测试
 
 | 文件 | 改动类型 | 说明 |
 |---|---|---|
-| [server/src/bootstrap.rs](file:///Users/<user>/workspace/qoder/phantom/server/src/bootstrap.rs) `tests` 段 | 编辑 | 加一个 `print_qr_code_does_not_panic_on_valid_uri` 单测 |
-| [tests/tests/cli_system.rs](file:///Users/<user>/workspace/qoder/phantom/tests/tests/cli_system.rs) | 编辑 | 追加断言 QR 字符（`\u{2588}` 全角方块）出现在 stdout |
+| [server/src/bootstrap.rs](server/src/bootstrap.rs) `tests` 段 | 编辑 | 加一个 `print_qr_code_does_not_panic_on_valid_uri` 单测 |
+| [tests/tests/cli_system.rs](tests/tests/cli_system.rs) | 编辑 | 追加断言 QR 字符（`\u{2588}` 全角方块）出现在 stdout |
 
 ---
 
@@ -47,14 +47,14 @@ Phantom 已实现 `phantom server` 命令行的零配置自举：启动时打印
 
 ### 1.1 workspace + server Cargo 依赖
 
-在根 [Cargo.toml](file:///Users/<user>/workspace/qoder/phantom/Cargo.toml#L17-L74) 的 `[workspace.dependencies]` 段追加：
+在根 [Cargo.toml](Cargo.toml#L17-L74) 的 `[workspace.dependencies]` 段追加：
 
 ```toml
 # Terminal QR code rendering (used by server bootstrap)
 qr2term = "0.3"
 ```
 
-在 [server/Cargo.toml](file:///Users/<user>/workspace/qoder/phantom/server/Cargo.toml#L18-L26) `[dependencies]` 末尾追加：
+在 [server/Cargo.toml](server/Cargo.toml#L18-L26) `[dependencies]` 末尾追加：
 
 ```toml
 qr2term = { workspace = true }
@@ -62,7 +62,7 @@ qr2term = { workspace = true }
 
 ### 1.2 bootstrap.rs：新增 QR 打印函数 + 改 print_summary
 
-在 [bootstrap.rs](file:///Users/<user>/workspace/qoder/phantom/server/src/bootstrap.rs#L16-L30) `use` 块加：
+在 [bootstrap.rs](server/src/bootstrap.rs#L16-L30) `use` 块加：
 
 ```rust
 use qr2term::print_qr;
@@ -82,7 +82,7 @@ pub fn print_qr_code(uri: &str) {
 }
 ```
 
-改 `print_summary`（[bootstrap.rs 第 504-521 行](file:///Users/<user>/workspace/qoder/phantom/server/src/bootstrap.rs#L504-L521)）：
+改 `print_summary`（[bootstrap.rs 第 504-521 行](server/src/bootstrap.rs#L504-L521)）：
 
 ```rust
 fn print_summary(info: SummaryInfo<'_>) {
@@ -112,7 +112,7 @@ fn print_summary(info: SummaryInfo<'_>) {
 
 ### 1.3 lib.rs：load 模式也加 QR
 
-`phantom_server::run` 当前把公钥丢弃为 `_public_key`（[lib.rs 第 43 行](file:///Users/<user>/workspace/qoder/phantom/server/src/lib.rs#L43)）。改为：
+`phantom_server::run` 当前把公钥丢弃为 `_public_key`（[lib.rs 第 43 行](server/src/lib.rs#L43)）。改为：
 
 ```rust
 let (public_key, secret_key) = config.load_key_pair()?;
@@ -144,7 +144,7 @@ println!();
 
 ### 2.1 client/Cargo.toml 加 cdylib（前置）
 
-[client/Cargo.toml](file:///Users/<user>/workspace/qoder/phantom/client/Cargo.toml) 末尾追加：
+[client/Cargo.toml](client/Cargo.toml) 末尾追加：
 
 ```toml
 [lib]
@@ -153,7 +153,7 @@ crate-type = ["rlib", "cdylib"]
 ```
 
 说明：
-- `rlib` 保留以满足 [client/cli/Cargo.toml](file:///Users/<user>/workspace/qoder/phantom/client/cli/Cargo.toml) 内部 `phantom_client::PhantomClient` 调用
+- `rlib` 保留以满足 [client/cli/Cargo.toml](client/cli/Cargo.toml) 内部 `phantom_client::PhantomClient` 调用
 - `cdylib` 让 Swift 侧 dylopen 解析生效
 - `name = "phantom_client"` 对齐 `Bridge.swift` 的符号前缀
 
@@ -189,7 +189,7 @@ crate-type = ["rlib", "cdylib"]
 
 ### 2.3 改 client/mac/README.md
 
-把现有 Build 段（[第 15-58 行](file:///Users/<user>/workspace/qoder/phantom/client/mac/README.md#L15-L58)）替换为：
+把现有 Build 段（[第 15-58 行](client/mac/README.md#L15-L58)）替换为：
 
 ````markdown
 ## Build
@@ -237,7 +237,7 @@ The lightning-bolt icon appears in the menu bar; click it to enter a
 
 ### 2.4 改根 README.md
 
-在根 [README.md 第 48 行](file:///Users/<user>/workspace/qoder/phantom/README.md#L48) `macOS 原生客户端启动后...` 一句之前，插入：
+在根 [README.md 第 48 行](README.md#L48) `macOS 原生客户端启动后...` 一句之前，插入：
 
 ````markdown
 ### macOS 客户端构建
@@ -258,7 +258,7 @@ scripts/build-mac.sh              # 默认 Apple Silicon release
 
 #### 单元测试
 
-在 [bootstrap.rs tests 段](file:///Users/<user>/workspace/qoder/phantom/server/src/bootstrap.rs#L595-L843) 末尾追加：
+在 [bootstrap.rs tests 段](server/src/bootstrap.rs#L595-L843) 末尾追加：
 
 ```rust
 #[test]
@@ -272,14 +272,14 @@ fn print_qr_code_does_not_panic_on_valid_uri() {
 
 #### 集成测试（可选）
 
-在 [tests/tests/cli_system.rs](file:///Users/<user>/workspace/qoder/phantom/tests/tests/cli_system.rs) 追加一个用例：跑 `phantom server --port 0`，断言 stdout 包含 `URI link` 和 `\u{2588}`（全角方块字符）。如果已有端到端断言模板，直接复用。
+在 [tests/tests/cli_system.rs](tests/tests/cli_system.rs) 追加一个用例：跑 `phantom server --port 0`，断言 stdout 包含 `URI link` 和 `\u{2588}`（全角方块字符）。如果已有端到端断言模板，直接复用。
 
 ---
 
 ## 执行顺序
 
-1. **服务端 QR**：先改 [Cargo.toml](file:///Users/<user>/workspace/qoder/phantom/Cargo.toml) + [server/Cargo.toml](file:///Users/<user>/workspace/qoder/phantom/server/Cargo.toml) 加依赖 → [bootstrap.rs](file:///Users/<user>/workspace/qoder/phantom/server/src/bootstrap.rs) 加 `print_qr_code` + 改 `print_summary` → [lib.rs](file:///Users/<user>/workspace/qoder/phantom/server/src/lib.rs) load 模式补 QR → `cargo build --release -p phantom-server` 验证 → 跑 `phantom server` 肉眼检查终端
-2. **macOS 前置**：[client/Cargo.toml](file:///Users/<user>/workspace/qoder/phantom/client/Cargo.toml) 加 `crate-type` → `cargo build --release -p phantom-client --lib` → 检查 `target/release/libphantom_client.dylib` 存在且 `nm` 能看到 `phantom_macos_*` 符号
+1. **服务端 QR**：先改 [Cargo.toml](Cargo.toml) + [server/Cargo.toml](server/Cargo.toml) 加依赖 → [bootstrap.rs](server/src/bootstrap.rs) 加 `print_qr_code` + 改 `print_summary` → [lib.rs](server/src/lib.rs) load 模式补 QR → `cargo build --release -p phantom-server` 验证 → 跑 `phantom server` 肉眼检查终端
+2. **macOS 前置**：[client/Cargo.toml](client/Cargo.toml) 加 `crate-type` → `cargo build --release -p phantom-client --lib` → 检查 `target/release/libphantom_client.dylib` 存在且 `nm` 能看到 `phantom_macos_*` 符号
 3. **macOS 脚本**：新建 `scripts/build-mac.sh` → `chmod +x` → 在 macOS 上跑 `scripts/build-mac.sh` → 检查 `Phantom.app/Contents/{Info.plist,MacOS/Phantom,Frameworks/libphantom_client.dylib}` 都存在 → `sudo open Phantom.app` 启动看菜单栏图标
 4. **文档**：改 `client/mac/README.md` + 根 `README.md`
 5. **测试**：追加单测到 bootstrap.rs
@@ -291,17 +291,17 @@ fn print_qr_code_does_not_panic_on_valid_uri() {
 ```bash
 # === 服务端 QR 码 ===
 cd /tmp && mkdir phantom-qr-test && cd "$_"
-/Users/<user>/workspace/qoder/phantom/target/release/phantom server --port 14443
+./target/release/phantom server --port 14443
 # 预期：看到 URI link 行 + 下方 QR 码（unicode 块字符）+ 客户端命令
 # 用手机扫码应能解析出 URI 文本
 # Ctrl+C 退出
 
 # === load 模式 QR ===
-/Users/<user>/workspace/qoder/phantom/target/release/phantom server -c /Users/<user>/workspace/qoder/phantom/config/server.toml
+./target/release/phantom server -c ./config/server.toml
 # 预期：load mode 摘要 + URI + QR 码
 
 # === macOS 客户端构建 ===
-cd /Users/<user>/workspace/qoder/phantom
+cd .
 cargo build --release -p phantom-client --lib
 ls -la target/release/libphantom_client.dylib          # 必须存在
 nm -gU target/release/libphantom_client.dylib | grep phantom_macos_   # 至少 3 个符号

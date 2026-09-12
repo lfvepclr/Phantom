@@ -38,7 +38,7 @@ macOS 宿主机
 ### 2.1 构建静态二进制
 
 ```bash
-cd /Users/<user>/workspace/qoder/phantom
+cd /path/to/Phantom
 cargo xtask build server-arm64
 # 产物：target/aarch64-unknown-linux-musl/release/phantom-server
 file target/aarch64-unknown-linux-musl/release/phantom-server
@@ -65,7 +65,7 @@ scratch 无 shell；所有状态（server.key / server.toml / clients）经 `/da
 ### 2.3 容器编配（含资源限制）
 
 ```bash
-cd /Users/<user>/workspace/qoder/phantom
+cd /path/to/Phantom
 
 # 内部网络（服务端与 web 容器互通；web 不发布端口）
 podman network create phantom-net

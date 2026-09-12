@@ -1,7 +1,7 @@
 #!/bin/bash
 # E2E 第2轮环境部署: web + TCP(443) + QUIC(8443) + 备用(9443) 四容器
 set -eu
-cd /Users/<user>/workspace/qoder/phantom
+cd "$(dirname "$0")/../.."
 
 echo '--- [1] 凭据就位 ---'
 cp .e2e-boot/server.key .e2e-data/server.key

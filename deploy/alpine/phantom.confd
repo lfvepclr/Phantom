@@ -1,0 +1,23 @@
+# Phantom server configuration for Alpine/OpenRC.
+# Installed to /etc/conf.d/phantom by deploy/alpine/install.sh.
+#
+# Change a value and run: rc-service phantom restart
+
+# Starting port. If it is busy the server walks upward (443 -> 444 -> ...).
+PHANTOM_PORT="443"
+
+# tcp or quic
+PHANTOM_PROTO="tcp"
+
+# Host written into the phantom:// URI. Use the public IP or a DNS name the
+# clients can reach; leave empty to let the server auto-detect its egress IP.
+PHANTOM_PUBLIC_HOST=""
+
+# Cipher selection: auto / aes-256-gcm / aes-128-gcm / ascon-128 /
+# chacha20-poly1305. "auto" picks the fastest cipher the CPU supports.
+PHANTOM_CIPHER="auto"
+
+# Service account. Binding :443 needs CAP_NET_BIND_SERVICE, which the init
+# script grants to the unprivileged `phantom` user. Set to "root" only if your
+# OpenRC/start-stop-daemon build cannot grant capabilities.
+PHANTOM_USER="phantom"

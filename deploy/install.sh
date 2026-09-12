@@ -1,11 +1,31 @@
 #!/bin/bash
 set -e
 
-echo "Building phantom-server..."
-cargo build --release -p phantom-server
+# Installs a *prebuilt* phantom binary plus the systemd unit.
+#
+# Nothing is compiled on the target host. Build the deployable bundle on the
+# dev machine first (container build by default):
+#   cargo xtask package server --platform linux/amd64
+# ...then run this script with the extracted binary:
+#   sudo PHANTOM_SERVER_BIN=/path/to/phantom bash deploy/install.sh
+
+BIN="${PHANTOM_SERVER_BIN:-}"
+if [ -z "$BIN" ]; then
+    for candidate in ./phantom target/release/phantom \
+                     target/x86_64-unknown-linux-musl/release/phantom \
+                     target/aarch64-unknown-linux-musl/release/phantom; do
+        if [ -x "$candidate" ]; then BIN="$candidate"; break; fi
+    done
+fi
+if [ -z "$BIN" ] || [ ! -f "$BIN" ]; then
+    echo "ERROR: no prebuilt phantom binary found." >&2
+    echo "  Build the bundle:  cargo xtask package server --platform linux/amd64" >&2
+    echo "  Then re-run with:  sudo PHANTOM_SERVER_BIN=<path/to/phantom> bash deploy/install.sh" >&2
+    exit 1
+fi
 
 echo "Installing binary..."
-cp target/release/phantom-server /usr/local/bin/
+install -m 0755 "$BIN" /usr/local/bin/phantom
 
 # Auto-bootstrap state directory. The systemd unit runs with this as CWD
 # so that ./server.key and ./server.toml are created here on first start.

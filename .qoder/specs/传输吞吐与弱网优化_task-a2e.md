@@ -64,7 +64,7 @@
 
 ## Phase E：真机与路由器（低影响）
 
-1. **第二台 Mac**（`<user>@<内网主机IP>`，密码不写入任何文档）：首连部署公钥免密 → 探测机型/芯片/网口速率（1GbE→118 / 2.5GbE→295 MB/s 封顶）→ 源码构建服务端 → LAN 线速对测（本机 phantom client ↔ 对端 phantom server，打满网口）。
+1. **第二台 Mac**（`user@<内网主机IP>`，密码不写入任何文档）：首连部署公钥免密 → 探测机型/芯片/网口速率（1GbE→118 / 2.5GbE→295 MB/s 封顶）→ 源码构建服务端 → LAN 线速对测（本机 phantom client ↔ 对端 phantom server，打满网口）。
 2. **路由器**（<路由器IP>，硬约束：承载真实流量）：仅只读探测 `cat /proc/cpuinfo`（确认 A53 是否含 aes/pmull，决定路由器侧 cipher 推荐）、`/proc/version`、`nproc`、`free -m`；零写入。如后续要跑服务端：静态 musl 二进制放 /tmp + nice 19 + 单核 + 内存上限 + 测完即删。
 3. 鸿蒙链路在真机 LAN 路径下复测（模拟器 → 路由器 → 第二台 Mac 服务端）。
 

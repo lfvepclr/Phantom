@@ -5,20 +5,26 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Auto-bootstrap mode: phantom-server writes ./server.key and ./server.toml
-# on first start. WorkingDirectory MUST point to a writable directory owned
-# by the service user; the server reads/writes server.key and server.toml
-# relative to this directory. The phantom:// URI quick-link lives as a comment
-# at the top of server.toml; the inline `[[allowed_clients]]` array below it
-# stores the whitelist (empty = open mode).
+# Auto-bootstrap mode: `phantom server` writes ./server.key and ./server.toml
+# on first start and reuses them afterwards, so the phantom:// URI stays
+# stable across restarts. WorkingDirectory MUST point to a writable directory
+# owned by the service user; the URI quick-link lives as a comment at the top
+# of server.toml.
+#
+# Shipped for non-Alpine hosts; the Alpine/OpenRC installer lives in
+# deploy/alpine/install.sh and is what `cargo xtask deploy server` uses.
 #
 # To use a TOML config instead, replace ExecStart with:
-#   /usr/local/bin/phantom-server /etc/phantom/server.toml
-ExecStart=/usr/local/bin/phantom-server
+#   /usr/local/bin/phantom server -c /etc/phantom/server.toml
+ExecStart=/usr/local/bin/phantom server --port 443 --proto tcp
 WorkingDirectory=/var/lib/phantom
 Restart=always
 RestartSec=5
 LimitNOFILE=65535
+
+# Binding :443 as an unprivileged user.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 NoNewPrivileges=true
 ProtectSystem=strict

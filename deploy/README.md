@@ -1,11 +1,79 @@
 # Phantom 部署指南
 
-`deploy/` 目录提供两件部署资产：
+## 0. 本地打包 → 容器验证 → 远端安装（推荐）
+
+服务器**不编译、不联网安装依赖**：本地产出静态二进制 + 安装脚本，服务器只解包执行。
+全流程集成在 `cargo xtask` 里。
+
+```bash
+# 1) 打包 linux/amd64 服务端（默认用 deploy/Containerfile 的固定环境构建；
+#    没有容器引擎时自动/显式退回宿主机 rust-lld 交叉：加 --no-container）
+cargo xtask package server --platform linux/amd64
+#    产物：dist/phantom-server-<version>-linux-amd64.tar.gz (+ .sha256)
+
+# 2) 容器内离线端到端验证（起 alpine:3.18 amd64 容器跑真实二进制 +
+#    本地 minihttpd origin，字节对账；不依赖任何被墙目标）
+cargo xtask verify server --platform linux/amd64
+
+# 3) 上传 + 安装 + 回显 phantom:// URI
+cargo xtask deploy server \
+  --host root@203.0.113.10 \
+  --public-host 203.0.113.10 \
+  --port 443 --proto tcp
+
+# 4) 速度基线 / 解锁断言
+cargo xtask speedtest --uri "<URI>" --check-unblock --vps-host root@203.0.113.10
+cargo xtask speedtest --loopback        # 客户端软件上限（本机 server+client+origin）
+```
+
+构建环境说明（`deploy/Containerfile`）：
+
+| 阶段 | 基础镜像 | 作用 |
+|------|----------|------|
+| `builder` | `rust:1.96-alpine3.18` | 交叉编译（`rust-lld` + self-contained musl CRT，不跑 QEMU 编译）；工具链与 crate 走 RsProxy |
+| `artifact` | `scratch` | 导出裸静态二进制，供 `-o type=local,dest=...` 提取 |
+| `test-origin` | `scratch` | `tests/e2e/minihttpd.rs` 编出的离线 origin（只用于验证，不进部署包） |
+| `verify` | `alpine:3.18` | 在**生产同版本**的 Alpine 上跑一次 `--version`/`server --help` |
+| `runtime` | `alpine:3.18` | 可选：可直接运行的 OCI 镜像（本 VPS 不用） |
+
+多环境：`--platform linux/amd64`（x86_64 服务器）与 `--platform linux/arm64`
+（ARM 服务器/路由器）用同一份 Containerfile。
+
+Alpine 服务器上的安装细节、取 URI、运维命令、以及"为什么最终以 root 运行"
+见 [`alpine/README.md`](alpine/README.md)。
+
+### 0.1 在没有 Google 直连的环境下验证解锁
+
+本地网络到不了 Google 时，"部署前验证"必须用可控目标，解锁结论留给部署后：
+
+| 阶段 | 目标 | 断言 |
+|------|------|------|
+| 部署前（离线） | 本地 `minihttpd` origin 的 `/10mb.bin` | 经隧道拉取后 `sha256` 与服务端完全一致 |
+| 部署前（离线） | `http://www.baidu.com` | 经隧道 200/301（证明真实公网中继可用，国内可达目标） |
+| 部署后 | `https://www.google.com/generate_204` | HTTP 204 |
+| 部署后 | `https://www.gstatic.com/generate_204` | HTTP 204 |
+| 部署后 | `https://www.cloudflare.com/cdn-cgi/trace` | `ip=<服务器IP> loc=HK colo=HKG`（出口身份证据） |
+| 部署后 | `https://www.youtube.com/` | HTTP 200 |
+
+以上部署后目标均已在这台 HK 服务器上实测通过。`cargo xtask speedtest --check-unblock`
+会一次性跑完并打印结果。
+
+要点：**经 SOCKS5 的连接由服务端解析域名**（`--socks5-hostname`），本地 DNS 污染
+不影响结果；若浏览器失败而 curl 成功，先用 `cdn-cgi/trace` 判定是 DNS 还是链路，
+再按浏览器 Secure DNS / 系统 DNS 顺序处置。TUN 模式下白名单域名由隧道内
+`client.dns`（默认 `8.8.8.8:53`）解析，其余域名走 `client.dns_direct`
+（默认 `223.5.5.5:53`）从物理网卡解析。
+
+---
+
+## 传统方式（systemd 主机）
+
+`deploy/` 目录下的 systemd 资产：
 
 | 文件 | 用途 |
 |------|------|
-| `install.sh` | 一键构建 + 安装二进制 + 准备 systemd 工作目录 + 安装 service 单元 |
-| `phantom.service` | systemd 单元；默认使用自举（auto）模式启动 |
+| `install.sh` | 安装**预编译**二进制 + 准备 systemd 工作目录 + 安装 service 单元（不再在目标机上编译） |
+| `phantom.service` | systemd 单元；`ExecStart=/usr/local/bin/phantom server --port 443 --proto tcp` |
 
 部署后唯一的"配置文件"是服务端在启动目录下生成的 `server.toml`：头部带 `phantom://` URI 快速链接注释，下方有 `bind` / `cipher` / `protocol` 配置以及内联 `[[allowed_clients]]` 白名单数组。
 

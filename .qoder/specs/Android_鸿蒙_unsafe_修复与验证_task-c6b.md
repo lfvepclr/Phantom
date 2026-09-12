@@ -27,8 +27,8 @@
 | Android 模拟器 / adb | ❌ 未安装 | 无法运行 instrumented 测试 |
 | Android Rust targets | ❌ 未安装 | `aarch64-linux-android` 等缺失 |
 | DevEco Studio | ✅ 已安装 | `DevEco Studio 26.0.0 Beta1` |
-| HarmonyOS SDK | ✅ 已安装 | `/Users/<user>/Library/Huawei/Sdk` |
-| HarmonyOS 模拟器 | ✅ 已部署 | `/Users/<user>/.Huawei/Emulator/deployed` |
+| HarmonyOS SDK | ✅ 已安装 | `~/Library/Huawei/Sdk` |
+| HarmonyOS 模拟器 | ✅ 已部署 | `~/.Huawei/Emulator/deployed` |
 | ohos-rs / cargo-ohos | ❌ 待确认 | 需验证是否已安装 |
 | GitHub Actions CI | ❌ 未配置 | 无自动化 Android/HarmonyOS 构建 |
 
@@ -42,8 +42,8 @@
 
 2. **HarmonyOS 工具链**
    - DevEco Studio `26.0.0 Beta1` 已安装，无需重复安装。
-   - HarmonyOS SDK 已位于 `/Users/<user>/Library/Huawei/Sdk`，DevEco Studio 内确认 API 12+ 已下载。
-   - 模拟器镜像已部署在 `/Users/<user>/.Huawei/Emulator/deployed`，支持命令行启动与调试。
+   - HarmonyOS SDK 已位于 `~/Library/Huawei/Sdk`，DevEco Studio 内确认 API 12+ 已下载。
+   - 模拟器镜像已部署在 `~/.Huawei/Emulator/deployed`，支持命令行启动与调试。
    - 安装/验证 ohos-rs / cargo-ohos 工具链（用于 NAPI 编译）。
    - 命令行启动 HarmonyOS 模拟器（参考[官方文档](https://developer.huawei.com/consumer/cn/doc/harmonyos-guides/ide-emulator-command-line)）：
      ```bash
@@ -54,11 +54,11 @@
      # 启动指定模拟器（name 替换为实际 AVD 名称）
      ./emulator -avd <avd_name>
      # 或后台启动 + 网络桥接（按需）
-     ./emulator -avd <avd_name> -netdir /Users/<user>/.Huawei/Emulator/deployed -no-window
+     ./emulator -avd <avd_name> -netdir ~/.Huawei/Emulator/deployed -no-window
      ```
      也可通过 HDC 命令验证设备连接：
      ```bash
-     /Users/<user>/Library/Huawei/Sdk/hmscore/TOOLCHAIN/bin/hdc list targets
+     ~/Library/Huawei/Sdk/hmscore/TOOLCHAIN/bin/hdc list targets
      ```
 
 3. **CI 准备**
@@ -317,7 +317,7 @@
 2. **等待模拟器就绪**
    ```bash
    # 轮询直到设备出现
-   /Users/<user>/Library/Huawei/Sdk/hmscore/TOOLCHAIN/bin/hdc list targets
+   ~/Library/Huawei/Sdk/hmscore/TOOLCHAIN/bin/hdc list targets
    ```
 
 3. **编译并安装 HAP**
@@ -326,18 +326,18 @@
    cd client/harmony
    ./scripts/build-harmony.sh
    # 使用 hvigor 或 hdc 安装产物（示例）
-   /Users/<user>/Library/Huawei/Sdk/hmscore/TOOLCHAIN/bin/hdc app install entry/build/default/outputs/default/entry-default-signed.hap
+   ~/Library/Huawei/Sdk/hmscore/TOOLCHAIN/bin/hdc app install entry/build/default/outputs/default/entry-default-signed.hap
    ```
 
 4. **启动应用**
    ```bash
-   /Users/<user>/Library/Huawei/Sdk/hmscore/TOOLCHAIN/bin/hdc shell am start -a ohos.want.action.home -b com.phantom.harmony -m EntryAbility
+   ~/Library/Huawei/Sdk/hmscore/TOOLCHAIN/bin/hdc shell am start -a ohos.want.action.home -b com.phantom.harmony -m EntryAbility
    ```
 
 5. **查看日志**
    ```bash
    # 实时抓取应用日志
-   /Users/<user>/Library/Huawei/Sdk/hmscore/TOOLCHAIN/bin/hdc hilog | grep -i phantom
+   ~/Library/Huawei/Sdk/hmscore/TOOLCHAIN/bin/hdc hilog | grep -i phantom
    ```
 
 6. **验证矩阵**

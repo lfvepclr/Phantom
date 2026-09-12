@@ -1,7 +1,7 @@
 #!/bin/bash
 # E2E: CLI 客户端数据面测试（QUIC 轮 + TCP 轮 + HTTP 代理 + 日志断言）
 set -u
-cd /Users/<user>/workspace/qoder/phantom
+cd "$(dirname "$0")/../.."
 
 URI_BASE='phantom://cGhhbnRvbS1lMmUtdGVzdC1zZXJ2ZXIta2V5LTMyYiE==@127.0.0.1:443?psk=cGhhbnRvbS1lMmUtcHJlLXNoYXJlZC1rZXktMzJiISE==&cipher=auto'
 URI_QUIC="${URI_BASE}&proto=quic#default"

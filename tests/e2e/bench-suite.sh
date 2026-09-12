@@ -3,7 +3,7 @@
 # 用法: bench-suite.sh <phase-tag>
 # 输出行前缀 BENCH[<phase-tag>] 便于 grep 汇总对比
 set -u
-cd /Users/<user>/workspace/qoder/phantom
+cd "$(dirname "$0")/../.."
 
 TAG="${1:-x}"
 KEY=$(sed -E 's|phantom://([^@]+)@.*|\1|' .e2e-boot/uri.txt)
