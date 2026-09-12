@@ -118,7 +118,8 @@ Mac 不回归（硬门，相对基线下降 ≤ 5%）：
 ```bash
 # 1) 安装带修复的 HAP
 hdc -t <设备号> install -r client/harmony/entry/build/default/outputs/default/entry-default-signed.hap
-# 2) 在手机上打开 Phantom 并「启动」，重启一次隧道（trace 会被截断）
+# 2) 打开 App → 连接详情 → 打开「记录 TUN 追踪」（状态会持久化），然后「启动」
+#    隧道（每次启动都会截断 trace 文件，所以一次工况对应一份 trace）
 # 3) 依次跑四个 60 s 工况（脚本会提示何时开始播放/下载）
 scripts/harmony-bench.sh --label "video 1080p"   --seconds 60 --out tests/PERF_TUN_PATH_REPORT.md
 scripts/harmony-bench.sh --label "dl.google.com" --seconds 60 --out tests/PERF_TUN_PATH_REPORT.md
