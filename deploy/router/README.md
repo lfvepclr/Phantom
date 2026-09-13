@@ -4,6 +4,20 @@
 
 ---
 
+## 0. 先选安装方式
+
+| 场景 | 用什么 | 说明 |
+|---|---|---|
+| **固件带 koolshare 软件中心**（官改 / ks梅林，如 `3.0.0.4.388_24199_koolcenter`） | [`client/koolshare/`](../../client/koolshare/README.md) 插件 | 有 Web 管理界面：开关、连接串、模式、白名单、定时重启、测速、上下行速率、日志；`cargo xtask package koolshare` 出离线包，软件中心「离线安装」即可 |
+| 梅林 / 官方固件，无软件中心 | 本目录的 `install.sh`（命令行），或插件的**降级安装模式** | 插件 `install.sh` 检测不到 `/koolshare` 时会自动改为装到 `/jffs/phantom` 并注册 `services-start` / `nat-start`，配置存文件而非 dbus |
+| 只要一份最小脚本、不要 Web | 本目录 | 下面正文即此方式 |
+
+> 本目录的 `phantom.sh` 与插件共用同一套启动参数（`client --tun --gateway`），
+> 但配置来源不同：这里是 `/jffs/phantom/phantom.conf`，插件是 dbus。
+> **两者不要同时启用**，否则两个进程会抢同一个 TUN 与路由表。
+
+---
+
 ## 1. 原理
 
 ```
@@ -47,6 +61,12 @@ LAN 客户端 ──┐
 | JFFS 分区 | 启用（Enable JFFS custom scripts and configs） |
 | 固件 | Asuswrt-Merlin（官方固件缺少 `/jffs/scripts` 钩子） |
 | 架构 | `aarch64`（BCM4912/BCM4908 机型）；用 `ssh admin@router uname -m` 确认 |
+
+> 本文示例统一写 `ssh admin@<路由器IP>`。若路由器把 SSH 改到了别的端口（本机是
+> **<SSH端口>**），把 `-p` 加在 host **之前**：`ssh -p <SSH端口> admin@<路由器IP>` ——
+> 写成 `ssh admin@<路由器IP> -p <SSH端口>` 会被当成远端命令执行。
+> scp 同理（大写 `-P`）：`scp -P <SSH端口> <file> admin@<路由器IP>:/tmp/`。
+> 另外路由器上的 `sh` 必须写成 `/bin/sh`（`/usr/sbin/sh` 是 Broadcom 调试工具）。
 
 `ip`、`iptables`、`/dev/net/tun` 在 Merlin 上默认可用（OpenVPN 依赖它们），
 安装脚本会在拷贝任何文件之前逐项校验。
@@ -152,7 +172,7 @@ ssh admin@<路由器IP> 'ip rule show; ip route show table 200; ip link show pha
 ### 彻底卸载
 
 ```bash
-ssh admin@<路由器IP> 'sh -c "
+ssh -p <SSH端口> admin@<路由器IP> '/bin/sh -c "
 /jffs/phantom/phantom.sh stop
 sed -i /phantom/d /jffs/scripts/services-start /jffs/scripts/nat-start
 rm -rf /jffs/phantom

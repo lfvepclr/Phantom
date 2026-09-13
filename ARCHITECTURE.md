@@ -308,7 +308,8 @@ Noise_IK_25519_{AESGCM,ChaChaPoly}_SHA256 + prologue = PSK
 | macOS | `tun::create_as_async("utun7")` | `phantom_macos_start/stop` | networksetup SOCKS5 自动设置/恢复 | cdylib + SwiftUI |
 | Android | VpnService fd → AsyncFd | `phantom_android_start/stop` | VpnService 路由规则 | cdylib + Kotlin |
 | HarmonyOS | VpnExtensionAbility fd → AsyncFd | NAPI 模块 | VpnExtensionAbility 路由 | cdylib + ArkTS |
-| Linux 路由器 | `TunDevice::create_with(TunSettings)` | N/A（直跑 CLI） | `ip rule` 策略路由 + iptables | aarch64-musl 静态二进制 |
+| Linux 路由器 | `TunDevice::create_with(TunSettings)` | N/A（直跑 CLI） | `ip rule` 策略路由 + iptables | aarch64 + armv7 musl 静态二进制 |
+| koolshare 插件 | 同上，由插件脚本拉起 | N/A（软件中心 ASP + sh） | 同上 | 软件中心离线包（双架构） |
 | CLI | 同上（`--tun` 可选） | `phantom-cli` main | 无 | 统一二进制 |
 
 ### 7.0 Linux 网关数据面（路由器）
@@ -328,6 +329,32 @@ LAN 客户端 ──转发──▶ ip rule iif br0 ─▶ table 200 ─▶ defa
 
 指令集的构造（`GatewayConfig::plan` / `teardown_plan`）与执行分离，因此可在
 无 root、无真实网卡的情况下单测；`Gateway` 的 `Drop` 负责完整回滚。
+
+### 7.0.1 koolshare 软件中心插件（路由器控制面）
+
+`client/koolshare/` 是路由器形态的**控制面外壳**，不引入任何新的数据面代码：
+
+```
+Module_phantom.asp  ──GET/POST /_api/──▶  /koolshare/scripts/phantom_config.sh
+        │                                        │ 生成 client.toml + proxy_domains.txt
+        │                                        ▼
+        └──GET /_temp/phantom_status.txt──  phantom_status.sh（2s 采样 /metrics）
+                                            phantom client -c … --server … --tun --gateway
+```
+
+| 约定 | 值 |
+|---|---|
+| 配置存储 | `dbus`（skipd）；无软件中心时降级为 `/jffs/phantom/etc/phantom.conf` |
+| 服务器来源 | `--server <URI>` 传入，覆盖 TOML 的 servers 段，避免两处不一致 |
+| 白名单 | 写 `proxy_domains.txt`，用 `PHANTOM_PROXY_DOMAINS` 注入（dbus 不支持多行） |
+| 指标 | 复用 `client.metrics_listen`（默认 `127.0.0.1:9150`），两次采样求差得速率 |
+| 二进制 | 包内同时带 `phantom-aarch64` 与 `phantom-armv7`，`install.sh` 按 `uname -m` 选 |
+| 平台检测 | `/koolshare` + `/usr/bin/skipd` + 内核 ≥ 4.1，否则拒绝安装或降级 `/jffs` |
+| 软件中心调用 | `POST /_api/ {id, method, params, fields}` → httpdb 先落 dbus，再执行 `scripts/<method> <id> <params...>`；脚本必须回包 `127.0.0.1:3030/_resp/<id>` |
+| 状态与日志通道 | 物理文件 `/tmp/upload/phantom_{status,log}.txt`，页面经 httpdb 的 `/_temp/<name>` 读（docroot 下的 `.txt` 一律 404） |
+| 开机 / nat 钩子 | `init.d/S98phantom.sh start`（wan-start）、`init.d/N98phantom.sh start_nat`（iptables 被重建时补规则） |
+
+细节与排障见 [`client/koolshare/README.md`](client/koolshare/README.md)。
 
 ### 7.1 macOS 系统代理
 

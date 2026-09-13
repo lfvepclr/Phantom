@@ -1,0 +1,27 @@
+#!/bin/sh
+# cru mock：Asuswrt 的 crontab 封装，只实现 a/d/l
+# 数据落在 /tmp/mock-cron.txt（id<TAB>schedule<TAB>command）
+CF="${MOCK_CRON_FILE:-/tmp/mock-cron.txt}"
+[ -f "$CF" ] || : >"$CF"
+
+# BusyBox sed 与 BSD sed 的 -i 语法不兼容，统一走临时文件
+sed_inplace() {
+    sed "$1" "$2" >"$2.sedtmp" 2>/dev/null && mv "$2.sedtmp" "$2" || rm -f "$2.sedtmp"
+}
+
+case "$1" in
+    a)
+        id="$2"
+        shift 2
+        sed_inplace "/^${id}	/d" "$CF"
+        printf '%s\t%s\n' "$id" "$*" >>"$CF"
+        ;;
+    d)
+        sed_inplace "/^$2	/d" "$CF"
+        ;;
+    l)
+        cat "$CF" 2>/dev/null
+        ;;
+    *) echo "mock cru: unsupported: $*" >&2 ;;
+esac
+exit 0

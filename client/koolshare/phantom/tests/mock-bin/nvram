@@ -1,0 +1,15 @@
+#!/bin/sh
+# nvram mock：返回固定的机型信息，供 install.sh 的机型/固件判定使用
+case "$1" in
+    get)
+        case "$2" in
+            odmpid)   echo "RT-AX86U Pro" ;;
+            productid) echo "RT-AX86U Pro" ;;
+            extendno) echo "24199_koolcenter" ;;
+            buildno)  echo "388" ;;
+            *)        echo "" ;;
+        esac
+        ;;
+    *) echo "" ;;
+esac
+exit 0

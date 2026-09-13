@@ -359,6 +359,137 @@ pub fn assemble_bundle(root: &Path, spec: &TargetSpec, bin: &Path) -> Result<Pat
     Ok(tarball)
 }
 
+/// Recursively copy `src` into `dst`, skipping top-level entries in `skip`.
+fn copy_tree(src: &Path, dst: &Path, skip: &[&str]) -> Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if skip.contains(&name.as_str()) {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(&name);
+        if entry.file_type()?.is_dir() {
+            copy_tree(&from, &to, &[])?;
+        } else {
+            fs::copy(&from, &to).with_context(|| format!("copy {}", from.display()))?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn make_executable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perm = fs::metadata(path)?.permissions();
+    perm.set_mode(0o755);
+    fs::set_permissions(path, perm)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_executable(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+/// Assemble the koolshare software-centre offline plugin bundle.
+///
+/// The software centre unpacks the tarball to `/tmp/phantom/` and runs
+/// `install.sh` from there, so the tarball must contain exactly one top-level
+/// `phantom/` directory. Both architectures ship in one package: `install.sh`
+/// picks between them with `uname -m`, because hnd/axhnd firmware mixes 64-bit
+/// kernels with 32-bit userspace.
+pub fn assemble_koolshare_bundle(root: &Path, aarch64: &Path, armv7: &Path) -> Result<PathBuf> {
+    let version = env!("CARGO_PKG_VERSION");
+    let src = root.join("client").join("koolshare").join("phantom");
+    if !src.exists() {
+        bail!("plugin source not found: {}", src.display());
+    }
+    for required in [
+        "install.sh",
+        "uninstall.sh",
+        "webs/Module_phantom.asp",
+        "scripts/phantom_config.sh",
+    ] {
+        if !src.join(required).exists() {
+            bail!("plugin source missing {}", src.join(required).display());
+        }
+    }
+
+    let build_dir = root.join("dist").join("koolshare-build");
+    if build_dir.exists() {
+        fs::remove_dir_all(&build_dir)?;
+    }
+    fs::create_dir_all(&build_dir)?;
+    let pkg = build_dir.join("phantom");
+    // bin/ 由本次构建注入、tests/ 只是开发期资产，都不要进离线包
+    copy_tree(&src, &pkg, &["bin", "tests"])?;
+
+    // 版本号跟随 workspace，install.sh 会把它写进 dbus
+    fs::write(pkg.join("version"), format!("{}\n", version))?;
+    // 软件中心离线包校验：必须存在 .valid 且内容含 hnd
+    fs::write(pkg.join(".valid"), "hnd\n")?;
+
+    let bin_dir = pkg.join("bin");
+    fs::create_dir_all(&bin_dir)?;
+    fs::copy(aarch64, bin_dir.join("phantom-aarch64"))
+        .with_context(|| format!("copy {}", aarch64.display()))?;
+    fs::copy(armv7, bin_dir.join("phantom-armv7"))
+        .with_context(|| format!("copy {}", armv7.display()))?;
+    for b in ["phantom-aarch64", "phantom-armv7"] {
+        make_executable(&bin_dir.join(b))?;
+    }
+    for script in [
+        "install.sh",
+        "uninstall.sh",
+        "scripts/phantom_config.sh",
+        "scripts/phantom_status.sh",
+        "scripts/phantom_speedtest.sh",
+        "scripts/phantom_cron.sh",
+        "scripts/phantom_diag.sh",
+        "scripts/phantom_watchdog.sh",
+    ] {
+        let p = pkg.join(script);
+        if p.exists() {
+            make_executable(&p)?;
+        }
+    }
+
+    // 体积提示：JFFS 空间紧张，双架构是最主要的占用
+    let total: u64 = ["phantom-aarch64", "phantom-armv7"]
+        .iter()
+        .filter_map(|b| fs::metadata(bin_dir.join(b)).ok())
+        .map(|m| m.len())
+        .sum();
+
+    let tarball = root.join("dist").join(format!("phantom-{}.tar.gz", version));
+    let _ = fs::remove_file(&tarball);
+    let mut cmd = Command::new("tar");
+    cmd.arg("czf")
+        .arg(&tarball)
+        .arg("-C")
+        .arg(&build_dir)
+        .arg("phantom");
+    run(&mut cmd, "tar czf koolshare bundle")?;
+
+    let digest = sha256_file(&tarball)?;
+    let sum_path = root
+        .join("dist")
+        .join(format!("phantom-{}.tar.gz.sha256", version));
+    fs::write(&sum_path, format!("{}  phantom-{}.tar.gz\n", digest, version))?;
+
+    println!();
+    println!("  Bundle:     {}", tarball.display());
+    println!("  SHA256:     {}", digest);
+    println!(
+        "  Binaries:   {:.1} MiB (aarch64 + armv7, static musl)",
+        total as f64 / (1024.0 * 1024.0)
+    );
+    println!("  Install:    软件中心 → 离线安装，上传上面的 tar.gz");
+    Ok(tarball)
+}
+
 /// `scripts/deploy-server.sh` wrapper: upload + install + report the URI.
 /// Offline end-to-end verification: runs the packaged binary inside the
 /// production Alpine release together with a controllable local origin

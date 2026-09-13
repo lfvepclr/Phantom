@@ -1,0 +1,39 @@
+#!/bin/sh
+# dbus mock：koolshare 的 skipd 键值库，只实现插件用到的子命令
+# 数据落在 /tmp/mock-dbus.txt（key=value）
+DB="${MOCK_DBUS_FILE:-/tmp/mock-dbus.txt}"
+[ -f "$DB" ] || : >"$DB"
+
+# BusyBox sed 与 BSD sed 的 -i 语法不兼容，统一走临时文件
+sed_inplace() {
+    sed "$1" "$2" >"$2.sedtmp" 2>/dev/null && mv "$2.sedtmp" "$2" || rm -f "$2.sedtmp"
+}
+
+case "$1" in
+    get)
+        key="$2"
+        sed -n "s/^${key}=//p" "$DB" 2>/dev/null | head -n 1
+        ;;
+    set)
+        kv="$2"
+        key="${kv%%=*}"
+        val="${kv#*=}"
+        if grep -q "^${key}=" "$DB" 2>/dev/null; then
+            sed_inplace "s|^${key}=.*|${key}=${val}|" "$DB"
+        else
+            echo "${key}=${val}" >>"$DB"
+        fi
+        ;;
+    remove)
+        sed_inplace "/^$2=/d" "$DB"
+        ;;
+    list)
+        if [ -n "$2" ]; then
+            grep "^$2" "$DB" 2>/dev/null
+        else
+            cat "$DB"
+        fi
+        ;;
+    *) echo "mock dbus: unsupported: $*" >&2 ;;
+esac
+exit 0

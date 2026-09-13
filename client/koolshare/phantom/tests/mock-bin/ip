@@ -1,0 +1,75 @@
+#!/bin/sh
+# ip mock：冒烟测试用，只实现插件真正会调用的子命令，并把「装了什么规则」记到文件。
+#
+#   ip rule add <spec...>   → 追加一行 `rule <spec...>`
+#   ip rule del <spec...>    → 按子串匹配删除；删到就返回 0，删不到返回 1
+#                              （返回值很关键：cleanup_rules 用
+#                               `while ip rule del ...; do :; done` 清规则，
+#                               删不到时必须非零，否则测试会死循环）
+#   ip rule show             → 打印 `<n>:\t<spec>`
+#   ip link show <name>      → 有对应 `link <name>` 行才算存在
+#   ip route show/flush table N
+#
+# 状态文件：$MOCK_IP_FILE（默认 /tmp/mock-ip.txt）
+F="${MOCK_IP_FILE:-/tmp/mock-ip.txt}"
+[ -f "$F" ] || : >"$F"
+
+case "$1" in
+    rule)
+        op="$2"
+        shift 2
+        spec="$*"
+        case "$op" in
+            add)
+                echo "rule $spec" >>"$F"
+                exit 0
+                ;;
+            del)
+                [ -n "$spec" ] || exit 1
+                grep -q -- "$spec" "$F" 2>/dev/null || exit 1
+                grep -v -- "$spec" "$F" >"$F.tmp" 2>/dev/null && mv "$F.tmp" "$F"
+                exit 0
+                ;;
+            show)
+                n=0
+                while IFS= read -r line; do
+                    case "$line" in
+                        "rule "*) n=$((n + 1)); printf '%s:\tfrom all %s\n' "$((32760 + n))" "${line#rule }" ;;
+                    esac
+                done <"$F"
+                exit 0
+                ;;
+        esac
+        ;;
+    route)
+        op="$2"
+        shift 2
+        spec="$*"
+        case "$op" in
+            show)
+                while IFS= read -r line; do
+                    case "$line" in
+                        "route table $spec "*) echo "${line#route }" ;;
+                    esac
+                done <"$F"
+                ;;
+            flush)
+                grep -v -- "route table $spec " "$F" >"$F.tmp" 2>/dev/null && mv "$F.tmp" "$F"
+                ;;
+        esac
+        exit 0
+        ;;
+    link)
+        op="$2"
+        name="$3"
+        case "$op" in
+            show)
+                grep -q -- "link $name" "$F" 2>/dev/null || exit 1
+                echo "$name: <POINTOPOINT,MULTICAST,NOARP,UP,LOWER_UP> mtu 1400"
+                exit 0
+                ;;
+        esac
+        exit 0
+        ;;
+esac
+exit 0

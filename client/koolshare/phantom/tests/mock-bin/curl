@@ -1,0 +1,70 @@
+#!/bin/sh
+# curl mock：只支持插件用到的三种调用
+#   - metrics: curl -s --max-time N http://127.0.0.1:9150/metrics
+#   - 测速    : curl -s --socks5-hostname ... -o /dev/null -w '...' <url>
+#   - 软件中心回包: curl -s -m 5 -X POST -d <id> http://127.0.0.1:3030/_resp/<id>
+#     这条会被记到 $PHANTOM_ACK_CAPTURE（URL 一行、body 一行），
+#     冒烟测试据此断言「脚本按约定回了包」。
+HIT_METRICS=0
+ACK_CAPTURE="${PHANTOM_ACK_CAPTURE:-}"
+prev=""
+for a in "$@"; do
+    case "$a" in
+        */_resp/*)
+            if [ -n "$ACK_CAPTURE" ]; then
+                printf '%s\n%s\n' "$a" "$prev" >>"$ACK_CAPTURE"
+            fi
+            exit 0
+            ;;
+    esac
+    prev="$a"
+done
+
+for a in "$@"; do
+    case "$a" in
+        *9150*) HIT_METRICS=1 ;;
+    esac
+done
+
+if [ "$HIT_METRICS" = "1" ]; then
+    # 计数器按调用次数递增，方便验证「两次采样求差算速率」
+    N=$(cat /tmp/mock-metrics-n 2>/dev/null || echo 0)
+    N=$((N + 1))
+    echo "$N" >/tmp/mock-metrics-n
+    cat <<EOF
+# HELP phantom_tcp_bytes_up Total TCP bytes sent upstream
+# TYPE phantom_tcp_bytes_up counter
+phantom_tcp_bytes_up $((1000000 * N))
+# HELP phantom_tcp_bytes_down Total TCP bytes received downstream
+# TYPE phantom_tcp_bytes_down counter
+phantom_tcp_bytes_down $((3000000 * N))
+# HELP phantom_udp_bytes_up Total UDP bytes sent upstream
+# TYPE phantom_udp_bytes_up counter
+phantom_udp_bytes_up $((1000 * N))
+# HELP phantom_udp_bytes_down Total UDP bytes received downstream
+# TYPE phantom_udp_bytes_down counter
+phantom_udp_bytes_down $((2000 * N))
+# HELP phantom_tcp_connections Total TCP connections
+# TYPE phantom_tcp_connections counter
+phantom_tcp_connections $((N * 2))
+# HELP phantom_route_direct_total Connections routed directly
+# TYPE phantom_route_direct_total counter
+phantom_route_direct_total $((N * 5))
+# HELP phantom_route_proxy_total Connections routed through the tunnel
+# TYPE phantom_route_proxy_total counter
+phantom_route_proxy_total $((N * 3))
+EOF
+    exit 0
+fi
+
+for a in "$@"; do
+    case "$a" in
+        *socks5-hostname*)
+            # size_download speed_download time_total time_starttransfer http_code
+            echo "10485760 2097152 5.001 0.123 200"
+            exit 0
+            ;;
+    esac
+done
+
+exit 0

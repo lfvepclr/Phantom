@@ -3,6 +3,7 @@
 //! Usage:
 //!   cargo xtask build [all|server|cli|router|mac|android|harmony] [--release|--debug]
 //!   cargo xtask package server [--platform linux/amd64] [--engine auto|podman|docker|none]
+//!   cargo xtask package koolshare                 # 路由器软件中心离线插件（双架构）
 //!   cargo xtask verify server
 //!   cargo xtask deploy server --host root@HOST
 //!   cargo xtask speedtest --uri <phantom://...>
@@ -47,9 +48,10 @@ enum Commands {
         #[arg(long)]
         features: Vec<String>,
     },
-    /// Build a deployable server bundle (pinned container build by default).
+    /// Build a deployable bundle: server (pinned container build) or koolshare
+    /// (router software-centre offline plugin, dual-arch)
     Package {
-        /// Target(s): server (alias: server-amd64)
+        /// Target(s): server (alias: server-amd64), koolshare
         target: Vec<String>,
         /// Target platform: linux/amd64 or linux/arm64
         #[arg(long, default_value = "linux/amd64")]
@@ -725,6 +727,52 @@ fn build_router_armv7(release: bool) -> Result<()> {
     Ok(())
 }
 
+/// Package the koolshare software-centre plugin (RT-AX86U Pro and friends).
+///
+/// Both architectures are built and shipped together: hnd/axhnd firmware
+/// mixes aarch64 kernels with 32-bit userspace, so `install.sh` picks the
+/// binary with `uname -m` at install time.
+fn package_koolshare(release: bool) -> Result<PathBuf> {
+    if !release {
+        bail!("the koolshare plugin must be packaged with --release");
+    }
+    if !router_target_installed() {
+        bail!(
+            "koolshare package prerequisite missing:\n  - rustup target add {}",
+            ROUTER_TARGET
+        );
+    }
+    if !rustup_target_installed(ROUTER_ARMV7_TARGET) {
+        bail!(
+            "koolshare package prerequisite missing:\n  - rustup target add {}",
+            ROUTER_ARMV7_TARGET
+        );
+    }
+
+    let root = project_root();
+    build_router(true)?;
+    build_router_armv7(true)?;
+
+    let profile = "release";
+    let aarch64 = root
+        .join("target")
+        .join(ROUTER_TARGET)
+        .join(profile)
+        .join("phantom");
+    let armv7 = root
+        .join("target")
+        .join(ROUTER_ARMV7_TARGET)
+        .join(profile)
+        .join("phantom");
+    for bin in [&aarch64, &armv7] {
+        if !bin.exists() {
+            bail!("router binary not found: {}", bin.display());
+        }
+    }
+
+    pack::assemble_koolshare_bundle(&root, &aarch64, &armv7)
+}
+
 fn build_mac(release: bool) -> Result<()> {
     let root = project_root();
     let script = root.join("scripts/build-mac.sh");
@@ -1143,6 +1191,22 @@ fn main() -> Result<()> {
             no_verify,
             runtime_image,
         } => {
+            // `package koolshare` 走自己的流水线（双架构 + 离线包组装），
+            // 与 server 的容器打包路径无关，所以先分流。
+            if target.iter().any(|t| t == "koolshare") {
+                let tarball = package_koolshare(true)?;
+                println!();
+                println!("Packaged: {}", tarball.display());
+                println!(
+                    "Next:     软件中心 → 离线安装；或 scp 到路由器 /tmp 后 \
+                     /bin/sh /tmp/phantom/install.sh"
+                );
+                println!(
+                    "注意:     华硕固件上 /usr/sbin/sh 是 memaccess（不是 shell），\
+                     命令必须用绝对路径 /bin/sh"
+                );
+                return Ok(());
+            }
             let _ = target;
             let spec = pack::resolve_platform(&platform)?;
             let tarball = build_bundle(&spec, &engine, no_container, no_verify, runtime_image)?;

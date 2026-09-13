@@ -56,8 +56,10 @@ start() {
     [ -c /dev/net/tun ] || { echo "phantom: /dev/net/tun unavailable" >&2; exit 1; }
 
     echo "phantom: starting ($(date))" >>"$LOGFILE"
+    # NO_COLOR=1 去掉 tracing 的 ANSI 转义：日志要落盘并被 grep/tail 阅读，
+    # 颜色序列会污染输出；RUST_LOG 由 phantom-cli 的 init_tracing 读取。
     # shellcheck disable=SC2046
-    RUST_LOG="$RUST_LOG" "$BIN" $(build_args) >>"$LOGFILE" 2>&1 &
+    NO_COLOR=1 RUST_LOG="$RUST_LOG" "$BIN" $(build_args) >>"$LOGFILE" 2>&1 &
     echo $! >"$PIDFILE"
 
     # Give the Hello verification a moment so a bad URI fails visibly here

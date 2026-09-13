@@ -1,0 +1,52 @@
+#!/bin/sh
+# iptables mock：冒烟测试用。
+#
+#   iptables -S <chain>            → 打印 `-A <chain> <spec>`
+#   iptables -t nat -S <chain>     → 同上（nat 表）
+#   iptables [-t nat] -I <chain> <spec...>
+#   iptables [-t nat] -D <chain> <spec...>
+#       -D 必须「删到返回 0 / 删不到返回 1」：cleanup_rules 用
+#       `while iptables -D ...; do :; done`，删不到时若不返回非零会死循环。
+#
+# 状态文件：$MOCK_IPTABLES_FILE（默认 /tmp/mock-iptables.txt），
+# 每行 `<table>-<chain> <spec...>`。
+F="${MOCK_IPTABLES_FILE:-/tmp/mock-iptables.txt}"
+[ -f "$F" ] || : >"$F"
+
+TABLE="filter"
+if [ "$1" = "-t" ]; then
+    TABLE="$2"
+    shift 2
+fi
+
+OP="$1"
+CHAIN="$2"
+shift 2
+SPEC="$*"
+KEY="${TABLE}-${CHAIN}"
+
+case "$OP" in
+    -S|--list)
+        if [ -n "$CHAIN" ]; then
+            while IFS= read -r line; do
+                case "$line" in
+                    "$KEY "*) echo "-A ${CHAIN} ${line#$KEY }" ;;
+                esac
+            done <"$F"
+        else
+            while IFS= read -r line; do
+                rest="${line#*-}"
+                echo "-A ${rest}"
+            done <"$F"
+        fi
+        ;;
+    -I|--insert)
+        echo "$KEY $SPEC" >>"$F"
+        ;;
+    -D|--delete)
+        [ -n "$SPEC" ] || exit 1
+        grep -q -- "^$KEY $SPEC\$" "$F" 2>/dev/null || exit 1
+        grep -v -- "^$KEY $SPEC\$" "$F" >"$F.tmp" 2>/dev/null && mv "$F.tmp" "$F"
+        ;;
+esac
+exit 0

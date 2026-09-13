@@ -1,0 +1,22 @@
+#!/bin/sh
+# phantom mock：冒烟测试用的假二进制
+#   --version        打印版本
+#   client ...       打印收到的参数后常驻（模拟隧道进程）
+case "$1" in
+    --version)
+        echo "phantom 0.1.0 (mock)"
+        ;;
+    client)
+        echo "mock phantom client args: $*"
+        echo "PHANTOM_PROXY_DOMAINS=${PHANTOM_PROXY_DOMAINS:-unset}"
+        echo "RUST_LOG=${RUST_LOG:-unset}"
+        echo "NO_COLOR=${NO_COLOR:-unset}"
+        while :; do
+            sleep 5
+        done
+        ;;
+    *)
+        echo "mock phantom: $*"
+        ;;
+esac
+exit 0
