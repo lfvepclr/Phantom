@@ -6,43 +6,69 @@ import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.viewModels
 import androidx.compose.foundation.background
 import androidx.compose.foundation.isSystemInDarkTheme
-import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontFamily
-import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.dp
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowCompat
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.repeatOnLifecycle
+import kotlinx.coroutines.awaitCancellation
+import co.phantom.android.ui.DashboardActions
+import co.phantom.android.ui.DashboardScreen
+import co.phantom.android.ui.InfoSheet
+import co.phantom.android.ui.LocalPhantomColors
+import co.phantom.android.ui.LogFullScreen
+import co.phantom.android.ui.PhantomColors
+import co.phantom.android.ui.PhantomTheme
+import co.phantom.android.ui.QrShareDialog
+import co.phantom.android.ui.ScanScreen
+import co.phantom.android.ui.ServerScreen
+import co.phantom.android.ui.SettingsSheet
+import co.phantom.android.ui.copyToClipboard
+import co.phantom.android.ui.phantomColorsFor
+import co.phantom.android.ui.shareFile
+import java.io.File
 
+/**
+ * The app's only activity: it hosts the four screens (dashboard, scanner,
+ * server, full-screen log) and owns the two platform permissions.
+ *
+ * Screens are a plain state machine rather than a navigation library — there
+ * are four of them, none nested, and no deep links to restore. Adding a
+ * navigation dependency for that would be more moving parts than the problem
+ * has, and this keeps the back button behaviour obvious.
+ */
 class MainActivity : ComponentActivity() {
 
     private val viewModel: PhantomTunnelViewModel by viewModels()
-
-    private var pendingStart: Pair<String, String>? = null
 
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult()
     ) { result ->
         if (result.resultCode == RESULT_OK) {
-            pendingStart?.let { (uri, mode) ->
-                viewModel.start(uri, mode)
-            }
+            viewModel.start()
+        } else {
+            // Dismissing the consent dialog is not an error to be shouted
+            // about; it just means no tunnel was started.
+            viewModel.consentDenied()
         }
-        pendingStart = null
     }
 
     private val notificationPermissionLauncher = registerForActivityResult(
@@ -53,242 +79,182 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            when (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)) {
-                PackageManager.PERMISSION_GRANTED -> {}
-                else -> notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) !=
+                PackageManager.PERMISSION_GRANTED
+            ) {
+                notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
             }
         }
 
         setContent {
-            val darkTheme = isSystemInDarkTheme()
-            MaterialTheme(
-                colorScheme = if (darkTheme) darkColorScheme() else lightColorScheme()
-            ) {
+            // Lifecycle-aware: the collection stops below STARTED, so a
+            // backgrounded dashboard is not even subscribed, let alone polling.
+            val state by viewModel.state.collectAsStateWithLifecycle()
+            val systemDark = isSystemInDarkTheme()
+            // The status/navigation bars belong to the window, not to Compose,
+            // so they are painted from the same three-way decision the theme
+            // makes — otherwise a dark app keeps a light system bar. Keyed, so
+            // the four window writes happen when the decision changes rather
+            // than on every recomposition.
+            LaunchedEffect(state.themeMode, systemDark) {
+                applySystemBarAppearance(phantomColorsFor(state.themeMode, systemDark))
+            }
+
+            // Logs are the only state the service does not publish: draining
+            // the core's ring buffer is pointless while nothing can show it, so
+            // the pump runs strictly between STARTED and STOPPED.
+            val lifecycleOwner = LocalLifecycleOwner.current
+            LaunchedEffect(lifecycleOwner) {
+                lifecycleOwner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                    viewModel.startLogPump()
+                    try {
+                        awaitCancellation()
+                    } finally {
+                        viewModel.stopLogPump()
+                    }
+                }
+            }
+
+            PhantomTheme(mode = state.themeMode) {
                 PhantomApp(
+                    state = state,
                     viewModel = viewModel,
-                    onStartVpn = { uri, mode ->
+                    onRequestStart = {
+                        // prepare() returns an intent only when consent is still
+                        // needed; otherwise the system already trusts us.
                         val intent = VpnService.prepare(this@MainActivity)
                         if (intent != null) {
-                            pendingStart = uri to mode
                             vpnPermissionLauncher.launch(intent)
                         } else {
-                            viewModel.start(uri, mode)
+                            viewModel.start()
                         }
-                    }
+                    },
                 )
             }
         }
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
+private enum class Screen { DASHBOARD, SCAN, SERVER, FULL_LOG }
+
 @Composable
-fun PhantomApp(
+private fun PhantomApp(
+    state: PhantomUiState,
     viewModel: PhantomTunnelViewModel,
-    onStartVpn: (String, String) -> Unit
+    onRequestStart: () -> Unit,
 ) {
-    val state by viewModel.state.collectAsStateWithLifecycle()
-    val statusText by viewModel.statusText.collectAsStateWithLifecycle()
-    val logs by viewModel.logs.collectAsStateWithLifecycle()
-    val isRunning by viewModel.isRunning.collectAsStateWithLifecycle()
+    var screen by remember { mutableStateOf(Screen.DASHBOARD) }
+    var showInfo by remember { mutableStateOf(false) }
+    var showSettings by remember { mutableStateOf(false) }
+    var showQr by remember { mutableStateOf(false) }
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val colors = LocalPhantomColors.current
 
-    var serverURI by remember { mutableStateOf("") }
-    var proxyMode by remember { mutableStateOf("smart") }
+    BackHandler(enabled = screen != Screen.DASHBOARD) {
+        screen = Screen.DASHBOARD
+    }
 
-    Scaffold(
-        topBar = {
-            TopAppBar(
-                title = {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Box(
-                            modifier = Modifier
-                                .size(28.dp)
-                                .clip(RoundedCornerShape(6.dp))
-                                .background(MaterialTheme.colorScheme.primary),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text(
-                                text = "P",
-                                color = MaterialTheme.colorScheme.onPrimary,
-                                style = MaterialTheme.typography.titleMedium
-                            )
-                        }
-                        Spacer(modifier = Modifier.width(10.dp))
-                        Text("Phantom")
-                    }
-                }
-            )
-        }
-    ) { padding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-                .padding(horizontal = 20.dp, vertical = 16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            StatusPill(state = state)
-
-            Spacer(modifier = Modifier.height(20.dp))
-
-            OutlinedTextField(
-                value = serverURI,
-                onValueChange = { if (!isRunning) serverURI = it },
-                label = { Text("Server URI") },
-                placeholder = { Text("phantom://key@host:port") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth(),
-                enabled = !isRunning
+    Box(modifier = Modifier.fillMaxSize().background(colors.canvas)) {
+        when (screen) {
+            Screen.DASHBOARD -> DashboardScreen(
+                state = state,
+                actions = DashboardActions(
+                    onToggle = {
+                        if (state.isRunning || state.busy) viewModel.stop() else onRequestStart()
+                    },
+                    onModeChange = viewModel::setMode,
+                    onUriChange = viewModel::onUriChanged,
+                    onAdoptUri = viewModel::adoptUri,
+                    onRemoveHistory = viewModel::removeHistory,
+                    onOpenInfo = { showInfo = true },
+                    onOpenSettings = { showSettings = true },
+                    onOpenServer = { screen = Screen.SERVER },
+                    onOpenScan = { screen = Screen.SCAN },
+                    onOpenFullLog = { screen = Screen.FULL_LOG },
+                    onTogglePause = { viewModel.setLogPaused(!state.logPaused) },
+                    onToggleDirectLogs = viewModel::setShowDirectLogs,
+                    onClearLogs = viewModel::clearLogs,
+                ),
             )
 
-            Spacer(modifier = Modifier.height(16.dp))
-
-            Text(
-                text = "Mode",
-                style = MaterialTheme.typography.labelLarge,
-                modifier = Modifier.fillMaxWidth()
-            )
-            Spacer(modifier = Modifier.height(6.dp))
-            SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-                listOf("proxy" to "Global", "smart" to "Auto", "direct" to "Direct").forEachIndexed { index, (value, label) ->
-                    SegmentedButton(
-                        selected = proxyMode == value,
-                        onClick = { if (!isRunning) proxyMode = value },
-                        shape = SegmentedButtonDefaults.itemShape(index = index, count = 3),
-                        enabled = !isRunning
-                    ) {
-                        Text(label)
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(20.dp))
-
-            Text(
-                text = statusText,
-                style = MaterialTheme.typography.bodyLarge,
-                fontFamily = FontFamily.Monospace,
-                color = when (state) {
-                    TunnelState.Error -> MaterialTheme.colorScheme.error
-                    TunnelState.Connected -> MaterialTheme.colorScheme.primary
-                    else -> LocalContentColor.current
-                }
-            )
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            Button(
-                onClick = {
-                    if (isRunning) {
-                        viewModel.stop()
-                    } else if (serverURI.isNotBlank()) {
-                        onStartVpn(serverURI, proxyMode)
-                    }
+            Screen.SCAN -> ScanScreen(
+                onClose = { screen = Screen.DASHBOARD },
+                onScanned = { uri ->
+                    viewModel.adoptUri(uri)
+                    // Importing a link is not the same as trusting it: the user
+                    // still presses start.
+                    screen = Screen.DASHBOARD
                 },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(50.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (isRunning) MaterialTheme.colorScheme.error
-                    else MaterialTheme.colorScheme.primary
-                )
-            ) {
-                Text(
-                    text = if (isRunning) "Stop Tunnel" else "Start Tunnel",
-                    style = MaterialTheme.typography.titleMedium
-                )
-            }
-
-            Spacer(modifier = Modifier.height(20.dp))
-
-            Text(
-                text = "Connection Logs",
-                style = MaterialTheme.typography.labelLarge,
-                modifier = Modifier.fillMaxWidth()
             )
-            Spacer(modifier = Modifier.height(6.dp))
-            LogView(
-                logs = logs,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .weight(1f)
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(MaterialTheme.colorScheme.surfaceVariant)
-                    .padding(12.dp)
+
+            Screen.SERVER -> ServerScreen(onBack = { screen = Screen.DASHBOARD })
+
+            Screen.FULL_LOG -> LogFullScreen(
+                lines = state.logLines,
+                paused = state.logPaused,
+                showDirect = state.showDirectLogs,
+                onTogglePause = { viewModel.setLogPaused(!state.logPaused) },
+                onToggleDirect = viewModel::setShowDirectLogs,
+                onClear = viewModel::clearLogs,
+                onClose = { screen = Screen.DASHBOARD },
             )
         }
+    }
+
+    if (showInfo) {
+        InfoSheet(
+            state = state,
+            onDismiss = { showInfo = false },
+            onMeasureLatency = viewModel::measureLatency,
+            onMeasureSpeed = viewModel::measureSpeed,
+            onCopyUri = { copyToClipboard(context, state.serverUri) },
+            onShareQr = {
+                showInfo = false
+                showQr = true
+            },
+        )
+    }
+
+    if (showSettings) {
+        SettingsSheet(
+            state = state,
+            onDismiss = { showSettings = false },
+            onThemeChange = viewModel::setThemeMode,
+            onTunTraceChange = viewModel::setTunTrace,
+            onExportLogs = {
+                // Prefer the session log; the TUN trace only exists when the
+                // user opted in, and it is far larger.
+                val session = File(context.filesDir, LOG_FILE)
+                val trace = File(context.filesDir, TRACE_FILE)
+                when {
+                    session.exists() -> shareFile(context, session, "text/plain", "Phantom 日志")
+                    trace.exists() -> shareFile(context, trace, "text/plain", "Phantom TUN 追踪")
+                }
+            },
+            onClearHistory = viewModel::clearHistory,
+            onUserRulesChange = viewModel::setUserRules,
+        )
+    }
+
+    if (showQr) {
+        QrShareDialog(uri = state.serverUri, onDismiss = { showQr = false })
     }
 }
 
-@Composable
-private fun StatusPill(state: TunnelState) {
-    val (bg, textColor, label) = when (state) {
-        TunnelState.Idle -> Triple(
-            MaterialTheme.colorScheme.surfaceVariant,
-            LocalContentColor.current.copy(alpha = 0.7f),
-            "Idle"
-        )
-        TunnelState.Connecting -> Triple(
-            MaterialTheme.colorScheme.secondaryContainer,
-            MaterialTheme.colorScheme.onSecondaryContainer,
-            "Connecting"
-        )
-        TunnelState.Connected -> Triple(
-            Color(0xFFD1FADF),
-            Color(0xFF0F5132),
-            "Connected"
-        )
-        TunnelState.Error -> Triple(
-            MaterialTheme.colorScheme.errorContainer,
-            MaterialTheme.colorScheme.onErrorContainer,
-            "Error"
-        )
-    }
-
-    Box(
-        modifier = Modifier
-            .clip(RoundedCornerShape(50))
-            .background(bg)
-            .padding(horizontal = 16.dp, vertical = 6.dp)
-    ) {
-        Text(
-            text = label,
-            color = textColor,
-            style = MaterialTheme.typography.labelLarge
-        )
-    }
-}
-
-@Composable
-private fun LogView(logs: List<String>, modifier: Modifier = Modifier) {
-    val listState = rememberLazyListState()
-
-    LaunchedEffect(logs.size) {
-        if (logs.isNotEmpty()) {
-            listState.animateScrollToItem(logs.lastIndex)
-        }
-    }
-
-    LazyColumn(
-        state = listState,
-        modifier = modifier,
-        verticalArrangement = Arrangement.spacedBy(2.dp)
-    ) {
-        items(logs) { line ->
-            val color = when {
-                line.contains("ERROR", ignoreCase = true) -> MaterialTheme.colorScheme.error
-                line.contains("WARN", ignoreCase = true) -> Color(0xFFEA9A3E)
-                else -> LocalContentColor.current
-            }
-            Text(
-                text = line,
-                style = MaterialTheme.typography.bodySmall,
-                fontFamily = FontFamily.Monospace,
-                color = color,
-                maxLines = 2,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.fillMaxWidth()
-            )
-        }
+/**
+ * Paint the two system bars from the app palette.
+ *
+ * Compose only owns the content area; without this the bars follow the
+ * platform theme and a dark app ends up framed by a light status bar.
+ */
+private fun ComponentActivity.applySystemBarAppearance(colors: PhantomColors) {
+    val canvas = colors.canvas.toArgb()
+    window.statusBarColor = canvas
+    window.navigationBarColor = canvas
+    val dark = colors.canvas.luminance() < 0.5f
+    val insets = WindowCompat.getInsetsController(window, window.decorView)
+    insets.isAppearanceLightStatusBars = !dark
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+        insets.isAppearanceLightNavigationBars = !dark
     }
 }

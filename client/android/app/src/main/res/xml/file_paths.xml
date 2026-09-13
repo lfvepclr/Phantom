@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Exportable files: the session log and the opt-in TUN trace, both written
+     by the tunnel into the app's private files directory. -->
+<paths>
+    <files-path
+        name="phantom_logs"
+        path="." />
+</paths>

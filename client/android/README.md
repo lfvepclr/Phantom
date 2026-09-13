@@ -4,6 +4,23 @@ Native Android VPN 客户端。隧道引擎全部运行在 Rust cdylib 中，Kot
 
 ## PRD 功能 → 技术架构映射
 
+### 客户端功能（与鸿蒙端对齐）
+
+| 功能 | 说明 |
+|------|------|
+| 服务器卡片 | 地址、状态徽标、实时速率、隧道/直连条数；整卡点开连接详情 |
+| 连接详情 | 协议、加密套件、两端密钥短指纹、连接时长、本次流量、测延迟、测速 |
+| 连接串管理 | 粘贴 / **应用内扫码**（CameraX + ML Kit）/ 历史下拉（✓ 表示本机连接成功过） |
+| 扫码兜底 | 相机权限被拒或无法对焦时，仍可「从相册选择」二维码图片或「手动输入」连接串 |
+| 分享 | 二维码（ZXing 生成）、复制、系统分享 |
+| 日志 | 界面 200 行 + 重复行折叠 + 仅隧道/全部过滤 + 暂停/清空/全屏；同时镜像到 `filesDir/phantom_vpn.log`，可导出 |
+| 分流 | 内置被墙域名白名单（FST），智能模式仅白名单走服务器，其余直连并用本地 DNS |
+| 网络自愈 | Wi-Fi ⇄ 移动数据切换时重建隧道（3s/10s/30s 退避，用尽后提示手动重连） |
+| 夜间模式 | 跟随系统 / 浅色 / 深色，写入 `themeMode`；状态栏与导航栏一并跟随 |
+| 内嵌服务器 | 在本机跑 Phantom 服务器，把 URI + 二维码分享给局域网设备；加密套件与协议是预设选项（与鸿蒙一致），运行中隐藏。**默认端口 8443 而非 443**：Android 应用没有 `CAP_NET_BIND_SERVICE`，绑定 <1024 的端口会 `EACCES`，界面对此有前置校验 |
+
+设置入口是首页右上角齿轮（主题、TUN 追踪、导出日志、白名单说明、关于）。
+
 | PRD 功能 | 技术模块 | 实现位置 | 关键技术点 |
 |----------|----------|----------|------------|
 | VPN 隧道 | `platform/android.rs` | `client/src/platform/android.rs` | VpnService TUN fd 一次传递，零 per-packet JNI |
@@ -157,9 +174,19 @@ graph LR
 | 规则 | 说明 |
 |------|------|
 | Kotlin 只调 `RustBridge` | `external fun` JNI 声明，不直接读写 Rust 内存 |
+| **`external fun` 必须带 `@JvmStatic`** | `RustBridge` 是 Kotlin `object`；不加 `@JvmStatic` 时生成的是**实例** native 方法，JVM 会把 `INSTANCE` 当第二个参数传给 Rust，而 Rust 按 `Java_..._RustBridge_*` 约定用 `GetStaticMethodID` 取方法 → CheckJNI 直接 `SIGABRT`（`jclass has wrong type`）。加与不加只差一个注解，崩与不崩就靠它 |
+| **服务器地址必须 `excludeRoute`** | `addRoute("0.0.0.0", 0)` 对 `Uids {0-99999}` 生效，**包含本进程**。不把服务器 IP 从 TUN 路由里剔掉，隧道自己的握手包会被自己的 TUN 吞掉，表现为 `Hello verification error: Connection timeout` 无限重连。鸿蒙侧用 `protectProcessNet` 解决同一问题 |
 | TUN fd 一次传递 | `PhantomVpnService.detachFd()` → Rust `from_fd(fd)` → 之后零 JNI |
 | safe wrapper 隔离 unsafe | JNI 调 `android_start_with_uri()` 等 safe 函数，C-ABI 委托给 safe wrapper |
 | 状态查询无分配 | `getStatus()` 返回 `jint`，`getLastError()` 返回 `JString`，无手动 CString 释放 |
+
+### 排障：连上了但打不开网页
+
+按顺序看三件事：
+
+1. **`files/phantom_vpn.log` 里有没有 `Hello verification error: Connection timeout`**：有 → 服务器地址没被排除出 TUN 路由（见上表），检查 `PhantomVpnService.resolveServerExclusions()`。
+2. **有没有 `Could not make wake event fd: Too many open files`**：fd 被耗尽，进程会 `SIGABRT`。高流量下 flow socket 会瞬时堆到数千，可以先 `adb shell run-as co.phantom.android ls /proc/$(pidof co.phantom.android)/fd | wc -l` 观察峰值。
+3. **从设备实测一次**：`adb shell 'printf "GET / HTTP/1.0\r\nHost: www.google.com\r\n\r\n" | nc -w 10 www.google.com 80'` 应返回 `200 OK` / `Server: gws`；同时日志里应有 `route www.google.com:53 -> Proxy (dns tunnel)`。
 
 ## 技术模块与实现位置
 
@@ -205,19 +232,37 @@ cargo xtask build android --debug  # debug 构建
 ```bash
 scripts/build-android.sh              # 默认 release
 scripts/build-android.sh --debug      # debug 构建
-ALL_TARGETS=1 scripts/build-android.sh  # 全 ABI
 ```
 
+> 目前只构建 `arm64-v8a` 一个 ABI。多 ABI（`arm64-v8a` + `armeabi-v7a` + `x86_64`）尚未支持，
+> 见文末 TODO；脚本里没有 `ALL_TARGETS` 开关。
+
 前置条件：
-- Rust toolchain + Android targets：`rustup target add aarch64-linux-android`
-- [`cargo-ndk`](https://github.com/bbqsrc/cargo-ndk)：`cargo install cargo-ndk`
-- Android NDK：设置 `ANDROID_NDK_HOME`
+- Rust toolchain + Android target：`rustup target add aarch64-linux-android`
+- Android NDK **r26 及以上**（脚本会校验大版本，过低直接报错）：设置 `ANDROID_NDK_HOME`，
+  或让它自动探测 `$HOME/Library/Android/sdk/ndk` 下已装的最新版本
+- JDK 17+：脚本按 `JAVA_HOME` → `/usr/libexec/java_home -v 17` → 系统当前 JDK →
+  Android Studio 自带 JBR → `/usr/lib/jvm/java-17-openjdk-amd64` 顺序探测
 
 脚本会：
 1. `rustup target add aarch64-linux-android` — 安装 Android Rust target
-2. `cargo build -p phantom-client --lib --target aarch64-linux-android` — 编译 Rust cdylib
-3. 复制 `libphantom_client.so` → `jniLibs/arm64-v8a/`
-4. 可选 Gradle APK 构建
+2. `cargo build -p phantom-android --lib --target aarch64-linux-android` — 编译 Rust cdylib
+3. 用 NDK 的 `llvm-strip` 裁剪后复制 `libphantom_android.so` → `jniLibs/arm64-v8a/`
+4. Gradle `assembleDebug`（自动推导 `JAVA_HOME` 与 `local.properties`）
+
+> **cdylib 是 `phantom-android`，不是 `phantom-client`。**
+> JNI 符号与内嵌服务器桥都在 `client/android/rust`（结构对齐 `client/harmony/rust`），
+> 这样 `phantom-client` 不必依赖 `phantom-server`。Kotlin 侧对应
+> `System.loadLibrary("phantom_android")`。
+>
+> 内嵌服务器的 URI 由 `serverStart()` 返回**一次**，页面被弹出后即随之消失；
+> `serversUri()` 是幂等 getter，供服务器页重新进入时取回当前正在服务的 URI。
+
+```bash
+# 前置：NDK 与 Rust target（各一次）
+~/Library/Android/sdk/cmdline-tools/latest/bin/sdkmanager "ndk;26.1.10909125"
+rustup target add aarch64-linux-android
+```
 
 ### 构建产物
 
@@ -225,7 +270,7 @@ ALL_TARGETS=1 scripts/build-android.sh  # 全 ABI
 client/android/app/src/main/
 ├── jniLibs/                        # Rust cdylib（gitignore）
 │   └── arm64-v8a/
-│       └── libphantom_client.so
+│       └── libphantom_android.so
 └── res/
     ├── drawable/                   # 自适应图标前景/背景
     │   ├── ic_launcher_foreground.png
@@ -245,8 +290,8 @@ cd ../../
 rustup target add aarch64-linux-android
 export ANDROID_NDK_HOME=$HOME/Library/Android/sdk/ndk/26.1.10909125
 CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android34-clang \
-  cargo build --release -p phantom-client --lib --target aarch64-linux-android
-cp target/aarch64-linux-android/release/libphantom_client.so \
+  cargo build --release -p phantom-android --lib --target aarch64-linux-android
+cp target/aarch64-linux-android/release/libphantom_android.so \
    client/android/app/src/main/jniLibs/arm64-v8a/
 ```
 
@@ -276,7 +321,7 @@ cargo xtask icons              # 生成所有平台图标（含 Android 5 密度
 
 - **APK 打包**：Gradle `assembleRelease` / `assembleDebug`
 - **签名**：Android Studio 自动 debug 签名；release 需配置 `signingConfigs`
-- **Rust cdylib 打包**：`libphantom_client.so` 放入 `jniLibs/<abi>/`，Gradle 自动打包进 APK
+- **Rust cdylib 打包**：`libphantom_android.so` 放入 `jniLibs/arm64-v8a/`，Gradle 自动打包进 APK
 
 ## 测试
 
@@ -301,6 +346,10 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 # Run on device → 自动安装
 ```
 
+> **小米 / 红米（HyperOS）**：`adb install` 报 `INSTALL_FAILED_USER_RESTRICTED` 时，需要在手机上
+> 「设置 → 更多设置 → 开发者选项 → **USB 安装**」打开开关（部分机型还要求登录小米账号并插入 SIM 卡）。
+> 这是系统侧的安装闸门，`adb` 无权绕过；`settings put` 也会因缺少 `WRITE_SECURE_SETTINGS` 被拒绝。
+
 ## 部署
 
 1. 构建 APK → 分发（应用商店 / 侧载）
@@ -309,8 +358,10 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 
 ## TODO
 
-- [ ] 真机/模拟器验证（Pixel / 小米 / 华为 Android 12-14）
-- [ ] Instrumented tests（`RustBridgeInstrumentedTest.kt`）
+- [x] 单元测试：连接串解析、历史编码、日志过滤/折叠、格式化（`app/src/test`）
+- [x] 真机安装验证（`22041216UC` / Android 14，需在手机上打开「USB 安装」）
+- [x] Instrumented tests（`RustBridgeInstrumentedTest.kt`，`am instrument` 直跑可避免 Gradle 跑完卸载应用、清掉用户已导入的连接串）
 - [ ] 多 ABI 构建（arm64-v8a + armeabi-v7a + x86_64）
+- [ ] flow 表上限：高流量下 flow socket 峰值可达约 1.9 万（进程上限 32768），会回落到千级，但曾耗尽一次 fd 导致 `Could not make wake event fd` 崩溃。需要一个显式的 flow/socket 上限 + 更早回收 idle flow
 - [ ] CI 自动化（`mobile.yml`：cargo-ndk + AVD + connectedAndroidTest）
 - [ ] 后台保活 / 锁屏 / 飞行模式切换测试

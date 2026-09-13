@@ -13,6 +13,19 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "0.1.0"
+
+        // `AndroidJUnit4`-annotated tests only run under this runner; the AGP
+        // default (`android.test.InstrumentationTestRunner`) never initialises
+        // androidx.test and the whole suite dies with "Process crashed".
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        ndk {
+            // Only the ABI the build script cross-compiles the Rust cdylib for.
+            // Shipping the others would multiply the APK by every vendor
+            // dependency's native code for architectures nothing here can run
+            // on anyway.
+            abiFilters += "arm64-v8a"
+        }
     }
 
     buildTypes {
@@ -36,6 +49,8 @@ android {
 
     buildFeatures {
         compose = true
+        // The settings sheet shows the version, which comes from BuildConfig.
+        buildConfig = true
     }
 
     composeOptions {
@@ -61,6 +76,17 @@ dependencies {
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
+    // Camera + on-device barcode decoding for the in-app scanner. The bundled
+    // ML Kit model runs without Play Services, which matters on domestic ROMs.
+    val cameraxVersion = "1.3.1"
+    implementation("androidx.camera:camera-core:$cameraxVersion")
+    implementation("androidx.camera:camera-camera2:$cameraxVersion")
+    implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
+    implementation("androidx.camera:camera-view:$cameraxVersion")
+    implementation("com.google.mlkit:barcode-scanning:17.3.0")
+    // QR *generation* for the share sheet (ML Kit only decodes).
+    implementation("com.google.zxing:core:3.5.3")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
     testImplementation("junit:junit:4.13.2")

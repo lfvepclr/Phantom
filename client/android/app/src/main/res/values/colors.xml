@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      The two canvas values from `PhantomColors`, mirrored here because the
+      launch window and the system bars are drawn before Compose exists. Keep
+      them in sync with `ui/PhantomTheme.kt`.
+    -->
+    <color name="phantom_canvas_light">#F4F5F7</color>
+    <color name="phantom_canvas_dark">#101214</color>
+</resources>

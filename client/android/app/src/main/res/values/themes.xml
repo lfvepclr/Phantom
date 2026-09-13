@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+      Window chrome only: the content is painted by Compose, so all this theme
+      has to do is keep the launch window and the system bars from flashing
+      light while the app is dark. `MainActivity.applySystemBarAppearance`
+      then repaints the bars to follow the in-app three-way choice at runtime.
+    -->
+    <style name="Theme.Phantom" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@color/phantom_canvas_light</item>
+        <item name="android:statusBarColor">@color/phantom_canvas_light</item>
+        <item name="android:navigationBarColor">@color/phantom_canvas_light</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+</resources>

@@ -4,5 +4,6 @@
     <string name="vpn_notification_channel_name">Phantom VPN</string>
     <string name="vpn_notification_channel_description">Shows when Phantom VPN is active</string>
     <string name="vpn_notification_title">Phantom VPN</string>
-    <string name="vpn_notification_text">Tunnel is active</string>
+    <!-- %1$s is the server the tunnel is connected to. -->
+    <string name="vpn_notification_text">隧道已连接：%1$s</string>
 </resources>

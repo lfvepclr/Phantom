@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Night variant of `Theme.Phantom`: same name, dark canvas. -->
+    <style name="Theme.Phantom" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/phantom_canvas_dark</item>
+        <item name="android:statusBarColor">@color/phantom_canvas_dark</item>
+        <item name="android:navigationBarColor">@color/phantom_canvas_dark</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+</resources>

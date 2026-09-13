@@ -5,6 +5,7 @@ members = [
     "server",
     "client",
     "client/cli",
+    "client/android/rust",
     "client/harmony",
     "xtask",
     "tests",
