@@ -433,8 +433,16 @@ fn default_max_streams() -> u32 {
     100
 }
 
+/// QUIC keepalive interval, in seconds.
+///
+/// 120 s rather than the 45 s this used to be: every keepalive frame is a radio
+/// wake-up on a phone, and a tunnel left connected but unused would otherwise
+/// wake the radio more than once a minute for nothing. Liveness is not lost —
+/// quinn still notices a dead path through its idle timeout, and a genuine
+/// network change reaches the client through its own callback, which rebuilds
+/// the datapath without waiting for keepalive to say anything.
 fn default_keep_alive() -> u64 {
-    45
+    120
 }
 
 impl Default for QuicConfig {
@@ -498,8 +506,19 @@ impl ServerConfig {
     pub fn load_key_pair(&self) -> Result<([u8; 32], [u8; 32])> {
         let mut file = fs::File::open(&self.private_key)
             .map_err(|e| PhantomError::Config(format!("Failed to open key file: {}", e)))?;
-        file.lock_shared()
-            .map_err(|e| PhantomError::Config(format!("Failed to lock key file: {}", e)))?;
+        // Same best-effort locking as the writer (see `crypto::keys`): a
+        // filesystem that cannot lock — Android app-private storage via FUSE —
+        // must still be able to read the key, otherwise the embedded phone
+        // server can never come up.
+        if let Err(e) = file.lock_shared() {
+            if e.kind() != std::io::ErrorKind::Unsupported {
+                return Err(PhantomError::Config(format!(
+                    "Failed to lock key file: {}",
+                    e
+                )));
+            }
+            tracing::debug!("{}: no file locking here ({e}); reading anyway", self.private_key);
+        }
         let mut content = String::new();
         std::io::Read::read_to_string(&mut file, &mut content)
             .map_err(|e| PhantomError::Config(format!("Failed to read key file: {}", e)))?;

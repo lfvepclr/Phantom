@@ -193,6 +193,12 @@ impl DnsProxy {
         let socket = UdpSocket::bind(bind_addr)
             .await
             .map_err(|e| PhantomError::Io(e))?;
+        // This socket deliberately talks to the *physical* network. On Android
+        // the VPN owns every socket once the TUN is up, so it has to be exempted
+        // here or the direct resolver's queries would be captured by our own
+        // TUN and never answered.
+        #[cfg(unix)]
+        crate::net_tune::protect_socket(std::os::unix::io::AsRawFd::as_raw_fd(&socket));
         tracing::info!(
             "DNS proxy bound to {} (tunnel resolver {}, direct resolver {})",
             socket.local_addr()?,
@@ -414,9 +420,35 @@ impl DnsProxy {
 // DNS Cache: IP -> domain mapping extracted from A-record responses.
 // ---------------------------------------------------------------------------
 
+/// How many IP→domain mappings the reverse-lookup cache may hold.
+///
+/// Every DNS answer the tunnel sees used to add a permanent entry, so a device
+/// that browses for a day accumulated tens of thousands of them. The cap bounds
+/// that; eviction is least-recently-touched.
+const DNS_CACHE_MAX_ENTRIES: usize = 4096;
+
+/// How long a mapping stays usable after it was last touched.
+///
+/// This cache is not a resolver cache — it turns a destination IP back into the
+/// domain the app resolved, which is what the whitelist matches on. Expiring an
+/// entry early would silently change a routing decision (a domain that used to
+/// be tunnelled starts being judged by its bare IP), so the retention floor is
+/// deliberately generous: half an hour, longer than any A-record TTL we are
+/// likely to see.
+const DNS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// One reverse-lookup entry, with the bookkeeping LRU needs.
+#[derive(Debug, Clone)]
+struct DnsCacheEntry {
+    domain: String,
+    /// Last time the entry was written *or* matched. Drives both the TTL and
+    /// the eviction order.
+    touched_at: std::time::Instant,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct DnsCache {
-    inner: Arc<Mutex<HashMap<Ipv4Addr, String>>>,
+    inner: Arc<Mutex<HashMap<Ipv4Addr, DnsCacheEntry>>>,
 }
 
 impl DnsCache {
@@ -425,11 +457,55 @@ impl DnsCache {
     }
 
     pub async fn insert(&self, ip: Ipv4Addr, domain: String) {
-        self.inner.lock().await.insert(ip, domain);
+        let mut map = self.inner.lock().await;
+        if map.len() >= DNS_CACHE_MAX_ENTRIES && !map.contains_key(&ip) {
+            // Evict the least recently touched entry: the one an active route is
+            // least likely to need again.
+            if let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, entry)| entry.touched_at)
+                .map(|(ip, _)| *ip)
+            {
+                map.remove(&oldest);
+            }
+        }
+        map.insert(
+            ip,
+            DnsCacheEntry {
+                domain,
+                touched_at: std::time::Instant::now(),
+            },
+        );
     }
 
+    /// Reverse-lookup an address, renewing its lease on a hit.
+    ///
+    /// A hit means this address is still being routed through its domain, which
+    /// is exactly the entry worth keeping; renewing it also keeps it ahead of
+    /// the eviction order.
     pub async fn lookup(&self, ip: Ipv4Addr) -> Option<String> {
-        self.inner.lock().await.get(&ip).cloned()
+        let mut map = self.inner.lock().await;
+        let expired = match map.get(&ip) {
+            Some(entry) => entry.touched_at.elapsed() > DNS_CACHE_TTL,
+            None => return None,
+        };
+        if expired {
+            map.remove(&ip);
+            return None;
+        }
+        let domain = map.get_mut(&ip)?;
+        domain.touched_at = std::time::Instant::now();
+        Some(domain.domain.clone())
+    }
+
+    /// Number of live entries (tests and metrics).
+    pub async fn len(&self) -> usize {
+        self.inner.lock().await.len()
+    }
+
+    /// True once nothing is cached.
+    pub async fn is_empty(&self) -> bool {
+        self.inner.lock().await.is_empty()
     }
 }
 
@@ -565,6 +641,70 @@ pub fn build_dns_response_packet(payload: &[u8], ctx: &DnsQueryContext) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Reverse-lookup round trip, and the empty result a miss produces.
+    ///
+    /// The miss case is the routing-critical one: an unknown address must come
+    /// back as `None` so `whitelist::decide` falls through to IP-based matching
+    /// instead of guessing a domain.
+    #[tokio::test]
+    async fn lookup_round_trips_and_misses_cleanly() {
+        let cache = DnsCache::new();
+        let ip = Ipv4Addr::new(142, 250, 72, 14);
+        assert_eq!(cache.lookup(ip).await, None, "unknown IP must not guess");
+        cache.insert(ip, "www.google.com".to_string()).await;
+        assert_eq!(cache.lookup(ip).await.as_deref(), Some("www.google.com"));
+    }
+
+    /// The cache must be bounded: a long session fills it, and eviction picks
+    /// the entry that has been idle the longest.
+    #[tokio::test]
+    async fn insert_beyond_capacity_evicts_least_recently_touched() {
+        let cache = DnsCache::new();
+        for i in 0..DNS_CACHE_MAX_ENTRIES as u32 {
+            cache
+                .insert(Ipv4Addr::from(i), format!("host-{i}.example"))
+                .await;
+        }
+        assert_eq!(cache.len().await, DNS_CACHE_MAX_ENTRIES);
+
+        // Touch one entry so it is clearly the most recently used, then force
+        // an eviction and make sure *it* survived rather than the oldest.
+        let touched = Ipv4Addr::from(0);
+        assert_eq!(
+            cache.lookup(touched).await.as_deref(),
+            Some("host-0.example")
+        );
+        cache
+            .insert(
+                Ipv4Addr::from(DNS_CACHE_MAX_ENTRIES as u32),
+                "newest.example".to_string(),
+            )
+            .await;
+        assert_eq!(cache.len().await, DNS_CACHE_MAX_ENTRIES);
+        assert_eq!(
+            cache.lookup(touched).await.as_deref(),
+            Some("host-0.example"),
+            "a just-touched entry must not be the one evicted"
+        );
+    }
+
+    /// A hit renews the lease, so an entry in active use is not pushed out by
+    /// newer — but untouched — ones.
+    #[tokio::test]
+    async fn lookup_renews_the_lease() {
+        let cache = DnsCache::new();
+        let first = Ipv4Addr::new(10, 0, 0, 1);
+        let second = Ipv4Addr::new(10, 0, 0, 2);
+        cache.insert(first, "a.example".to_string()).await;
+        cache.insert(second, "b.example".to_string()).await;
+        // `first` is now older than `second`; touching it must make it survive a
+        // single-entry eviction instead.
+        assert_eq!(cache.lookup(first).await.as_deref(), Some("a.example"));
+        cache.insert(Ipv4Addr::new(10, 0, 0, 3), "c.example".to_string()).await;
+        assert_eq!(cache.len().await, 3, "nothing evicted below the cap");
+        assert_eq!(cache.lookup(second).await.as_deref(), Some("b.example"));
+    }
 
     #[test]
     fn parse_dns_addr_accepts_tls_prefix() {

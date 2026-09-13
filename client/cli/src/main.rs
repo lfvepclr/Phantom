@@ -214,8 +214,17 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Install the global subscriber.
+///
+/// `RUST_LOG` wins when set, otherwise `level` (the hardcoded default) applies.
+/// `with_env_filter("info")` only parses the string it is handed — it never
+/// reads the environment — so without this the documented
+/// `RUST_LOG=debug phantom client …` was silently a no-op (and the router
+/// plugin's "log level" setting would have been dead too).
 fn init_tracing(level: &str) {
-    let _ = tracing_subscriber::fmt().with_env_filter(level).try_init();
+    use tracing_subscriber::EnvFilter;
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
+    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 
 /// Parse `--tun-addr` (`10.7.0.1/24`) into an address plus netmask.

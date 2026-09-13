@@ -208,6 +208,13 @@ fn start_with_config(config: ClientConfig) -> i32 {
         // show up as literal "[2m[32m" garbage. Keep the output plain.
         .with_ansi(false)
         .with_target(false)
+        // The default timer prints a full RFC3339 stamp with microseconds —
+        // ~33 columns that push every route line past the width of the log
+        // pane, so the useful part (target and decision) ends up truncated.
+        // Swift prepends a short local `HH:MM:SS` when it ingests the line,
+        // which is also what makes the repeat-collapsing work: a unique stamp
+        // per line would otherwise make every message look distinct.
+        .without_time()
         .with_writer(LogBufferWriter::new)
         .try_init();
 
@@ -338,6 +345,7 @@ fn start_with_config(config: ClientConfig) -> i32 {
             // Ready-to-use TCP sessions, so a page load does not pay a connect
             // plus a Noise handshake on every new connection.
             let tcp_pool = std::sync::Arc::new(crate::tcp_pool::TcpSessionPool::new());
+            tcp_pool.spawn_sweeper();
             if let Some(server) = config_clone
                 .servers
                 .first()

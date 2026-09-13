@@ -11,7 +11,9 @@
 
 use crate::rules::RuleEngine;
 use ipnet::IpNet;
-use phantom_core::{ClientConfig, PhantomError, ProxyMode, Result, RuleAction, RulesConfig};
+use phantom_core::{
+    ClientConfig, ClientRule, PhantomError, ProxyMode, Result, RuleAction, RulePattern, RulesConfig,
+};
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -179,6 +181,43 @@ impl RouteReason {
     }
 }
 
+/// The token every client pane greps for to hide direct traffic.
+///
+/// Capitalisation is part of the contract: macOS, HarmonyOS and Android all
+/// match this exact string, so it is spelled out here once instead of being
+/// reconstructed (wrongly) in three languages.
+pub const ROUTE_DIRECT_MARKER: &str = "-> Direct (";
+
+/// The one and only shape of a routing breadcrumb.
+///
+/// Every transport — TUN, SOCKS5 CONNECT and the HTTP proxy — writes its
+/// verdict through this function. When they each formatted their own line the
+/// SOCKS5/HTTP paths emitted `-> DIRECT (` while the client panes matched
+/// `-> Direct (`, so "tunnel only" silently showed every direct flow on macOS
+/// (whose system proxy rides the SOCKS5/HTTP path rather than the TUN one).
+pub fn route_log_line(
+    target: impl std::fmt::Display,
+    action: RuleAction,
+    reason: impl std::fmt::Display,
+) -> String {
+    format!("route {} -> {:?} ({})", target, action, reason)
+}
+
+/// The same line for an intercepted DNS query, which carries the resolved
+/// addresses after the verdict.
+pub fn dns_route_log_line(
+    domain: &str,
+    route: impl std::fmt::Display,
+    action: RuleAction,
+    answers: &str,
+) -> String {
+    format!(
+        "{} {}",
+        route_log_line(format_args!("{}:53", domain), action, format_args!("dns {}", route)),
+        answers
+    )
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct RouteDecision {
     pub action: RuleAction,
@@ -291,7 +330,8 @@ pub struct Router {
 
 impl Router {
     pub fn new(cfg: &ClientConfig, extra: &[String]) -> Self {
-        let engine = match RuleEngine::from_config(&cfg.rules) {
+        let rules = with_user_rules(&cfg.rules);
+        let engine = match RuleEngine::from_config(&rules) {
             Ok(e) => Some(e),
             Err(e) => {
                 tracing::warn!("Rule engine init failed ({}); using whitelist only", e);
@@ -301,7 +341,7 @@ impl Router {
         Self {
             mode: cfg.client.mode,
             engine,
-            whitelist: Arc::new(ProxyWhitelist::from_config(&cfg.rules, extra)),
+            whitelist: Arc::new(ProxyWhitelist::from_config(&rules, extra)),
         }
     }
 
@@ -334,6 +374,137 @@ pub fn preset_extra_domains(domains: Vec<String>) {
 
 fn extra_domains() -> Vec<String> {
     EXTRA_DOMAINS.lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// User rule editor (Android / HarmonyOS "分流白名单")
+// ---------------------------------------------------------------------------
+
+/// Wire format accepted by [`set_user_rules`].
+///
+/// One rule per line, `kind:value`, where `kind` is one of:
+///
+/// ```text
+/// domain:www.google.com     exact host
+/// suffix:google.com         google.com and every *.google.com
+/// keyword:youtube           substring match on the host
+/// regex:^.*\.doubleclick\.net$
+/// cidr:91.108.4.0/22        whole network (the UI folds IP ranges into these)
+/// ```
+///
+/// A line with no recognised prefix is taken as a bare domain, and a leading
+/// `*.` promotes it to a suffix — the plain format the desktop editor already
+/// writes, so one string can be pasted between clients.
+///
+/// Every user rule means *proxy*: this editor extends the proxy whitelist, it
+/// does not override it with direct routes.
+pub const USER_RULE_FORMAT_HELP: &str =
+    "domain:/suffix:/keyword:/regex:/cidr: per line, or a bare domain";
+
+/// Parse [`USER_RULE_FORMAT_HELP`]-formatted text, dropping what cannot be used.
+///
+/// Invalid entries are skipped (and logged) rather than failing the whole set:
+/// one mistyped regex must not cost the user every other rule. Regexes are
+/// compiled here for exactly that reason — [`RuleEngine::from_config`] treats a
+/// bad pattern as a configuration error and would abandon *all* rules.
+pub fn parse_user_rules(text: &str) -> Vec<ClientRule> {
+    let mut rules = Vec::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (kind, value) = match line.split_once(':') {
+            Some((head, tail))
+                if ["domain", "suffix", "keyword", "regex", "cidr"].contains(&head.trim()) =>
+            {
+                (head.trim(), tail.trim())
+            }
+            // Bare domain: the desktop editor's format.
+            _ => match line.strip_prefix("*.") {
+                Some(rest) => ("suffix", rest),
+                None => ("domain", line),
+            },
+        };
+        if value.is_empty() {
+            tracing::warn!("Dropping empty user rule: {line}");
+            continue;
+        }
+        let pattern = match kind {
+            "domain" => RulePattern::DomainFull {
+                value: value.to_lowercase(),
+            },
+            "suffix" => RulePattern::DomainSuffix {
+                value: value.to_lowercase(),
+            },
+            "keyword" => RulePattern::DomainKeyword {
+                value: value.to_lowercase(),
+            },
+            "regex" => {
+                if let Err(e) = regex::Regex::new(value) {
+                    tracing::warn!("Dropping invalid user regex {value:?}: {e}");
+                    continue;
+                }
+                RulePattern::DomainRegex {
+                    value: value.to_string(),
+                }
+            }
+            "cidr" => match value.parse::<IpNet>() {
+                Ok(_) => RulePattern::IpCidr {
+                    value: value.to_string(),
+                },
+                Err(e) => {
+                    tracing::warn!("Dropping invalid user CIDR {value:?}: {e}");
+                    continue;
+                }
+            },
+            other => {
+                tracing::warn!("Dropping user rule with unknown kind {other:?}");
+                continue;
+            }
+        };
+        rules.push(ClientRule {
+            pattern,
+            action: RuleAction::Proxy,
+        });
+    }
+    rules
+}
+
+/// User rules injected by an embedding UI, on top of `ClientConfig.rules`.
+///
+/// Rules ride this global rather than the `phantom://` URI on purpose: the URI
+/// is scanned, shared and stored as one opaque string, and a rule list inside it
+/// would leak into QR codes and connection history. It is also what keeps the
+/// desktop editor, Android and HarmonyOS on one wire format.
+static USER_RULES: std::sync::Mutex<Vec<ClientRule>> = std::sync::Mutex::new(Vec::new());
+
+/// Replace the user rules with the ones parsed from `text`.
+pub fn set_user_rules(text: &str) {
+    let rules = parse_user_rules(text);
+    tracing::info!("User rules: {} entr(ies) accepted", rules.len());
+    if let Ok(mut guard) = USER_RULES.lock() {
+        *guard = rules;
+    }
+}
+
+fn user_rules() -> Vec<ClientRule> {
+    USER_RULES.lock().map(|g| g.clone()).unwrap_or_default()
+}
+
+/// `cfg.rules` with the UI's rules appended.
+///
+/// User rules are appended rather than replacing, and [`crate::rules`]' priority
+/// order puts them ahead of `final`, so a user entry wins over the built-in
+/// default without disturbing anything the config itself asked for.
+fn with_user_rules(rules: &RulesConfig) -> RulesConfig {
+    let user = user_rules();
+    if user.is_empty() {
+        return rules.clone();
+    }
+    let mut merged = rules.clone();
+    merged.rules.extend(user);
+    merged
 }
 
 /// Process-wide routing state.
@@ -549,5 +720,32 @@ mod tests {
             443,
         );
         assert!(!whitelisted.allows_tunnel_fallback(ProxyMode::Smart));
+    }
+
+    /// The client panes ("仅隧道" on macOS, `showDirectLogs` on HarmonyOS and
+    /// Android) filter on this exact spelling, so the shared formatter is the
+    /// contract: keep both verdicts — and therefore the marker — pinned.
+    #[test]
+    fn route_log_line_is_the_shape_the_client_panes_match() {
+        let proxied = route_log_line("www.google.com:443", RuleAction::Proxy, "whitelist");
+        assert_eq!(proxied, "route www.google.com:443 -> Proxy (whitelist)");
+
+        let direct = route_log_line("v.youku.com:443", RuleAction::Direct, "final");
+        assert_eq!(direct, "route v.youku.com:443 -> Direct (final)");
+        assert!(direct.contains(ROUTE_DIRECT_MARKER));
+        assert!(!proxied.contains(ROUTE_DIRECT_MARKER));
+
+        // A proxied flow whose *reason* mentions a failed direct attempt must
+        // not be mistaken for direct traffic once it is spelled this way.
+        let retried = route_log_line(
+            "142.250.0.1:443",
+            RuleAction::Proxy,
+            "direct connect timed out; retrying through the tunnel",
+        );
+        assert!(retried.starts_with("route 142.250.0.1:443 -> Proxy ("));
+
+        // Intercepted DNS carries the resolved addresses after the verdict.
+        let dns = dns_route_log_line("www.baidu.com", "local", RuleAction::Direct, "1.2.3.4");
+        assert_eq!(dns, "route www.baidu.com:53 -> Direct (dns local) 1.2.3.4");
     }
 }

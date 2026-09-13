@@ -159,6 +159,11 @@ impl TrafficStats {
     }
 
     /// Render stats in Prometheus exposition format.
+    ///
+    /// The TUN-health counters are included on purpose: "the tunnel is up but
+    /// video stalls" is invisible in the byte counters alone (a wedged flow
+    /// still transfers megabytes — all of them retransmissions), and a router
+    /// has no UI to fall back on.
     pub fn render_prometheus(&self) -> String {
         format!(
             "# HELP phantom_tcp_bytes_up Total TCP bytes sent upstream\n# TYPE phantom_tcp_bytes_up counter\nphantom_tcp_bytes_up {}\n\
@@ -169,7 +174,15 @@ impl TrafficStats {
              # HELP phantom_route_direct_total Connections routed directly (bypassing the tunnel)\n# TYPE phantom_route_direct_total counter\nphantom_route_direct_total {}\n\
              # HELP phantom_route_proxy_total Connections routed through the tunnel\n# TYPE phantom_route_proxy_total counter\nphantom_route_proxy_total {}\n\
              # HELP phantom_udp_datagrams_up Total UDP datagrams sent upstream\n# TYPE phantom_udp_datagrams_up counter\nphantom_udp_datagrams_up {}\n\
-             # HELP phantom_udp_datagrams_down Total UDP datagrams received downstream\n# TYPE phantom_udp_datagrams_down counter\nphantom_udp_datagrams_down {}\n",
+             # HELP phantom_udp_datagrams_down Total UDP datagrams received downstream\n# TYPE phantom_udp_datagrams_down counter\nphantom_udp_datagrams_down {}\n\
+             # HELP phantom_tcp_dup_bytes Retransmitted payload written into the app\n# TYPE phantom_tcp_dup_bytes counter\nphantom_tcp_dup_bytes {}\n\
+             # HELP phantom_dup_acks_total Duplicate ACKs seen from the app\n# TYPE phantom_dup_acks_total counter\nphantom_dup_acks_total {}\n\
+             # HELP phantom_tun_write_wait_ms_total Cumulative wait for TUN writability\n# TYPE phantom_tun_write_wait_ms_total counter\nphantom_tun_write_wait_ms_total {}\n\
+             # HELP phantom_tun_write_wait_max_ms Worst single wait for TUN writability\n# TYPE phantom_tun_write_wait_max_ms gauge\nphantom_tun_write_wait_max_ms {}\n\
+             # HELP phantom_tun_txq_peak_bytes Peak TUN write-queue depth\n# TYPE phantom_tun_txq_peak_bytes gauge\nphantom_tun_txq_peak_bytes {}\n\
+             # HELP phantom_retransmit_suppressed_total Retransmissions suppressed by the budget guard\n# TYPE phantom_retransmit_suppressed_total counter\nphantom_retransmit_suppressed_total {}\n\
+             # HELP phantom_retransmit_budget_rst_total Flows reset for exceeding the duplicate-injection budget\n# TYPE phantom_retransmit_budget_rst_total counter\nphantom_retransmit_budget_rst_total {}\n\
+             # HELP phantom_route_direct_failed_total Direct connects that timed out and fell back to the tunnel\n# TYPE phantom_route_direct_failed_total counter\nphantom_route_direct_failed_total {}\n",
             self.tcp_bytes_up.load(Ordering::Relaxed),
             self.tcp_bytes_down.load(Ordering::Relaxed),
             self.udp_bytes_up.load(Ordering::Relaxed),
@@ -179,6 +192,14 @@ impl TrafficStats {
             self.route_proxy.load(Ordering::Relaxed),
             self.udp_datagrams_up.load(Ordering::Relaxed),
             self.udp_datagrams_down.load(Ordering::Relaxed),
+            self.tcp_dup_bytes.load(Ordering::Relaxed),
+            self.dup_acks.load(Ordering::Relaxed),
+            self.tun_write_wait_ms.load(Ordering::Relaxed),
+            self.tun_write_wait_max_ms.load(Ordering::Relaxed),
+            self.tun_txq_peak.load(Ordering::Relaxed),
+            self.retransmit_suppressed.load(Ordering::Relaxed),
+            self.retransmit_budget_rst.load(Ordering::Relaxed),
+            self.route_direct_failed.load(Ordering::Relaxed),
         )
     }
 }
@@ -230,6 +251,34 @@ mod tests {
         assert!(output.contains("phantom_tcp_bytes_down 200"));
         assert!(output.contains("phantom_udp_bytes_up 50"));
         assert!(output.contains("# TYPE phantom_tcp_bytes_up counter"));
+    }
+
+    /// A wedged flow still moves bytes, so the byte counters alone cannot tell
+    /// "healthy" from "stalled". These are the ones a headless router needs.
+    #[test]
+    fn render_prometheus_exposes_tun_health() {
+        let stats = TrafficStats::new();
+        stats.record_tcp_dup(1400);
+        stats.record_dup_ack();
+        stats.record_tun_write_wait(120);
+        stats.record_tun_queue_depth(65536);
+        stats.record_retransmit_suppressed(3);
+        stats.record_retransmit_budget_rst();
+        stats.record_route_direct_failed();
+
+        let output = stats.render_prometheus();
+        for name in [
+            "phantom_tcp_dup_bytes 1400",
+            "phantom_dup_acks_total 1",
+            "phantom_tun_write_wait_ms_total 120",
+            "phantom_tun_write_wait_max_ms 120",
+            "phantom_tun_txq_peak_bytes 65536",
+            "phantom_retransmit_suppressed_total 3",
+            "phantom_retransmit_budget_rst_total 1",
+            "phantom_route_direct_failed_total 1",
+        ] {
+            assert!(output.contains(name), "missing {name} in:\n{output}");
+        }
     }
 
     #[test]

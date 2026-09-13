@@ -40,6 +40,91 @@ const SEND_HIGH_WATER: usize = 512 * 1024;
 /// How long the retransmission supervisor waits between ticks.
 const RETRANSMIT_TICK: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// Tick used once a flow has nothing in flight.
+///
+/// The supervisor exists to retransmit unacknowledged bytes and to flush a
+/// queued FIN. A fully acknowledged flow has neither, and the 500 ms cadence
+/// then wakes the runtime twice a second, per flow, for nothing. With a few
+/// dozen parked keep-alive connections that is the largest single source of
+/// idle wake-ups in the client, so a quiet flow is checked far less often —
+/// still often enough to notice a FIN or an epoch change promptly.
+const IDLE_TICK: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How long a flow may carry no payload in either direction before it is
+/// reclaimed.
+///
+/// Nothing else ever retires such a flow: the retransmit budget only fires on
+/// flows that have bytes in flight, and the relay task is parked on two
+/// `await`s that `try_join!` will not return from. It stayed forever, holding
+/// an upstream socket, a table entry and its supervisor. Five minutes is past
+/// any HTTP keep-alive or streaming gap; anything genuinely idle is reconnected
+/// by the app the moment it writes again.
+const TCP_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Hard cap on concurrent TCP flows.
+///
+/// Each flow owns an upstream socket and a supervisor task, and the table used
+/// to be unbounded — a burst of background syncs opened tens of thousands of
+/// them before any retired (26k sockets stuck in `FIN_WAIT1` on a real device
+/// took the whole process down). At the cap a new SYN is answered with RST so
+/// the app backs off immediately rather than queueing behind a resource that is
+/// not coming back.
+const MAX_FLOWS: usize = 4096;
+
+/// How long a *direct* UDP mapping may hear nothing back before it is closed.
+///
+/// The mapping exists so replies can find their way back to the app; nothing
+/// keeps it alive once the app stops talking, and each one held a socket plus a
+/// reader task forever — `recv_from` on a bound socket does not fail. A quiet
+/// flow is torn down and the next datagram simply opens a fresh one.
+const UDP_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a *tunnelled* UDP mapping may go unused before it is released.
+///
+/// QUIC and gaming traffic come back in bursts, so this is deliberately the
+/// longer of the two UDP timeouts — but it still has to exist, because the
+/// client-side mapping otherwise only disappears when the server closes the
+/// flow, which it has no reason to do.
+const UDP_PROXY_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How often the tunnelled-UDP reaper checks for idle flows.
+const UDP_REAP_TICK: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Whether a parked TCP flow has been quiet long enough to reclaim.
+///
+/// This *is* the "do not kill a live long connection" contract, so it is a free
+/// function rather than a condition buried in the supervisor loop: a flow is
+/// retired only when nothing is queued, no FIN is still owed to the app, and no
+/// payload has moved in either direction for `TCP_IDLE_TIMEOUT`.
+///
+/// Note the caller derives `idle_for` from `last_activity_at`, which is advanced
+/// by payload only — never by a bare ACK. A peer that keeps acknowledging
+/// nothing therefore cannot keep a dead flow alive.
+fn tcp_idle_reclaimable(
+    idle_for: std::time::Duration,
+    queued_payload: bool,
+    fin_queued: bool,
+) -> bool {
+    !queued_payload && !fin_queued && idle_for >= TCP_IDLE_TIMEOUT
+}
+
+/// Whether a tunnelled UDP mapping has gone unused long enough to release.
+///
+/// Split out for the same reason as [`tcp_idle_reclaimable`]: the timeout is the
+/// only thing keeping an idle QUIC/gaming mapping from living for the session.
+fn udp_proxy_idle_expired(idle_for: std::time::Duration) -> bool {
+    idle_for >= UDP_PROXY_IDLE_TIMEOUT
+}
+
+/// How long the shared DNS-over-tunnel flow may sit without a query.
+///
+/// One flow serves every query the tunnel resolves, so it is worth keeping
+/// while DNS is busy — but it used to stay up for the whole session, holding a
+/// socket pair over a link the phone may have long since switched. The next
+/// query re-establishes it, and that query can ride the flow-establishing SYN,
+/// so the cost of letting it go is one round trip.
+const DNS_TUNNEL_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Consecutive *unproductive* retransmissions tolerated before a flow is
 /// dropped. A retransmission only counts when the app acknowledged nothing
 /// since the previous one, so a long download that keeps making progress is
@@ -597,6 +682,7 @@ fn new_flow_state(
         drain: Arc::new(tokio::sync::Notify::new()),
         dup_acks: 0,
         last_progress_at: std::time::Instant::now(),
+        last_activity_at: std::time::Instant::now(),
         traced_injections: 0,
         bytes_from_app: 0,
         bytes_to_app: 0,
@@ -647,6 +733,12 @@ pub struct TcpFlowState {
     /// Last `snd_una` value that made progress, used by the retransmit
     /// supervisor to distinguish "slow but alive" from "wedged".
     last_progress_at: std::time::Instant,
+    /// Last time payload actually crossed this flow, in either direction.
+    ///
+    /// Deliberately *not* refreshed by bare ACKs: a flow that only ever
+    /// acknowledges is exactly the one worth reclaiming, and counting ACK
+    /// round-trips would keep every parked connection alive forever.
+    last_activity_at: std::time::Instant,
     /// Number of segments injected into the app so far (trace cap).
     traced_injections: u32,
     /// Payload bytes the app sent us / we delivered to the app.
@@ -699,6 +791,11 @@ impl FlowTable {
     pub async fn remove(&self, key: &FlowKey) {
         self.flows.lock().await.remove(key);
     }
+
+    /// Number of live flows, used to bound the table (see [`MAX_FLOWS`]).
+    pub async fn len(&self) -> usize {
+        self.flows.lock().await.len()
+    }
 }
 
 impl Clone for FlowTable {
@@ -721,21 +818,28 @@ impl UdpFlowTable {
         }
     }
 
-    async fn get_or_create(&self, key: &FlowKey) -> Result<Arc<tokio::net::UdpSocket>> {
+    async fn get_or_create(&self, key: &FlowKey) -> Result<(Arc<tokio::net::UdpSocket>, bool)> {
         let mut map = self.flows.lock().await;
         if let Some(sock) = map.get(key) {
-            return Ok(Arc::clone(sock));
+            return Ok((Arc::clone(sock), false));
         }
         let sock = tokio::net::UdpSocket::bind("0.0.0.0:0")
             .await
             .map_err(PhantomError::Io)?;
         let arc = Arc::new(sock);
         map.insert(*key, Arc::clone(&arc));
-        Ok(arc)
+        Ok((arc, true))
     }
 
-    async fn remove(&self, key: &FlowKey) {
-        self.flows.lock().await.remove(key);
+    /// Removes `key`, but only while it still maps to `expected`.
+    ///
+    /// A retiring reader must not evict the socket a concurrent datagram just
+    /// created: the idle timeout and a fresh `send_to` can interleave.
+    async fn remove_if(&self, key: &FlowKey, expected: &Arc<tokio::net::UdpSocket>) {
+        let mut map = self.flows.lock().await;
+        if map.get(key).is_some_and(|current| Arc::ptr_eq(current, expected)) {
+            map.remove(key);
+        }
     }
 }
 
@@ -747,16 +851,43 @@ impl Clone for UdpFlowTable {
     }
 }
 
+/// One tunnelled UDP flow as the client sees it.
+struct UdpProxyFlow {
+    /// Datagrams to deliver to the flow's target (the frame pump's input).
+    outbound: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    /// When the flow was established; `last_send_ms` is measured from here.
+    created: std::time::Instant,
+    /// Milliseconds after `created` of the last datagram we sent. Atomic
+    /// because `handle_udp` touches it on the TUN loop while the reaper reads it.
+    last_send_ms: std::sync::atomic::AtomicU64,
+}
+
+impl UdpProxyFlow {
+    /// Milliseconds this flow has been quiet.
+    fn idle_ms(&self) -> u64 {
+        let since_created = self.created.elapsed().as_millis() as u64;
+        since_created.saturating_sub(self.last_send_ms.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
 /// Tracks active UDP proxy flows (sending UDP through the Phantom tunnel).
 /// Each flow holds a sender channel for injecting datagrams into the relay task.
 struct UdpProxyFlowTable {
-    flows: Arc<Mutex<HashMap<FlowKey, tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>>,
+    flows: Arc<Mutex<HashMap<FlowKey, Arc<UdpProxyFlow>>>>,
 }
 
 impl UdpProxyFlowTable {
     fn new() -> Self {
         Self {
             flows: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Removes `key`, but only while it still maps to `expected`.
+    async fn remove_if(&self, key: &FlowKey, expected: &Arc<UdpProxyFlow>) {
+        let mut map = self.flows.lock().await;
+        if map.get(key).is_some_and(|current| Arc::ptr_eq(current, expected)) {
+            map.remove(key);
         }
     }
 }
@@ -875,15 +1006,13 @@ async fn deliver_dns_response(
             // so the UI's "show direct traffic" switch filters domestic DNS
             // noise with the very same rule, and so a reader can tell at a
             // glance whether a domain was resolved through the tunnel.
+            let action = match route {
+                DnsRoute::Tunnel => RuleAction::Proxy,
+                DnsRoute::Local => RuleAction::Direct,
+            };
             tracing::info!(
-                "route {}:53 -> {} (dns {}) {}",
-                domain,
-                match route {
-                    DnsRoute::Tunnel => "Proxy",
-                    DnsRoute::Local => "Direct",
-                },
-                route.as_str(),
-                joined
+                "{}",
+                crate::whitelist::dns_route_log_line(&domain, route.as_str(), action, &joined)
             );
         }
     }
@@ -1159,10 +1288,22 @@ impl<D: TunIo> TunProxy<D> {
                             deliver_dns_response(payload, ctx, domain, route, cache, device).await
                         }
                     };
-                    while let Some(payload) = inbound.recv().await {
-                        dns_task
-                            .handle_tunnel_response(payload, &mut on_response)
-                            .await;
+                    loop {
+                        // The shared flow is one socket pair serving every
+                        // tunnelled query, so it is worth keeping while DNS is
+                        // busy — but it used to outlive the session. Let a quiet
+                        // stretch close it; the next query re-establishes the
+                        // flow and can ride the flow-establishing SYN, so the
+                        // cost is one round trip.
+                        match tokio::time::timeout(DNS_TUNNEL_IDLE, inbound.recv()).await {
+                            Ok(Some(payload)) => {
+                                dns_task
+                                    .handle_tunnel_response(payload, &mut on_response)
+                                    .await;
+                            }
+                            Ok(None) => break,
+                            Err(_) => break,
+                        }
                     }
                     tracing::info!("DNS tunnel flow closed; the next query re-establishes it");
                     dns_task.set_tunnel_sender(None);
@@ -1414,6 +1555,28 @@ impl<D: TunIo> TunProxy<D> {
         }
 
         if syn && !ack {
+            // Bound the table before spending any work on the new flow: each
+            // entry owns an upstream socket and a supervisor task, and the table
+            // used to grow without limit until the process ran out of
+            // descriptors. Refusing with RST makes the app back off at once.
+            if self.flows.len().await >= MAX_FLOWS {
+                tracing::debug!(
+                    "flow table full ({}); refusing TCP flow to {}:{}",
+                    MAX_FLOWS,
+                    dst_ip,
+                    dst_port
+                );
+                self.send_tcp_rst(
+                    key,
+                    src_ip,
+                    dst_ip,
+                    src_port,
+                    dst_port,
+                    tcp.sequence_number(),
+                )
+                .await?;
+                return Ok(());
+            }
             self.stats.record_tcp_connect();
             crate::tun_trace!(
                 "SYN {}:{} -> {}:{} seq={} win={} opts=[{}]",
@@ -1460,11 +1623,12 @@ impl<D: TunIo> TunProxy<D> {
             // One line per new TCP flow: this is the main breadcrumb for
             // verifying that a domain actually took the tunnel.
             tracing::info!(
-                "route {}:{} -> {:?} ({})",
-                dst_ip,
-                dst_port,
-                action,
-                decision.reason.as_str()
+                "{}",
+                crate::whitelist::route_log_line(
+                    format_args!("{}:{}", dst_ip, dst_port),
+                    action,
+                    decision.reason.as_str()
+                )
             );
 
             match action {
@@ -1600,6 +1764,9 @@ impl<D: TunIo> TunProxy<D> {
                 if !chunk.is_empty() {
                     st.ack = st.ack.wrapping_add(chunk.len() as u32);
                     st.bytes_from_app += chunk.len() as u64;
+                    // Payload from the app counts as activity too: an upload
+                    // that never receives anything back is still in use.
+                    st.last_activity_at = std::time::Instant::now();
                     self.writer.count_up(chunk.len() as u64);
                     let _ = flow.tx_to_relay.send(Bytes::copy_from_slice(chunk));
                 }
@@ -1682,23 +1849,43 @@ impl<D: TunIo> TunProxy<D> {
 
         match action {
             RuleAction::Direct => {
-                let socket = self.udp_flows.get_or_create(&key).await?;
+                let (socket, created) = self.udp_flows.get_or_create(&key).await?;
                 let dst_sa = SocketAddr::new(dst_ip, dst_port);
                 socket
                     .send_to(data, dst_sa)
                     .await
                     .map_err(PhantomError::Io)?;
+                if !created {
+                    // A reader is already parked on this socket; spawning
+                    // another per datagram would leave a growing pile of tasks
+                    // that never return.
+                    return Ok(());
+                }
 
-                // Spawn receiver for this UDP flow if not already running.
+                // Spawn receiver for this UDP flow — exactly once per flow.
                 let device = Arc::clone(&self.writer);
                 let udp_flows = self.udp_flows.clone();
                 tokio::spawn(async move {
                     let mut buf = vec![0u8; 8192];
                     loop {
-                        let n = match socket.recv_from(&mut buf).await {
-                            Ok((n, _peer)) => n,
-                            Err(e) => {
+                        // Bound how long a mapping survives without a reply.
+                        // The socket, its table entry and this task all go with
+                        // it; the next datagram from the app opens a fresh one.
+                        let received =
+                            tokio::time::timeout(UDP_IDLE_TIMEOUT, socket.recv_from(&mut buf)).await;
+                        let n = match received {
+                            Ok(Ok((n, _peer))) => n,
+                            Ok(Err(e)) => {
                                 tracing::debug!("UDP recv error: {}", e);
+                                break;
+                            }
+                            Err(_) => {
+                                crate::tun_trace!(
+                                    "udp flow {}:{} idle; closing",
+                                    dst_ip,
+                                    dst_port
+                                );
+                                tracing::debug!("UDP flow {}:{} idle; reclaiming", dst_ip, dst_port);
                                 break;
                             }
                         };
@@ -1713,7 +1900,7 @@ impl<D: TunIo> TunProxy<D> {
                         device.count_udp_down(n as u64);
                         device.send(pkt).await;
                     }
-                    udp_flows.remove(&key).await;
+                    udp_flows.remove_if(&key, &socket).await;
                 });
             }
             RuleAction::Proxy => {
@@ -1860,8 +2047,11 @@ impl<D: TunIo> TunProxy<D> {
         // ended, so fall through and re-establish instead of dropping data.
         {
             let map = self.udp_proxy_flows.flows.lock().await;
-            if let Some(tx) = map.get(key) {
-                match tx.send(datagram) {
+            if let Some(existing) = map.get(key) {
+                existing
+                    .last_send_ms
+                    .store(existing.created.elapsed().as_millis() as u64, Ordering::Relaxed);
+                match existing.outbound.send(datagram) {
                     Ok(()) => return Ok(()),
                     // Recover the datagram from the failed send.
                     Err(e) => datagram = e.0,
@@ -1893,11 +2083,16 @@ impl<D: TunIo> TunProxy<D> {
                 .await?;
 
         // Store the outbound channel; the frame pump lives inside udp_relay.
+        let entry = Arc::new(UdpProxyFlow {
+            outbound: flow.outbound,
+            created: std::time::Instant::now(),
+            last_send_ms: std::sync::atomic::AtomicU64::new(0),
+        });
         self.udp_proxy_flows
             .flows
             .lock()
             .await
-            .insert(*key, flow.outbound);
+            .insert(*key, Arc::clone(&entry));
 
         // TUN-side inbound pump: tunnel datagrams → UDP packets → TUN device.
         let device = Arc::clone(&self.writer);
@@ -1917,6 +2112,33 @@ impl<D: TunIo> TunProxy<D> {
                 device.send(pkt).await;
             }
             udp_proxy_flows.flows.lock().await.remove(&key_clone);
+        });
+
+        // Client-side idle expiry. The server has no reason to close a flow it
+        // is not being asked about, so without this the mapping — and the
+        // tunnel-side flow behind it — lived for the whole session.
+        let reaper_entry = Arc::clone(&entry);
+        let reaper_table = self.udp_proxy_flows.clone();
+        let reap_key = *key;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(UDP_REAP_TICK).await;
+                let idle_for = std::time::Duration::from_millis(reaper_entry.idle_ms());
+                if !udp_proxy_idle_expired(idle_for) {
+                    continue;
+                }
+                crate::tun_trace!("udp proxy flow {}:{} idle; closing", reap_key.dst_ip, reap_key.dst_port);
+                tracing::debug!(
+                    "UDP proxy flow {}:{} idle for {}s; releasing",
+                    reap_key.dst_ip,
+                    reap_key.dst_port,
+                    idle_for.as_secs()
+                );
+                // Dropping the sender closes the frame pump's input, which tears
+                // the tunnel-side flow down with it.
+                reaper_table.remove_if(&reap_key, &reaper_entry).await;
+                return;
+            }
         });
 
         Ok(())
@@ -1967,13 +2189,50 @@ impl<D: TunIo> TunProxy<D> {
                 let now = std::time::Instant::now();
                 if unacked == 0 {
                     stalled = 0;
-                    rto = RETRANSMIT_TICK;
                     last_check = now;
                     if st.fin_queued && !st.fin_sent {
                         let _ = flush_send_queue(&mut st, &writer).await;
                     }
+                    let idle_for = now.duration_since(st.last_activity_at);
+                    // Reclaim only a flow that is genuinely parked: queued
+                    // payload or a pending FIN both mean something is still
+                    // owed to one of the two ends.
+                    if tcp_idle_reclaimable(idle_for, !st.send_queue.is_empty(), st.fin_queued) {
+                        st.end_reason = "idle timeout";
+                        let rst = build_tcp_rst_packet(&st).ok();
+                        drop(st);
+                        // The empty payload is the relay task's stop signal: it
+                        // shuts the upstream down, which is what lets its
+                        // `try_join!` return and actually releases the socket.
+                        // Dropping the table entry on its own would leak it.
+                        if let Some(flow) = flows.get(&key).await {
+                            let _ = flow.tx_to_relay.send(Bytes::new());
+                        }
+                        if let Some(pkt) = rst {
+                            writer.send(pkt).await;
+                        }
+                        crate::tun_trace!(
+                            "flow {}:{} retired: idle for {}s",
+                            key.dst_ip,
+                            key.dst_port,
+                            idle_for.as_secs()
+                        );
+                        tracing::debug!(
+                            "TCP flow {}:{} idle for {}s; reclaiming",
+                            key.dst_ip,
+                            key.dst_port,
+                            idle_for.as_secs()
+                        );
+                        flows.remove(&key).await;
+                        return;
+                    }
+                    // Nothing in flight to retransmit, so the fast cadence buys
+                    // nothing; check back on the idle tick instead.
+                    rto = IDLE_TICK;
                     continue;
                 }
+                // Back in flight: return to the retransmission cadence.
+                rto = RETRANSMIT_TICK;
                 // Any acknowledgement since the previous tick means the flow is
                 // alive; restart the budget instead of counting down to a kill.
                 if st.last_progress_at > last_check {
@@ -2349,9 +2608,12 @@ async fn tcp_direct_relay_task(
     // the app cannot afford another 2.5 s of nothing on every connection.
     if fallback_to_tunnel && direct_failures().is_known_bad(dst_ip, std::time::Instant::now()) {
         tracing::info!(
-            "route {}:{} -> Proxy (direct unreachable earlier on this network)",
-            dst_ip,
-            dst_port
+            "{}",
+            crate::whitelist::route_log_line(
+                format_args!("{}:{}", dst_ip, dst_port),
+                phantom_core::RuleAction::Proxy,
+                "direct unreachable earlier on this network"
+            )
         );
         crate::tun_trace!("direct-retry-skip {}:{}", dst_ip, dst_port);
         stats.record_route_direct_failed();
@@ -2384,10 +2646,12 @@ async fn tcp_direct_relay_task(
             direct_failures().remember(dst_ip, std::time::Instant::now());
             stats.record_route_direct_failed();
             tracing::info!(
-                "route {}:{} -> Proxy (direct connect failed: {}; retrying through the tunnel)",
-                dst_ip,
-                dst_port,
-                e
+                "{}",
+                crate::whitelist::route_log_line(
+                    format_args!("{}:{}", dst_ip, dst_port),
+                    phantom_core::RuleAction::Proxy,
+                    format_args!("direct connect failed: {}; retrying through the tunnel", e)
+                )
             );
             return retry_through_tunnel(
                 rx_from_tun,
@@ -2407,9 +2671,12 @@ async fn tcp_direct_relay_task(
             direct_failures().remember(dst_ip, std::time::Instant::now());
             stats.record_route_direct_failed();
             tracing::info!(
-                "route {}:{} -> Proxy (direct connect timed out; retrying through the tunnel)",
-                dst_ip,
-                dst_port
+                "{}",
+                crate::whitelist::route_log_line(
+                    format_args!("{}:{}", dst_ip, dst_port),
+                    phantom_core::RuleAction::Proxy,
+                    "direct connect timed out; retrying through the tunnel"
+                )
             );
             return retry_through_tunnel(
                 rx_from_tun,
@@ -2713,6 +2980,8 @@ async fn flush_send_queue(state: &mut TcpFlowState, device: &Arc<TunWriter>) -> 
         device.count_down(n as u64);
         state.seq = state.seq.wrapping_add(n as u32);
         state.bytes_to_app += n as u64;
+        // Payload really crossed the flow, so its idle clock restarts.
+        state.last_activity_at = std::time::Instant::now();
         bursts += 1;
         if bursts >= 64 {
             // Yield to the runtime on very large bursts; the supervisor and the
@@ -3347,5 +3616,68 @@ mod tests {
             "cache grew to {} entries",
             cache.len()
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Idle reclaim
+    // -----------------------------------------------------------------------
+
+    /// The point of the idle timeout is to retire a flow nobody is using, so it
+    /// must not fire while either end is still owed something.
+    #[test]
+    fn tcp_idle_reclaim_spares_a_flow_with_anything_outstanding() {
+        let past = TCP_IDLE_TIMEOUT + std::time::Duration::from_secs(60);
+        assert!(
+            tcp_idle_reclaimable(past, false, false),
+            "a parked flow should be reclaimed"
+        );
+        assert!(
+            !tcp_idle_reclaimable(past, true, false),
+            "queued payload means the app is still waiting for bytes"
+        );
+        assert!(
+            !tcp_idle_reclaimable(past, false, true),
+            "a FIN still owed to the app means the flow is mid-close"
+        );
+        assert!(!tcp_idle_reclaimable(past, true, true));
+    }
+
+    /// Long connections only survive because the threshold is far past any
+    /// keep-alive or streaming gap, so the boundary is asserted explicitly: a
+    /// later tweak that made the timeout bite would fail here, not on a phone.
+    #[test]
+    fn tcp_idle_reclaim_fires_only_past_the_timeout() {
+        assert!(!tcp_idle_reclaimable(
+            TCP_IDLE_TIMEOUT - std::time::Duration::from_secs(1),
+            false,
+            false
+        ));
+        assert!(tcp_idle_reclaimable(TCP_IDLE_TIMEOUT, false, false));
+        // An HTTP keep-alive gap and an idle stretch of a streaming response
+        // both sit well inside the window.
+        assert!(!tcp_idle_reclaimable(
+            std::time::Duration::from_secs(120),
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn udp_proxy_idle_expiry_fires_only_past_the_timeout() {
+        assert!(!udp_proxy_idle_expired(
+            UDP_PROXY_IDLE_TIMEOUT - std::time::Duration::from_secs(1)
+        ));
+        assert!(udp_proxy_idle_expired(UDP_PROXY_IDLE_TIMEOUT));
+    }
+
+    /// The tunnelled mapping is documented as "deliberately the longer of the
+    /// two" because QUIC and gaming traffic return in bursts, and it must stay
+    /// longer than the reaper's own tick or a flow could be reaped before the
+    /// reaper has had a chance to see it being used.
+    #[test]
+    fn udp_timeouts_keep_their_documented_ordering() {
+        assert!(UDP_PROXY_IDLE_TIMEOUT >= UDP_IDLE_TIMEOUT);
+        assert!(UDP_IDLE_TIMEOUT > UDP_REAP_TICK);
+        assert!(DNS_TUNNEL_IDLE > UDP_REAP_TICK);
     }
 }

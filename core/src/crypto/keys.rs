@@ -127,10 +127,31 @@ impl KeyPair {
 
     fn write_key_file(&self, path: &str, psk: Option<&Psk>) -> Result<()> {
         use std::io::Write;
-        let mut file = fs::File::create(path)
-            .map_err(|e| PhantomError::Crypto(format!("Failed to create key file: {}", e)))?;
-        file.lock()
-            .map_err(|e| PhantomError::Crypto(format!("Failed to lock key file: {}", e)))?;
+        // Write beside the target and rename it into place. `File::create`
+        // truncates, so writing in place would destroy a perfectly good key as
+        // soon as anything after it fails — a filesystem that cannot lock, a
+        // full disk, a crash — and leave a half-written key that no client can
+        // ever match again.
+        let tmp_path = format!("{path}.tmp");
+        let mut file = fs::File::create(&tmp_path).map_err(|e| {
+            PhantomError::Crypto(format!("Failed to create key file {}: {}", tmp_path, e))
+        })?;
+        // Advisory locking is a best-effort guard against a second process
+        // writing the same key file concurrently. Plenty of filesystems do not
+        // implement it at all — Android's app-private storage answers
+        // `lock() not supported` — and refusing to persist the key there would
+        // make the embedded phone server impossible to start, so an unsupported
+        // lock is downgraded to a note while a real failure still errors out.
+        if let Err(e) = file.lock() {
+            if e.kind() != std::io::ErrorKind::Unsupported {
+                let _ = fs::remove_file(&tmp_path);
+                return Err(PhantomError::Crypto(format!(
+                    "Failed to lock key file: {}",
+                    e
+                )));
+            }
+            tracing::debug!("{tmp_path}: no file locking here ({e}); writing the key anyway");
+        }
         let mut content = format!(
             "{}\n{}\n",
             self.public_key_base64(),
@@ -142,12 +163,17 @@ impl KeyPair {
         }
         file.write_all(content.as_bytes())
             .map_err(|e| PhantomError::Crypto(format!("Failed to write key file: {}", e)))?;
-        let mut perms = fs::metadata(path)
+        file.sync_all()
+            .map_err(|e| PhantomError::Crypto(format!("Failed to flush key file: {}", e)))?;
+        let mut perms = fs::metadata(&tmp_path)
             .map_err(|e| PhantomError::Crypto(format!("Failed to stat key file: {}", e)))?
             .permissions();
         perms.set_mode(0o600);
-        fs::set_permissions(path, perms).map_err(|e| {
+        fs::set_permissions(&tmp_path, perms).map_err(|e| {
             PhantomError::Crypto(format!("Failed to set key file permissions: {}", e))
+        })?;
+        fs::rename(&tmp_path, path).map_err(|e| {
+            PhantomError::Crypto(format!("Failed to install key file {}: {}", path, e))
         })?;
         Ok(())
     }

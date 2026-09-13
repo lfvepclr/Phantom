@@ -155,15 +155,11 @@ async fn handle_http_connection(
     };
     let decision =
         crate::whitelist::shared(config).decide(decision_domain, decision_ip, target_port);
+    // Shared formatter, same wording as the TUN and SOCKS5 paths (see
+    // `whitelist::route_log_line`).
     tracing::info!(
-        "route {} -> {} ({})",
-        request.target,
-        if decision.is_direct() {
-            "DIRECT"
-        } else {
-            "PROXY"
-        },
-        decision.reason.as_str()
+        "{}",
+        crate::whitelist::route_log_line(&request.target, decision.action, decision.reason.as_str())
     );
     if decision.is_direct() {
         stats.record_route_direct();

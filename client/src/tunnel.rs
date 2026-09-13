@@ -95,6 +95,7 @@ impl PhantomClient {
     pub async fn run(&self) -> Result<()> {
         self.verify().await?;
         self.prewarm_tcp_pool();
+        self.tcp_pool.spawn_sweeper();
         let listener = self.bind_socks5().await?;
         self.spawn_health_check();
         self.spawn_metrics();
@@ -114,6 +115,7 @@ impl PhantomClient {
     pub async fn run_tun(&self, options: TunRuntimeOptions) -> Result<()> {
         self.verify().await?;
         self.prewarm_tcp_pool();
+        self.tcp_pool.spawn_sweeper();
 
         // Bind SOCKS5 before touching the network configuration: a port clash
         // should fail cleanly rather than half-install a gateway.

@@ -23,9 +23,9 @@ use tokio::runtime::Runtime;
 #[cfg(target_os = "android")]
 use jni::JNIEnv;
 #[cfg(target_os = "android")]
-use jni::objects::{JClass, JString};
+use jni::JavaVM;
 #[cfg(target_os = "android")]
-use jni::sys::jint;
+use jni::objects::{GlobalRef, JClass, JValue};
 
 static RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
 
@@ -44,6 +44,25 @@ static LAST_ERROR: Mutex<String> = Mutex::new(String::new());
 const LOG_BUFFER_CAPACITY: usize = 200;
 static LOG_BUFFER: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static LOG_CURSOR: Mutex<u64> = Mutex::new(0);
+
+/// Optional on-disk mirror of [`LOG_BUFFER`].
+///
+/// The ring buffer dies with the process, which is exactly when a bug report
+/// needs it most (app killed by the OS, VPN service crashed, tunnel wedged).
+/// The platform shell points this at a sandbox file at service start; the file
+/// is capped so a session that runs for days cannot fill the phone.
+static LOG_FILE: Mutex<Option<std::fs::File>> = Mutex::new(None);
+static LOG_FILE_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const LOG_FILE_MAX_BYTES: u64 = 1024 * 1024;
+
+/// JVM handle and `RustBridge` class captured on the first JNI call.
+///
+/// `VpnService.protect()` is an instance method on the *service*, but the fd
+/// it has to adopt is created later, deep inside the datapath. Remembering the
+/// VM here is what lets `protect_fd` reach back into Kotlin from a tokio
+/// worker thread.
+#[cfg(target_os = "android")]
+static PROTECT_BRIDGE: Mutex<Option<(JavaVM, GlobalRef)>> = Mutex::new(None);
 
 /// Live counters of the running tunnel, shared with the UI.
 ///
@@ -82,13 +101,170 @@ fn clear_error() {
 }
 
 fn push_log(line: &str) {
-    let mut buf = LOG_BUFFER.lock().unwrap();
-    if buf.len() >= LOG_BUFFER_CAPACITY {
-        buf.remove(0);
+    {
+        let mut buf = LOG_BUFFER.lock().unwrap();
+        if buf.len() >= LOG_BUFFER_CAPACITY {
+            buf.remove(0);
+        }
+        buf.push(line.to_string());
+        let mut cursor = LOG_CURSOR.lock().unwrap();
+        *cursor += 1;
     }
-    buf.push(line.to_string());
-    let mut cursor = LOG_CURSOR.lock().unwrap();
-    *cursor += 1;
+    append_log_file(line);
+}
+
+/// Point the on-disk log mirror at `path`, or disable it with `None`.
+///
+/// Returns 0 on success and -1 when the file could not be opened (the caller
+/// keeps its in-memory log either way).
+pub fn android_set_log_path(path: Option<&str>) -> i32 {
+    let mut guard = LOG_FILE.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = None;
+    LOG_FILE_BYTES.store(0, Ordering::Relaxed);
+    let Some(path) = path else {
+        return 0;
+    };
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        Ok(file) => {
+            let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            LOG_FILE_BYTES.store(len, Ordering::Relaxed);
+            *guard = Some(file);
+            tracing::info!("session log mirroring to {path}");
+            0
+        }
+        Err(e) => {
+            tracing::warn!("session log file {path} could not be opened: {e}");
+            -1
+        }
+    }
+}
+
+/// Drop every buffered log line and truncate the on-disk mirror.
+///
+/// Both halves have to go together: clearing only the buffer would leave the
+/// lines the operator just dismissed sitting in the file they open next.
+pub fn android_clear_logs() -> i32 {
+    LOG_BUFFER.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    *LOG_CURSOR.lock().unwrap_or_else(|e| e.into_inner()) = 0;
+    if let Some(file) = LOG_FILE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+    {
+        let _ = file.set_len(0);
+    }
+    LOG_FILE_BYTES.store(0, Ordering::Relaxed);
+    0
+}
+
+/// Append one line to the mirrored file, rotating it when it hits the cap.
+///
+/// Lock order is always `LOG_BUFFER` → `LOG_CURSOR` → `LOG_FILE`; `push_log`
+/// calls this only after releasing the first two, so the JNI clear path cannot
+/// deadlock against the tracing writer.
+fn append_log_file(line: &str) {
+    use std::io::Write;
+
+    let mut guard = LOG_FILE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(file) = guard.as_mut() else {
+        return;
+    };
+    let pending = line.len() as u64 + 1;
+    if LOG_FILE_BYTES.load(Ordering::Relaxed) + pending > LOG_FILE_MAX_BYTES {
+        // Rotate in place: keep the most recent lines (the ring buffer is a
+        // superset of what the UI can show) instead of dropping the file.
+        let tail = LOG_BUFFER
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if file.set_len(0).is_err() {
+            return;
+        }
+        let mut written = 0u64;
+        for old in tail.iter() {
+            if file.write_all(old.as_bytes()).is_err() || file.write_all(b"\n").is_err() {
+                return;
+            }
+            written += old.len() as u64 + 1;
+        }
+        LOG_FILE_BYTES.store(written, Ordering::Relaxed);
+        return;
+    }
+    if file.write_all(line.as_bytes()).is_ok() && file.write_all(b"\n").is_ok() {
+        LOG_FILE_BYTES.fetch_add(pending, Ordering::Relaxed);
+    }
+}
+
+/// Exempt a socket from the VPN interface via `VpnService.protect()`.
+///
+/// Returns `false` when the bridge has not been captured yet or Kotlin refused
+/// the fd; the caller then knows its packets will be captured by the TUN.
+#[cfg(target_os = "android")]
+pub fn remember_bridge(env: &mut JNIEnv, class: &JClass) {
+    let vm = match env.get_java_vm() {
+        Ok(vm) => vm,
+        Err(e) => {
+            tracing::debug!("remember_bridge: get_java_vm failed: {e}");
+            return;
+        }
+    };
+    let global = match env.new_global_ref(class) {
+        Ok(global) => global,
+        Err(e) => {
+            tracing::debug!("remember_bridge: new_global_ref failed: {e}");
+            return;
+        }
+    };
+    *PROTECT_BRIDGE.lock().unwrap_or_else(|e| e.into_inner()) = Some((vm, global));
+}
+
+#[cfg(target_os = "android")]
+pub fn protect_fd(fd: RawFd) -> bool {
+    let guard = PROTECT_BRIDGE.lock().unwrap_or_else(|e| e.into_inner());
+    let Some((vm, class)) = guard.as_ref() else {
+        return false;
+    };
+    let mut env = match vm.attach_current_thread() {
+        Ok(env) => env,
+        Err(e) => {
+            tracing::debug!("protect_fd: attach failed: {e}");
+            return false;
+        }
+    };
+    match env.call_static_method(class, "protectFd", "(I)Z", &[JValue::Int(fd)]) {
+        Ok(value) => value.z().unwrap_or(false),
+        Err(e) => {
+            // A pending Java exception poisons every later JNI call on this
+            // thread, and this runs on tokio workers that make plenty of them;
+            // clear it so one rejected fd cannot take the datapath down.
+            if env.exception_check().unwrap_or(false) {
+                let _ = env.exception_clear();
+            }
+            tracing::warn!("protect_fd: protectFd({fd}) failed: {e}");
+            false
+        }
+    }
+}
+
+/// Replace the user "分流白名单" rules the UI edited.
+///
+/// Same contract as the desktop `phantom_macos_set_proxy_domains`: call before
+/// `android_start_with_uri`, because the routing state is built once per start.
+/// Text rather than a structured list keeps the JNI surface a single string and
+/// lets Android and HarmonyOS share one format (see [`crate::whitelist`]).
+pub fn android_set_user_rules(text: &str) -> i32 {
+    crate::whitelist::set_user_rules(text);
+    0
+}
+
+/// Host builds (`cargo check` for the mobile bridge) have no VpnService.
+#[cfg(not(target_os = "android"))]
+pub fn protect_fd(_fd: RawFd) -> bool {
+    true
 }
 
 fn build_config_from_uri(uri: &str, mode: &str) -> Result<ClientConfig, i32> {
@@ -382,6 +558,10 @@ fn start_with_config(fd: RawFd, config: ClientConfig) -> i32 {
 
     set_status(1); // starting
     clear_error();
+    // Rebuild the routing state so the whitelist the UI edited applies on every
+    // start, not only the first one: without this the process-wide router built
+    // by the previous start would be reused and the new rules ignored.
+    crate::whitelist::rebuild(&config);
     push_log(&format!(
         "[INFO] Starting tunnel (mode={:?}) ...",
         config.client.mode
@@ -510,6 +690,10 @@ fn start_with_config(fd: RawFd, config: ClientConfig) -> i32 {
             // bursts (a page load, an app launch), and each new flow would
             // otherwise pay a connect plus a Noise handshake first.
             let tcp_pool = std::sync::Arc::new(crate::tcp_pool::TcpSessionPool::new());
+            // Age the pool out in the background: without this the age rules
+            // only ever run when a flow asks, and a phone left idle overnight
+            // would keep holding handshaked sockets the whole time.
+            tcp_pool.spawn_sweeper();
             *SHARED_TCP_POOL.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some(std::sync::Arc::clone(&tcp_pool));
             // Warm one session up front: the first page after "connect" is when
@@ -755,85 +939,10 @@ impl<'a> tracing_subscriber::fmt::writer::MakeWriter<'a> for LogBufferWriter {
     }
 }
 
-// JNI wrappers used by Kotlin `co.phantom.android.RustBridge`.
-// These mirror the C-ABI functions above but accept JString parameters and
-// return JString values so Kotlin can call them with ordinary `external fun`
-// declarations.
-
-#[cfg(target_os = "android")]
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_co_phantom_android_RustBridge_startTunnelWithURI<'local>(
-    mut env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    fd: jint,
-    uri: JString<'local>,
-    mode: JString<'local>,
-) -> jint {
-    let uri = match env.get_string(&uri) {
-        Ok(s) => s.to_str().unwrap_or("").to_string(),
-        Err(_) => return -1,
-    };
-    let mode = match env.get_string(&mode) {
-        Ok(s) => s.to_str().unwrap_or("smart").to_string(),
-        Err(_) => return -1,
-    };
-    android_start_with_uri(fd as RawFd, &uri, &mode)
-}
-
-#[cfg(target_os = "android")]
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_co_phantom_android_RustBridge_startTunnel<'local>(
-    mut env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    fd: jint,
-    config: JString<'local>,
-) -> jint {
-    let config_str = match env.get_string(&config) {
-        Ok(s) => s.to_str().unwrap_or("").to_string(),
-        Err(_) => return -1,
-    };
-    android_start(fd as RawFd, &config_str)
-}
-
-#[cfg(target_os = "android")]
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_co_phantom_android_RustBridge_stopTunnel(
-    _env: JNIEnv,
-    _class: JClass,
-) -> jint {
-    android_stop()
-}
-
-#[cfg(target_os = "android")]
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_co_phantom_android_RustBridge_getStatus(
-    _env: JNIEnv,
-    _class: JClass,
-) -> jint {
-    android_get_status()
-}
-
-#[cfg(target_os = "android")]
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_co_phantom_android_RustBridge_getLastError<'local>(
-    env: JNIEnv<'local>,
-    _class: JClass<'local>,
-) -> JString<'local> {
-    env.new_string(&android_get_last_error())
-        .expect("new_string failed")
-}
-
-#[cfg(target_os = "android")]
-#[unsafe(no_mangle)]
-pub extern "system" fn Java_co_phantom_android_RustBridge_getLogs<'local>(
-    env: JNIEnv<'local>,
-    _class: JClass<'local>,
-    since_cursor: jni::sys::jlong,
-) -> JString<'local> {
-    let (lines, cursor) = android_get_logs(since_cursor as u64);
-    let result = format!("{}\n{}", cursor, lines.join("\n"));
-    env.new_string(&result).expect("new_string failed")
-}
+// The JNI wrappers that Kotlin calls live in the `phantom-android` crate
+// (`client/android/rust`), next to the embedded-server bridge, so this crate
+// keeps a single platform-independent surface shared with the HarmonyOS NAPI
+// bindings.
 
 #[cfg(all(test, target_os = "android"))]
 mod tests {

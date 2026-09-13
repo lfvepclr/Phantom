@@ -20,6 +20,24 @@
 
 use tokio::net::TcpStream;
 
+/// Route a socket outside the tunnel interface where the platform needs it.
+///
+/// On Android every socket belongs to the VPN by default once the TUN is up,
+/// so the direct resolver (`client.dns_direct`) would send its queries into our
+/// own TUN and never reach the physical network. `VpnService.protect()` is the
+/// only supported way to exempt a socket, and it has to be called from Kotlin —
+/// this is the hook the datapath uses to reach it.
+///
+/// Everywhere else this is a no-op: macOS and HarmonyOS run the tunnel out of
+/// process or exclude the resolver route explicitly, so their sockets already
+/// take the physical path.
+#[cfg(unix)]
+pub fn protect_socket(fd: std::os::unix::io::RawFd) {
+    if !crate::platform::protect_fd(fd) {
+        tracing::debug!("socket {fd} could not be protected from the tunnel");
+    }
+}
+
 /// Apply the client's datapath tuning to one connected stream.
 ///
 /// Every option is best-effort: a platform that refuses one must not fail the

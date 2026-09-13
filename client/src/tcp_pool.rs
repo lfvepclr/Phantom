@@ -53,8 +53,27 @@ const MAX_IDLE: usize = 4;
 ///
 /// Deliberately short: the pool exists to cover the gap between the resources of
 /// one page load, not to keep connections open for minutes. A session older than
-/// this is dropped rather than risk handing out one that a NAT already forgot.
+/// this is no longer handed out eagerly — it may only survive as the pool's one
+/// *warm* session (see [`WARM_IDLE_AGE`]).
 const MAX_IDLE_AGE: Duration = Duration::from_secs(8);
+
+/// How long at most one session may be kept warm past [`MAX_IDLE_AGE`].
+///
+/// The pool would otherwise empty completely `MAX_IDLE_AGE` after the last flow,
+/// and the very next page load would pay a full connect + Noise handshake again.
+/// Keeping a single session warm is the compromise: one socket instead of four,
+/// and a session that a NAT has already forgotten costs the caller the handshake
+/// it was meant to skip — never an error, because every caller falls back to a
+/// fresh connect when a pooled session fails.
+const WARM_IDLE_AGE: Duration = Duration::from_secs(120);
+
+/// How often the background sweep applies the age rules.
+///
+/// `prune` is otherwise only reached from `take`/`refill`, so a pool nobody is
+/// using would hold its sockets — each one probed by the transport's keepalive —
+/// until the next flow arrived. One cheap wake per [`SWEEP_INTERVAL`] bounds
+/// their lifetime instead of leaving it unbounded.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Handshake timeout for a refill. `None` means "no timeout" (the transport's
 /// own connect timeout still applies).
@@ -134,6 +153,39 @@ impl TcpSessionPool {
         let mut state = self.state.lock().await;
         prune(&mut state, now, epoch);
         state.idle.len()
+    }
+
+    /// Start the periodic sweep.
+    ///
+    /// Called once when the tunnel starts. Without it the age rules only ever
+    /// apply when a flow happens to ask, which is never in the idle case the
+    /// pool is supposed to stay cheap in.
+    pub fn spawn_sweeper(self: &Arc<Self>) {
+        let pool = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(SWEEP_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                pool.sweep().await;
+            }
+        });
+    }
+
+    /// Apply the age rules once.
+    pub async fn sweep(&self) {
+        let now = Instant::now();
+        let epoch = crate::tun::network_epoch();
+        let mut state = self.state.lock().await;
+        let before = state.idle.len();
+        prune(&mut state, now, epoch);
+        if state.idle.len() != before {
+            tracing::debug!(
+                "TCP session pool swept ({} -> {} idle)",
+                before,
+                state.idle.len()
+            );
+        }
     }
 
     /// Take a ready session for `server`, if one is fresh.
@@ -273,10 +325,28 @@ impl TcpSessionPool {
 }
 
 /// Drop sessions that are too old or from a previous network epoch.
+///
+/// Two tiers. Sessions past [`MAX_IDLE_AGE`] are no longer handed out eagerly
+/// (a NAT may have forgotten them), but the newest of them survives as the
+/// pool's single warm session until [`WARM_IDLE_AGE`], so the next burst does
+/// not pay a fresh handshake. Everything older — and every *second* warm
+/// candidate — is closed.
 fn prune(state: &mut State, now: Instant, epoch: u64) {
-    state
-        .idle
-        .retain(|s| now.duration_since(s.born_at) < MAX_IDLE_AGE && s.epoch == epoch);
+    state.idle.retain(|s| {
+        s.epoch == epoch && now.duration_since(s.born_at) < WARM_IDLE_AGE
+    });
+    // Hot sessions stay where they are; of the warm ones keep only the newest.
+    let mut warm_seen = false;
+    state.idle.retain(|s| {
+        if now.duration_since(s.born_at) < MAX_IDLE_AGE {
+            return true;
+        }
+        if warm_seen {
+            return false;
+        }
+        warm_seen = true;
+        true
+    });
 }
 
 fn pool_key(server: &ServerEntry, cipher: CipherPreference) -> String {

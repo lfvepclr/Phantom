@@ -1,5 +1,6 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::BytesMut;
+use std::time::Duration;
 use phantom_core::CipherPreference;
 use phantom_core::TransportProtocol;
 use phantom_core::constants::MAX_FRAME_PAYLOAD;
@@ -77,7 +78,14 @@ pub async fn handle_socks5_connection(
         }
         // The TUN path already logged this decision; keep the relay quiet so
         // one connection does not produce two route lines.
-        tracing::debug!("route {} -> PROXY (decided by TUN)", target);
+        tracing::debug!(
+            "{}",
+            crate::whitelist::route_log_line(
+                &target,
+                phantom_core::RuleAction::Proxy,
+                "decided by TUN"
+            )
+        );
         crate::whitelist::RouteDecision {
             action: phantom_core::RuleAction::Proxy,
             reason: crate::whitelist::RouteReason::Whitelist,
@@ -85,15 +93,12 @@ pub async fn handle_socks5_connection(
     } else {
         let router = crate::whitelist::shared(config);
         let decision = router.decide(decision_domain, decision_ip, target_port);
+        // Same wording as the TUN path, through the shared formatter: the
+        // macOS system proxy rides *this* path, so a divergent `DIRECT` here
+        // made the client's "tunnel only" switch a no-op.
         tracing::info!(
-            "route {} -> {} ({})",
-            target,
-            if decision.is_direct() {
-                "DIRECT"
-            } else {
-                "PROXY"
-            },
-            decision.reason.as_str()
+            "{}",
+            crate::whitelist::route_log_line(&target, decision.action, decision.reason.as_str())
         );
         decision
     };
@@ -596,8 +601,21 @@ async fn handle_udp_associate(
     let mut buf = vec![0u8; 65536];
     let mut ctl = [0u8; 16];
 
+    // An association with no control traffic and no datagrams is dead weight:
+    // it holds the control socket and every per-target flow it opened. Clients
+    // that use UDP do so in bursts, so five quiet minutes is a safe cut-off —
+    // and the association is re-established from scratch the next time the
+    // client asks for one.
+    const UDP_ASSOC_IDLE: Duration = Duration::from_secs(300);
+    let idle = tokio::time::sleep(UDP_ASSOC_IDLE);
+    tokio::pin!(idle);
+
     loop {
         tokio::select! {
+            _ = &mut idle => {
+                tracing::debug!("UDP ASSOCIATE idle; closing");
+                break;
+            }
             res = socks5.read(&mut ctl) => {
                 // Any EOF or error on the control connection ends the
                 // association; payload bytes (there should be none) are ignored.
@@ -605,6 +623,7 @@ async fn handle_udp_associate(
                     Ok(0) | Err(_) => break,
                     Ok(_) => {}
                 }
+                idle.as_mut().reset(tokio::time::Instant::now() + UDP_ASSOC_IDLE);
             }
             res = udp.recv_from(&mut buf) => {
                 let (n, src) = match res {
@@ -614,6 +633,7 @@ async fn handle_udp_associate(
                         break;
                     }
                 };
+                idle.as_mut().reset(tokio::time::Instant::now() + UDP_ASSOC_IDLE);
                 match client_addr {
                     None => client_addr = Some(src),
                     Some(addr) if addr != src => continue,

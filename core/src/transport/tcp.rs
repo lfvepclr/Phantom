@@ -60,10 +60,18 @@ impl Transport for TcpTransport {
         // keepalive a socket whose path disappeared (Wi-Fi ⇄ cellular) stays
         // "established" until the OS TCP retransmission timeout — minutes in
         // which the client believes it is connected but nothing moves.
-        // 15 s idle + 3 probes fails such a socket in well under a minute.
+        //
+        // 60 s idle + 3 probes at 10 s fails such a socket in about 90 s. That
+        // is slower than the 15 s this used to be, on purpose: every probe is a
+        // radio wake-up on a phone, and a tunnel left connected but unused would
+        // otherwise be probed four times a minute per socket. The fast path for
+        // a real link change is the platform's own network callback
+        // (`notifyNetworkChange` / `protectProcessNet`), which resets the
+        // datapath immediately; keepalive is only the backstop for a path that
+        // died silently.
         let keepalive = socket2::TcpKeepalive::new()
-            .with_time(Duration::from_secs(15))
-            .with_interval(Duration::from_secs(5));
+            .with_time(Duration::from_secs(60))
+            .with_interval(Duration::from_secs(10));
         #[cfg(not(any(target_os = "openbsd", target_os = "redox")))]
         let keepalive = keepalive.with_retries(3);
         let _ = socket.set_tcp_keepalive(&keepalive);

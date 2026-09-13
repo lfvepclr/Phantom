@@ -299,7 +299,18 @@ fn load_or_generate_key(path: &Path) -> Result<ServerIdentity> {
     let p = path
         .to_str()
         .ok_or_else(|| anyhow!("non-UTF8 key path: {}", path.display()))?;
-    if path.exists() {
+    // A zero-length key file is not a key: it is what an interrupted write
+    // leaves behind. Regenerating is safe, because nothing can ever have been
+    // derived from a file with no content, and it is the only way out of a
+    // state that otherwise wedges the server on every start.
+    let has_content = path.metadata().map(|m| m.len() > 0).unwrap_or(false);
+    if !has_content && path.exists() {
+        tracing::warn!(
+            "{} is empty (an interrupted write); regenerating the key pair",
+            path.display()
+        );
+    }
+    if has_content {
         let identity = KeyPair::load_server_identity(p)
             .with_context(|| format!("failed to load existing key {}", path.display()))?;
         tracing::info!("Reusing existing key from {}", path.display());
