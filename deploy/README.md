@@ -114,7 +114,7 @@ cd ~/phantom && phantom server
 
 ```bash
 sudo grep '^#   phantom://' /var/lib/phantom/server.toml | sed 's/^#   //'
-# phantom://<服务器公钥base64>=@192.168.1.10:443?cipher=auto&proto=tcp#default
+# phantom://<服务器公钥base64>@<服务器地址>:443?cipher=auto&proto=tcp#default
 ```
 
 把这个 URI 分发给客户端：

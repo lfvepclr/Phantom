@@ -201,7 +201,7 @@ ssh -p <SSH端口> admin@<路由器IP> 'tar xzf /tmp/phantom-0.1.0.tar.gz -C /tm
 
 打开 `http://<路由器IP>/Module_phantom.asp` 配置。
 
-> 本机 SSH 端口是 **<SSH端口>**（不是 22），所以命令统一写 `ssh -p <SSH端口> admin@<路由器IP>` ——
+> 若路由器把 SSH 端口改成了非 22（示例写作 `<SSH端口>`），命令统一写 `ssh -p <SSH端口> admin@<路由器IP>` ——
 > `-p` 必须在 host **之前**，写成 `ssh admin@<路由器IP> -p <SSH端口>` 会被当成远端命令。
 
 ## 6. 调试（重点）

@@ -62,8 +62,8 @@ LAN 客户端 ──┐
 | 固件 | Asuswrt-Merlin（官方固件缺少 `/jffs/scripts` 钩子） |
 | 架构 | `aarch64`（BCM4912/BCM4908 机型）；用 `ssh admin@router uname -m` 确认 |
 
-> 本文示例统一写 `ssh admin@<路由器IP>`。若路由器把 SSH 改到了别的端口（本机是
-> **<SSH端口>**），把 `-p` 加在 host **之前**：`ssh -p <SSH端口> admin@<路由器IP>` ——
+> 本文示例统一写 `ssh admin@<路由器IP>`。若路由器把 SSH 改到了别的端口（示例写作
+> `<SSH端口>`），把 `-p` 加在 host **之前**：`ssh -p <SSH端口> admin@<路由器IP>` ——
 > 写成 `ssh admin@<路由器IP> -p <SSH端口>` 会被当成远端命令执行。
 > scp 同理（大写 `-P`）：`scp -P <SSH端口> <file> admin@<路由器IP>:/tmp/`。
 > 另外路由器上的 `sh` 必须写成 `/bin/sh`（`/usr/sbin/sh` 是 Broadcom 调试工具）。

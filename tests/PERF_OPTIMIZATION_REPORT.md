@@ -95,7 +95,7 @@ QUIC cipher 约束：AEAD 由 Noise pattern 固定（AESGCM 或 ChaChaPoly），
 | macOS CLI（本机） | 15.5 / 20.2 / 20.3 MB/s | ≥ 裸链路上限，协议开销≈0 |
 | 鸿蒙模拟器（SOCKS5-only） | 19.0 / 19.0 / 20.0 MB/s | 与 macOS 客户端持平，Hello 验证通过 |
 
-鸿蒙链路拓扑：模拟器(QEMU slirp 10.0.2.15) → 宿主机 relay（127.0.0.1:8443 → 50.20:8443，`tests/e2e/tcp_relay.py`）→ WiFi → 50.20 phantom-server → 回环 python http.server。模拟器内核直连 <内网主机IP> 报 EHOSTUNREACH（slirp 不转发至 LAN 其他主机），relay 桥接为模拟器环境的固定解法。
+鸿蒙链路拓扑：模拟器(QEMU slirp 10.0.2.15) → 宿主机 relay（127.0.0.1:8443 → <内网主机>:8443，`tests/e2e/tcp_relay.py`）→ WiFi → <内网主机> phantom-server → 回环 python http.server。模拟器内核直连 <内网主机IP> 报 EHOSTUNREACH（slirp 不转发至 LAN 其他主机），relay 桥接为模拟器环境的固定解法。
 
 ### 7.3 WiFi 优化结论
 
@@ -122,7 +122,7 @@ phantom 已打满物理链路，协议层无优化空间。链路层优化按收
 | ✅ SOCKS5 隔离模式（`listen="0.0.0.0:1080"` + proxy_auth，`tests/e2e/router-client.toml`） | 只代理显式配置代理的设备，零路由表改动，phantom 崩溃不影响网络。**推荐生产模式** |
 | ❌ gateway 透明网关（`--tun --gateway`） | **路由环路缺陷**：隧道自身连接被自身策略路由吞掉（Server unreachable），转发规则已生效但隧道不通 → 全网瘫。需修复（fwmark 排除隧道 socket）后才能上生产 |
 
-**吞吐**（proto=tcp，Mac（M3 Pro）→路由器单跳为 server 模式；双跳为路由器 client SOCKS5 → 50.20 server）：
+**吞吐**（proto=tcp，Mac（M3 Pro）→路由器单跳为 server 模式；双跳为路由器 client SOCKS5 → <内网主机> server）：
 
 | 场景 | 吞吐 | 结论 |
 |---|---|---|

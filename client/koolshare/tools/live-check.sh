@@ -6,14 +6,15 @@
 # 在线设备零影响。需要「真启动」验证时请在 Web 页面上操作。
 #
 # 用法（注意 ssh 的 -p 必须在 host 之前，写成 `ssh admin@host -p <SSH端口>` 是错的）：
-#   bash client/koolshare/tools/live-check.sh --host <路由器IP> --port <SSH端口>
+#   bash client/koolshare/tools/live-check.sh --host <路由器IP> [--port <SSH端口>]
 #
 # 输出可直接整段回贴。最后会拿本机源码里的 ASP 与该机的对比（含皮肤 sed），
 # 一眼看出「改了没推上去」。
 
 set -uo pipefail
 
-HOST=<路由器IP>
+# 仓库里不留真实地址：主机必须由 --host 或环境变量给出。
+HOST="${PHANTOM_ROUTER_HOST:-}"
 PORT=22
 USER=admin
 
@@ -31,6 +32,11 @@ while [ $# -gt 0 ]; do
         *) echo "未知参数：$1（用 --help 看用法）" >&2; exit 1 ;;
     esac
 done
+
+if [ -z "$HOST" ]; then
+    echo "缺少路由器地址：请用 --host <路由器IP>（或环境变量 PHANTOM_ROUTER_HOST）" >&2
+    exit 1
+fi
 
 # 本机源码里的 ASP（用来和真机对比指纹）
 SELF_DIR=$(cd "$(dirname "$0")/.." && pwd)

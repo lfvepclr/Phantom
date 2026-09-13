@@ -80,6 +80,8 @@ client/harmony/entry/src/main/resources/rawfile/
 # === Test / Bench ===
 /tests/target
 /tests/bench/target
+__pycache__/
+*.pyc
 
 # === koolshare 路由器插件 ===
 # 二进制由 cargo xtask package koolshare 注入，不入库（体积大且随版本变）
