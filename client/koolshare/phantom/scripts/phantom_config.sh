@@ -232,13 +232,25 @@ detach_run() {
 # JFFS/tmpfs 空间有限，日志必须截断（500 行 / 256KB）
 trim_log() {
     [ -f "$LOG" ] || return 0
+    # **必须原地覆盖，不能用 mv 轮换。**
+    # 运行中的 phantom 进程是带着日志 fd 一直写（`>>"$LOG"`）的：一旦用
+    # `mv 新文件 $LOG` 换掉 inode，它之后所有的输出都会写进一个没人引用的旧文件 ——
+    # 页面和 SSH 都再也看不到隧道日志（只有重启隧道才恢复）。
+    # 真机上踩过：清日志/截断之后，日志页停在「配置已保存…」，隧道却在满速跑。
+    # `cat > "$LOG"` 是截断同一个 inode，append 语义保持不变。
     local lines=$(wc -l <"$LOG" 2>/dev/null | tr -d ' ')
     if [ -n "$lines" ] && [ "$lines" -gt 500 ] 2>/dev/null; then
-        tail -n 500 "$LOG" >"${LOG}.tmp" 2>/dev/null && mv "${LOG}.tmp" "$LOG"
+        if tail -n 500 "$LOG" >"${LOG}.tmp" 2>/dev/null; then
+            cat "${LOG}.tmp" >"$LOG" 2>/dev/null
+        fi
+        rm -f "${LOG}.tmp" 2>/dev/null
     fi
     local bytes=$(wc -c <"$LOG" 2>/dev/null | tr -d ' ')
     if [ -n "$bytes" ] && [ "$bytes" -gt 262144 ] 2>/dev/null; then
-        tail -c 200000 "$LOG" >"${LOG}.tmp" 2>/dev/null && mv "${LOG}.tmp" "$LOG"
+        if tail -c 200000 "$LOG" >"${LOG}.tmp" 2>/dev/null; then
+            cat "${LOG}.tmp" >"$LOG" 2>/dev/null
+        fi
+        rm -f "${LOG}.tmp" 2>/dev/null
     fi
 }
 

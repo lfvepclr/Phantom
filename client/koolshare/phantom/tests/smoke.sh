@@ -437,6 +437,36 @@ fi
 
 # ---------------------------------------------------------------- 启动
 
+step "日志轮换：不能换 inode（否则运行中的隧道日志会消失）"
+# 运行中的 phantom 进程带着日志 fd 一直写；如果截断实现用 `mv` 换掉 inode，
+# 它之后的所有输出都会写进一个没人引用的旧文件 —— 页面/SSH 都看不到日志，
+# 只有重启隧道才恢复。真机上就是这么丢掉 17:25 之后全部日志的。
+awk '/^trim_log\(\) \{/,/^\}/' "$CFG" >"${ROOT:-/tmp}/trim_fn.sh"
+if grep -qE 'mv[[:space:]]*"\$\{?LOG' "${ROOT:-/tmp}/trim_fn.sh"; then
+    bad "trim_log 用 mv 轮换日志（运行中进程的日志会永久丢失）"
+else
+    ok "trim_log 原地截断（不用 mv 换 inode）"
+fi
+i=0
+while [ $i -lt 600 ]; do
+    echo "filler-$i" >>"$LOG"
+    i=$((i + 1))
+done
+exec 9>>"$LOG"
+echo "MARKER-BEFORE" >&9
+"$SH" "$CONF_SH" status >/dev/null 2>&1
+echo "MARKER-AFTER" >&9
+exec 9>&-
+if grep -q "MARKER-AFTER" "$LOG" 2>/dev/null; then
+    ok "截断后同一 fd 的写入仍可见（inode 未变）"
+else
+    bad "截断后同一 fd 的写入丢失 —— 运行中的隧道日志会消失"
+fi
+grep -q "MARKER-BEFORE" "$LOG" 2>/dev/null && ok "截断保留了最新日志行" || bad "截断把最新日志行也丢了"
+lines_now=$(wc -l <"$LOG" | tr -d ' ')
+[ "$lines_now" -le 501 ] 2>/dev/null && ok "日志已截断到 500 行以内（${lines_now} 行）" \
+    || bad "日志未按预期截断（${lines_now} 行）"
+
 step "配置并启动"
 setcfg uri "phantom://AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA@1.2.3.4:443?psk=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 setcfg enable 1
