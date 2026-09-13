@@ -18,6 +18,31 @@ final class LogBufferTests: XCTestCase {
         XCTAssertEqual(logMessage(of: lines[3]), "no-timestamp line")
     }
 
+    /// The pane is ~50 monospace columns wide, so the severity token is carried
+    /// out-of-band instead of eating five of them on every line.
+    func testLevelIsSplitOutOfTheRenderedText() {
+        XCTAssertEqual(splitLevel("INFO route a:443 -> Proxy (whitelist)").level, .info)
+        XCTAssertEqual(splitLevel("WARN system proxy not set").level, .warn)
+        XCTAssertEqual(splitLevel("ERROR tunnel exited").level, .error)
+        // A message that merely starts with a word keeps its text intact.
+        XCTAssertEqual(splitLevel("Informational note").text, "Informational note")
+        XCTAssertEqual(splitLevel("Informational note").level, .other)
+
+        let rendered = renderLogLines(lines, filter: .tunnel)
+        XCTAssertEqual(rendered.first?.level, .info)
+        XCTAssertFalse(rendered.contains { $0.text.contains("INFO ") })
+        XCTAssertTrue(rendered.first?.text.hasSuffix("-> Proxy (whitelist)") == true)
+    }
+
+    func testPaddingSpacesAreSqueezed() {
+        XCTAssertEqual(collapseSpaces("INFO  route a:443"), "INFO route a:443")
+        XCTAssertEqual(
+            renderLogLines(["17:26:44 INFO  route a:443 -> Proxy (whitelist)"], filter: .all)
+                .first?.text,
+            "17:26:44 route a:443 -> Proxy (whitelist)"
+        )
+    }
+
     func testTunnelFilterHidesDirectFlows() {
         let tunnel = renderLogLines(lines, filter: .tunnel)
         XCTAssertFalse(tunnel.contains { $0.text.contains("youku") })
@@ -25,6 +50,64 @@ final class LogBufferTests: XCTestCase {
 
         let all = renderLogLines(lines, filter: .all)
         XCTAssertTrue(all.contains { $0.text.contains("youku") })
+    }
+
+    /// macOS points the system proxy at our SOCKS5/HTTP listener, so the lines
+    /// it sees are the ones those transports emit — not the TUN ones. They used
+    /// to spell the verdict `-> DIRECT (`, which the pane did not match, so
+    /// 「仅隧道」 still showed every direct flow.
+    func testTunnelFilterUnderstandsTheProxyTransportSpelling() {
+        let socks = [
+            "17:26:44 INFO SOCKS5 target: v.youku.com:443 (cmd=0x1)",
+            "17:26:44 INFO route v.youku.com:443 -> DIRECT (final)",
+            "17:26:44 INFO Direct connection established -> v.youku.com:443",
+            "17:26:45 INFO SOCKS5 target: www.google.com:443 (cmd=0x1)",
+            "17:26:45 INFO route www.google.com:443 -> PROXY (whitelist)",
+            "17:26:45 INFO Relay done ↑ www.google.com:443 (1200 bytes up)",
+        ]
+        let tunnel = renderLogLines(socks, filter: .tunnel)
+        XCTAssertEqual(tunnel.map(\.text), [
+            "17:26:45 SOCKS5 target: www.google.com:443 (cmd=0x1)",
+            "17:26:45 route www.google.com:443 -> PROXY (whitelist)",
+            "17:26:45 Relay done ↑ www.google.com:443 (1200 bytes up)",
+        ])
+        // Nothing is hidden from the full view — the disk log is the record of
+        // everything; this is only about what the narrow pane shows.
+        XCTAssertEqual(renderLogLines(socks, filter: .all).count, socks.count)
+    }
+
+    func testTunnelFilterHidesTheHttpProxyDirectLines() {
+        let http = [
+            "17:26:44 INFO HTTP CONNECT → v.youku.com:443 (tunnel)",
+            "17:26:44 INFO route v.youku.com:443 -> DIRECT (final)",
+            "17:26:44 INFO Direct HTTP connection established → v.youku.com:443",
+        ]
+        XCTAssertTrue(renderLogLines(http, filter: .tunnel).isEmpty)
+    }
+
+    /// A flow that failed direct and was retried through the tunnel is tunnel
+    /// traffic; its reason text mentions "direct" and must not be filtered out.
+    func testDirectFallbackRetriedThroughTheTunnelStaysVisible() {
+        let lines = [
+            "17:26:44 INFO route 142.250.0.1:443 -> Proxy (direct connect timed out; retrying through the tunnel)",
+            "17:26:44 INFO route 1.2.3.4:443 -> Direct (dns local) 1.2.3.4",
+        ]
+        let tunnel = renderLogLines(lines, filter: .tunnel)
+        XCTAssertEqual(tunnel.map(\.text), [
+            "17:26:44 route 142.250.0.1:443 -> Proxy (direct connect timed out; retrying through the tunnel)"
+        ])
+    }
+
+    func testRouteClassificationIsCaseInsensitiveAndBannerAware() {
+        XCTAssertTrue(LogRoute.isDirect("route a:443 -> Direct (final)"))
+        XCTAssertTrue(LogRoute.isDirect("route a:443 -> DIRECT (final)"))
+        XCTAssertFalse(LogRoute.isDirect("route a:443 -> Proxy (whitelist)"))
+        XCTAssertFalse(LogRoute.isDirect("route a:443 -> Proxy (direct unreachable earlier on this network)"))
+        XCTAssertEqual(LogRoute.directTarget("route a:443 -> Direct (final)"), "a:443")
+        XCTAssertNil(LogRoute.directTarget("route a:443 -> Proxy (whitelist)"))
+        XCTAssertEqual(LogRoute.bannerTarget("SOCKS5 target: a:443 (cmd=0x1)"), "a:443")
+        XCTAssertEqual(LogRoute.bannerTarget("HTTP CONNECT → a:443 (tunnel)"), "a:443")
+        XCTAssertNil(LogRoute.bannerTarget("route a:443 -> Direct (final)"))
     }
 
     func testConsecutiveRepeatsCollapse() {

@@ -12,7 +12,17 @@ enum Theme {
     static let cardPadding: CGFloat = 14
     static let pagePadding: CGFloat = 16
     static let gap: CGFloat = 12
-    static let logMinHeight: CGFloat = 220
+    /// The popover is fixed-size by construction (MenuBarExtra windows are not
+    /// resizable), so both dimensions are constants rather than preferences.
+    /// 400pt keeps the log readable at monospace 11 without stretching the
+    /// server card across a wide screen.
+    static let popoverWidth: CGFloat = 400
+    static let popoverHeight: CGFloat = 620
+
+    /// Floor for the log card: it shares the popover column with the cards, so
+    /// the point where the layout stops shrinking it and starts scrolling the
+    /// cards instead has to be fairly low.
+    static let popoverLogMinHeight: CGFloat = 150
 
     static func accent(_ state: PhantomState) -> Color {
         Color(nsColor: state.accent)

@@ -256,9 +256,9 @@ final class PhantomTunnel: ObservableObject {
                 } else {
                     status = "Connected — SOCKS5 127.0.0.1:\(port)（系统代理未设置）"
                     logs.append(
-                        "[WARN] System proxy was not set on the active network service. "
-                            + "SOCKS5 itself works on 127.0.0.1:\(port); set the system proxy "
-                            + "manually with: bash scripts/mac-sysproxy.sh on"
+                        "\(Self.logStampFormatter.string(from: Date())) "
+                            + "[WARN] system proxy not set; SOCKS5 ready on "
+                            + "127.0.0.1:\(port); run scripts/mac-sysproxy.sh on"
                     )
                 }
             }
@@ -434,9 +434,23 @@ final class PhantomTunnel: ObservableObject {
         let result = phantomMacosGetLogs(sinceCursor: logCursor)
         logCursor = result.cursor
         guard !result.lines.isEmpty else { return }
-        logs.append(contentsOf: result.lines)
+        // The core emits bare messages (`INFO route host:port -> Proxy (reason)`);
+        // the clock is stamped here, in the shortest form that still tells two
+        // bursts apart. A full RFC3339 prefix would eat a third of the pane and,
+        // worse, make every line unique so identical repeats could never be
+        // collapsed.
+        let stamp = Self.logStampFormatter.string(from: Date())
+        logs.append(contentsOf: result.lines.map { "\(stamp) \($0)" })
         if logs.count > Self.logBufferLimit {
             logs.removeFirst(logs.count - Self.logBufferLimit)
         }
     }
+
+    /// `HH:MM:SS` — fixed-width, locale-independent, 9 columns with the space.
+    private static let logStampFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "HH:mm:ss"
+        return formatter
+    }()
 }

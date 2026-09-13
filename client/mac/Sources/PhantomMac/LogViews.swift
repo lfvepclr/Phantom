@@ -1,19 +1,19 @@
 import SwiftUI
 import PhantomMacKit
 
-/// Log pane, shared by the main window's card and the dedicated log window.
+/// Log pane, shared by the dashboard card and the expanded (full-popover) view.
 ///
 /// Both show the same buffer with the same controls, so "the log looks
 /// different in the two places" can never be a source of confusion.
 struct LogPane: View {
     @ObservedObject var tunnel: PhantomTunnel
-    /// Card mode adds the toolbar affordances that only make sense in a window
-    /// (open the log window); the window itself shows a follow toggle instead.
-    var isCard: Bool = true
+    /// Card mode offers "放大"; the expanded view offers "收起" instead.
+    var onExpand: (() -> Void)?
+    var onClose: (() -> Void)?
     @State private var followTail = true
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 6) {
             header
             list
         }
@@ -25,16 +25,22 @@ struct LogPane: View {
             Text("日志")
                 .font(.system(size: 14, weight: .semibold))
 
-            if isCard {
+            if let onExpand {
                 // Full screen belongs next to the *title*: sitting beside the
                 // clear button it was one slip away from wiping the log.
-                Button {
-                    WindowBridge.shared.showLogs()
-                } label: {
+                Button(action: onExpand) {
                     Image(systemName: "arrow.up.left.and.arrow.down.right")
                 }
                 .buttonStyle(.plain)
-                .help("打开独立日志窗口")
+                .help("放大到整个面板")
+            }
+
+            if let onClose {
+                Button(action: onClose) {
+                    Image(systemName: "arrow.down.right.and.arrow.up.left")
+                }
+                .buttonStyle(.plain)
+                .help("收起")
             }
 
             Spacer(minLength: 0)
@@ -79,18 +85,25 @@ struct LogPane: View {
     private var list: some View {
         ScrollViewReader { proxy in
             ScrollView {
-                LazyVStack(alignment: .leading, spacing: 1) {
+                // No inter-row spacing: monospace lines already have their own
+                // leading, and every point saved here is another route line the
+                // operator can see without scrolling.
+                LazyVStack(alignment: .leading, spacing: 0) {
                     if tunnel.visibleLogLines.isEmpty {
                         Text(emptyText)
-                            .font(.system(size: 11, design: .monospaced))
+                            .font(.system(size: 10.5, design: .monospaced))
                             .foregroundStyle(.tertiary)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.vertical, 8)
                     } else {
                         ForEach(tunnel.visibleLogLines) { line in
                             Text(line.text)
-                                .font(.system(size: 11, design: .monospaced))
-                                .foregroundStyle(color(for: line.text))
+                                // 10.5pt monospace fits a whole route line
+                                // (`17:26:44 route www.google.com:443 -> Proxy (whitelist)`)
+                                // in the ~340pt of log width the popover leaves;
+                                // at 11pt the routing verdict fell off the end.
+                                .font(.system(size: 10.5, design: .monospaced))
+                                .foregroundStyle(color(for: line))
                                 // One physical line per entry: wrapping pushed
                                 // the useful part of a route decision out of view.
                                 .lineLimit(1)
@@ -101,8 +114,8 @@ struct LogPane: View {
                         }
                     }
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 8)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
             }
             .background(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
@@ -130,59 +143,36 @@ struct LogPane: View {
         return tunnel.isRunning ? "等待日志…" : "连接后在这里查看实时日志"
     }
 
-    private func color(for line: String) -> Color {
-        if line.contains("ERROR") || line.contains("error") || line.contains("Error") {
-            return Color(nsColor: .systemRed)
+    /// Severity comes from the parsed level rather than a substring search:
+    /// the token is stripped from the text so the route itself fits on one line.
+    private func color(for line: LogLine) -> Color {
+        switch line.level {
+        case .error: return Color(nsColor: .systemRed)
+        case .warn: return Color(nsColor: .systemOrange)
+        case .info, .other:
+            // Direct flows are the boring majority; keep them visually quieter
+            // than proxied ones so a scan finds the tunnel traffic first.
+            return LogRoute.isDirect(line.text) ? .secondary : .primary
         }
-        if line.contains("WARN") || line.contains("warn") {
-            return Color(nsColor: .systemOrange)
-        }
-        if line.contains("-> Direct (") {
-            return .secondary
-        }
-        if line.contains("INFO") {
-            return .primary
-        }
-        return .primary.opacity(0.85)
     }
 }
 
-/// The log card inside the main window: fills the height the window gives it.
+/// The log card inside the popover: fills the height the layout gives it.
 struct LogCard: View {
     @ObservedObject var tunnel: PhantomTunnel
     let height: CGFloat
+    var onExpand: (() -> Void)?
 
     var body: some View {
-        Card {
-            LogPane(tunnel: tunnel, isCard: true)
+        // Tighter than the default card: a monospace block does not need 14pt
+        // of padding on every side, and the frame is fixed here anyway.
+        Card(padding: 10) {
+            LogPane(tunnel: tunnel, onExpand: onExpand)
         }
         .frame(height: height)
-        .padding(.horizontal, Theme.pagePadding)
-        .padding(.bottom, 6)
-    }
-}
-
-/// Dedicated, resizable log window — the "放大" target.
-struct LogWindowView: View {
-    @ObservedObject var tunnel: PhantomTunnel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack(spacing: 8) {
-                Text("Phantom 日志")
-                    .font(.system(size: 15, weight: .semibold))
-                Text(tunnel.link.valid ? linkAddress(tunnel.link) : "未配置连接")
-                    .font(.system(size: 12))
-                    .foregroundStyle(.secondary)
-                Spacer(minLength: 0)
-                Text(tunnel.logPaused ? "已暂停" : tunnel.state.title)
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(Theme.accent(tunnel.state))
-            }
-
-            LogPane(tunnel: tunnel, isCard: false)
-        }
-        .padding(Theme.pagePadding)
-        .frame(minWidth: 560, minHeight: 360)
+        // Narrower than the cards' page padding: the log is text, not a card
+        // you read across, and those 4pt buy a character of line width.
+        .padding(.horizontal, 12)
+        .padding(.bottom, 4)
     }
 }

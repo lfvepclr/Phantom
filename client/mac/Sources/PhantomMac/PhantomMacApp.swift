@@ -45,28 +45,12 @@ private func setupCrashLogger() {
 }
 
 // MARK: - Window plumbing
-
-enum WindowID {
-    static let main = "main"
-    static let logs = "logs"
-}
-
-/// Bridges "open a window" out of the SwiftUI environment so the termination /
-/// launch hooks (which are not views) can trigger it too.
-@MainActor
-final class WindowBridge {
-    static let shared = WindowBridge()
-    var openMain: (() -> Void)?
-    var openLogs: (() -> Void)?
-
-    func showMain() {
-        openMain?()
-    }
-
-    func showLogs() {
-        openLogs?()
-    }
-}
+//
+// There is exactly one window now: the menu-bar popover. The logs used to live
+// in a second window, which needed a registry of concrete `NSWindow`s just to
+// raise it (`openWindow(id:)` is a no-op for an already-open window) and could
+// still end up stuck behind another app. Folding the log into the popover
+// removed both the window and the problem.
 
 /// Owns the process-level lifecycle.
 ///
@@ -78,26 +62,31 @@ final class WindowBridge {
 final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupCrashLogger()
-        // First run: with no connection configured there is nothing to see in
-        // the menu bar, so open the window that explains what to do.
-        guard PhantomTunnel.shared.serverURI.isEmpty else { return }
-        // The opener is published by the menu bar label the first time it
-        // appears, which can land after this hook — retry briefly instead of
-        // silently doing nothing on a fresh install.
-        openMainWindowWhenAvailable(attemptsLeft: 8)
-    }
-
-    private func openMainWindowWhenAvailable(attemptsLeft: Int) {
-        guard attemptsLeft > 0 else { return }
+        // There is no main window to open any more — the UI lives in the menu
+        // bar popover, which cannot be opened programmatically. A fresh install
+        // would otherwise look like nothing happened at all, so say once what
+        // the icon is and where to click.
+        guard PhantomTunnel.shared.serverURI.isEmpty,
+              !UserDefaults.standard.bool(forKey: Self.onboardedKey) else { return }
         Task { @MainActor in
-            try? await Task.sleep(for: .milliseconds(500))
-            if WindowBridge.shared.openMain == nil {
-                self.openMainWindowWhenAvailable(attemptsLeft: attemptsLeft - 1)
-            } else {
-                WindowBridge.shared.showMain()
+            // Let the menu bar item appear first: an alert that beats its own
+            // icon to the screen is confusing.
+            try? await Task.sleep(for: .milliseconds(800))
+            let alert = NSAlert()
+            alert.messageText = "Phantom 已在菜单栏运行"
+            alert.informativeText = "点击菜单栏的幽灵图标即可打开面板、粘贴连接串并启动隧道。"
+            alert.addButton(withTitle: "知道了")
+            alert.showsSuppressionButton = true
+            alert.suppressionButton?.title = "不再提示"
+            alert.runModal()
+            if alert.suppressionButton?.state == .on {
+                UserDefaults.standard.set(true, forKey: Self.onboardedKey)
             }
         }
     }
+
+    /// Set once the user has seen (and dismissed) the first-run explanation.
+    private static let onboardedKey = "phantom.onboarded"
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         PhantomTunnel.shared.shutdown()
@@ -117,32 +106,22 @@ struct PhantomMacApp: App {
     }
 
     var body: some Scene {
-        // The menu bar owns status + quick switches only; the real UI lives in
-        // resizable windows, where the log pane finally has room to breathe.
+        // The dashboard *is* the menu bar popover: one click to see the state,
+        // one click to start or stop. Everything that is not a daily control
+        // is a page pushed inside the popover, and the log keeps whatever height
+        // is left.
         MenuBarExtra {
-            QuickMenu(tunnel: tunnel)
+            DashboardPopover(tunnel: tunnel)
         } label: {
             MenuBarLabel(tunnel: tunnel)
         }
-        .menuBarExtraStyle(.menu)
-
-        Window("Phantom", id: WindowID.main) {
-            MainWindowView(tunnel: tunnel)
-        }
-        .defaultSize(width: 460, height: 780)
-        .windowResizability(.contentMinSize)
+        .menuBarExtraStyle(.window)
         .commands {
             CommandGroup(replacing: .appTermination) {
                 Button("退出 Phantom") { NSApp.terminate(nil) }
                     .keyboardShortcut("q", modifiers: .command)
             }
         }
-
-        Window("Phantom 日志", id: WindowID.logs) {
-            LogWindowView(tunnel: tunnel)
-        }
-        .defaultSize(width: 760, height: 460)
-        .windowResizability(.contentMinSize)
     }
 }
 
@@ -154,61 +133,15 @@ struct PhantomMacApp: App {
 /// a coloured shape comes out as a flat blob. Shape differences survive.
 struct MenuBarLabel: View {
     @ObservedObject var tunnel: PhantomTunnel
-    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        Image(nsImage: MenuBarGlyph.image(for: tunnel.state))
-            .help("Phantom — \(tunnel.state.title)")
-            .onAppear {
-                WindowBridge.shared.openMain = {
-                    openWindow(id: WindowID.main)
-                    NSApp.activate()
-                }
-                WindowBridge.shared.openLogs = {
-                    openWindow(id: WindowID.logs)
-                    NSApp.activate()
-                }
-            }
-    }
-}
-
-// MARK: - Quick menu
-
-/// What a click on the menu bar icon offers: state, the one switch people use
-/// most, and the windows.
-struct QuickMenu: View {
-    @ObservedObject var tunnel: PhantomTunnel
-    @Environment(\.openWindow) private var openWindow
-
-    var body: some View {
-        Text("Phantom — \(tunnel.state.title)")
-        Text(tunnel.link.valid ? linkAddress(tunnel.link) : "未配置连接")
-        if tunnel.isRunning {
-            Text("↓ \(formatRate(tunnel.rates.downPerSecond))   ↑ \(formatRate(tunnel.rates.upPerSecond))")
-        }
-        Divider()
-
-        Button(tunnel.isRunning ? "断开连接" : "启动连接") {
-            tunnel.toggle()
-        }
-        .disabled(!tunnel.isRunning && tunnel.serverURI.isEmpty)
-
-        Divider()
-
-        Button("打开主界面") {
-            openWindow(id: WindowID.main)
-            NSApp.activate()
-        }
-        Button("日志窗口") {
-            openWindow(id: WindowID.logs)
-            NSApp.activate()
-        }
-
-        Divider()
-
-        Button("退出 Phantom") {
-            NSApp.terminate(nil)
-        }
-        .keyboardShortcut("q", modifiers: .command)
+        // A fresh install has no connection and no window to explain itself, so
+        // the icon carries a small dot until something is configured.
+        Image(nsImage: MenuBarGlyph.image(for: tunnel.state, needsAttention: !tunnel.link.valid))
+            .help(
+                tunnel.link.valid
+                    ? "Phantom — \(tunnel.state.title)"
+                    : "Phantom — 点击配置连接串"
+            )
     }
 }

@@ -16,13 +16,42 @@ public enum MenuBarGlyph {
     /// Canvas size in points; 18pt matches the other extras in the bar.
     public static let canvasSize = NSSize(width: 18, height: 18)
 
-    public static func image(for state: PhantomState, size: NSSize = canvasSize) -> NSImage {
+    /// - Parameter needsAttention: draws a small dot beside the ghost, used on
+    ///   a fresh install where nothing is configured yet. The popover cannot be
+    ///   opened programmatically, so the icon itself has to carry the hint that
+    ///   there is something to do here.
+    public static func image(
+        for state: PhantomState,
+        needsAttention: Bool = false,
+        size: NSSize = canvasSize
+    ) -> NSImage {
         let image = NSImage(size: size, flipped: false) { rect in
             draw(state: state, in: rect)
+            if needsAttention {
+                drawAttentionDot(in: rect)
+            }
             return true
         }
         image.isTemplate = true
         return image
+    }
+
+    /// A single solid dot in the bottom-right corner.
+    ///
+    /// Deliberately *not* the exclamation badge: that one means "error", and
+    /// "you have not configured anything yet" is not an error.
+    private static func drawAttentionDot(in rect: NSRect) {
+        let radius = rect.width * 0.13
+        let centre = NSPoint(x: rect.maxX - radius - 0.5, y: rect.minY + radius + 0.5)
+        NSColor.black.setFill()
+        NSBezierPath(
+            ovalIn: NSRect(
+                x: centre.x - radius,
+                y: centre.y - radius,
+                width: radius * 2,
+                height: radius * 2
+            )
+        ).fill()
     }
 
     /// Ghost silhouette in `rect`: semicircular head, straight flanks and a
