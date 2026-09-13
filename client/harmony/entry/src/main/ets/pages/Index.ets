@@ -1,9 +1,10 @@
 import { promptAction, router } from '@kit.ArkUI';
-import { common, Want } from '@kit.AbilityKit';
+import { bundleManager, common, Want } from '@kit.AbilityKit';
 import { vpnExtension } from '@kit.NetworkKit';
 import { preferences, uniformTypeDescriptor as utd } from '@kit.ArkData';
 import { BusinessError, pasteboard } from '@kit.BasicServicesKit';
 import { systemShare } from '@kit.ShareKit';
+import { fileIo as fs, fileUri } from '@kit.CoreFileKit';
 import {
   PHANTOM_BUNDLE,
   PHANTOM_VPN_ABILITY,
@@ -13,6 +14,7 @@ import {
   clearLog,
   clearNetworkChange,
   clearStats,
+  logFilePath,
   publishStart,
   publishStatus,
   readLogTail,
@@ -20,7 +22,9 @@ import {
   readStats,
   readStatus,
   traceFilePath,
+  publishUserRules,
 } from '../common/VpnBridge';
+import { RuleFormat, RuleKind, RuleRow, ruleKindLabel } from '../common/RuleFormat';
 import {
   ServerHistoryEntry,
   ServerLink,
@@ -36,7 +40,7 @@ import {
 } from '../common/ServerLink';
 import { LatencyResult, SpeedResult, probeLatency, runSpeedTest } from '../common/TunnelProbe';
 import { ServerPage } from './ServerPage';
-import { Theme } from '../common/Theme';
+import { Theme, ThemeMode, applyThemeMode } from '../common/Theme';
 
 /// One entry of the routing-mode segment control.
 interface ModeOption {
@@ -51,6 +55,21 @@ const MODES: ModeOption[] = [
   { key: 'direct', label: '直连', hint: '全部直连（相当于关闭分流）' },
 ];
 
+/// `versionName` of this app, or "" when the bundle query is unavailable.
+///
+/// Read through `bundleManager` rather than hardcoded so the settings sheet
+/// can never drift from what was actually installed.
+function readAppVersion(): string {
+  try {
+    const info: bundleManager.BundleInfo =
+      bundleManager.getBundleInfoForSelfSync(bundleManager.BundleFlag.GET_BUNDLE_INFO_WITH_APPLICATION);
+    return info.versionName;
+  } catch (e) {
+    console.warn('[Phantom] version lookup failed: ' + JSON.stringify(e));
+    return '';
+  }
+}
+
 /// Structured view of the connection, shown in the detail sheet.
 ///
 /// This lives in its own component on purpose: a `bindSheet` builder rendered
@@ -61,7 +80,7 @@ const MODES: ModeOption[] = [
 struct ServerInfoPanel {
   @Prop name: string = '';
   @Prop status: string = '';
-  @Prop statusColor: string = Theme.textSecondary;
+  @Prop statusColor: ResourceColor = Theme.textSecondary;
   @Prop host: string = '';
   @Prop port: number = 0;
   @Prop proto: string = '';
@@ -82,12 +101,10 @@ struct ServerInfoPanel {
   @Prop speedResult: string = '';
   @Prop latencyBusy: boolean = false;
   @Prop speedBusy: boolean = false;
-  @Prop tunTrace: boolean = false;
   onProbeLatency: () => void = () => {};
   onProbeSpeed: () => void = () => {};
   onCopy: () => void = () => {};
   onShare: () => void = () => {};
-  onToggleTrace: (value: boolean) => void = () => {};
 
   @Builder
   row(label: string, value: string) {
@@ -208,29 +225,8 @@ struct ServerInfoPanel {
         .width('100%')
         .enabled(this.configured)
 
-        Row() {
-          Column({ space: 2 }) {
-            Text('记录 TUN 追踪')
-              .fontSize(14)
-              .fontColor(Theme.textPrimary)
-            Text('排查 Google 等应用卡住时用；重启隧道后生效')
-              .fontSize(11)
-              .fontColor(Theme.textTertiary)
-          }
-          .layoutWeight(1)
-          .alignItems(HorizontalAlign.Start)
-
-          Toggle({ type: ToggleType.Switch, isOn: this.tunTrace })
-            .selectedColor(Theme.brand)
-            .onChange((isOn: boolean) => {
-              this.onToggleTrace(isOn);
-            })
-        }
-        .width('100%')
-        .padding({ top: 6 })
-
-        Divider().color(Theme.divider).margin({ top: 4, bottom: 4 })
-
+        // The trace toggle moved to the settings sheet: it is a diagnostic
+        // switch, not part of what this connection *is*.
         // Sharing lives here rather than on the dashboard: the quick link is
         // something you hand to another device occasionally, not a daily
         // control, and the QR code needs the room.
@@ -293,11 +289,16 @@ const AUTH_HINT_AFTER_MS: number = 4000;
 /// does not hit the disk on every keystroke.
 const SAVE_DEBOUNCE_MS: number = 600;
 
-/// The VPN extension publishes its state once a second. If that heartbeat stops
-/// (process killed, VPN torn down from Settings, device rebooted) the status
-/// file keeps its last value — treat it as stale instead of showing a tunnel
-/// that no longer exists.
-const STATUS_STALE_AFTER_MS: number = 5000;
+/// The VPN extension republishes its state on every change, and otherwise only
+/// refreshes the timestamp every `STATUS_HEARTBEAT_MS` (3 s, see
+/// `common/VpnBridge.ets`). If that heartbeat stops (process killed, VPN torn
+/// down from Settings, device rebooted) the status file keeps its last value —
+/// treat it as stale instead of showing a tunnel that no longer exists.
+///
+/// The window must cover several missed heartbeats, which is why it is three
+/// heartbeat periods rather than one: too tight a window would declare a
+/// merely-delayed heartbeat dead and fire a needless auto-reconnect.
+const STATUS_STALE_AFTER_MS: number = 9000;
 
 /// The extension only rewrites the counter file when a counter actually moved,
 /// so a snapshot older than this means "the tunnel is idle": the live rate has
@@ -353,6 +354,92 @@ function stampOf(line: string): string {
 function messageOf(line: string): string {
   const stamp = stampOf(line);
   return stamp.length === 0 ? line : line.substring(9);
+}
+
+const LOG_LEVEL_TOKENS: string[] = ['INFO', 'WARN', 'ERROR', 'DEBUG', 'TRACE'];
+
+/// Tokens that only ever appear on a line whose flow went straight out.
+///
+/// Matched case-insensitively: the TUN datapath writes `-> Direct (` while the
+/// SOCKS5/HTTP listeners write `-> DIRECT (`, and matching only the first
+/// spelling made the "tunnel only" switch a no-op for those flows.
+const LOG_DIRECT_TOKENS: string[] = [
+  '-> direct (',
+  'direct connection established',
+  'direct connect failed',
+  'direct http resolve failed',
+  'direct http connect failed',
+  'direct http connection established',
+  'flow end (direct)',
+];
+
+/// A proxied verdict is never direct, whatever its reason text mentions.
+const LOG_PROXY_TOKENS: string[] = ['-> proxy ('];
+
+/// `INFO route …` -> `route …`, so matching does not have to know the level.
+function logBody(message: string): string {
+  for (const token of LOG_LEVEL_TOKENS) {
+    if (message.startsWith(token + ' ')) {
+      return message.substring(token.length + 1).trim();
+    }
+  }
+  return message;
+}
+
+function isDirectLogLine(message: string): boolean {
+  const lower = message.toLowerCase();
+  for (const token of LOG_PROXY_TOKENS) {
+    if (lower.includes(token)) {
+      return false;
+    }
+  }
+  for (const token of LOG_DIRECT_TOKENS) {
+    if (lower.includes(token)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/// `<target>` out of `route <target> -> …`, or '' when the line is not one.
+function routeTargetOf(body: string): string {
+  const arrow = body.indexOf(' -> ');
+  if (arrow < 0) {
+    return '';
+  }
+  const head = body.substring(0, arrow);
+  const keyword = head.lastIndexOf('route ');
+  if (keyword < 0) {
+    return '';
+  }
+  return head.substring(keyword + 6);
+}
+
+/// The target of a `route <target> -> Direct (…)` line, or '' when there is none.
+function directTargetOf(message: string): string {
+  if (!isDirectLogLine(message)) {
+    return '';
+  }
+  return routeTargetOf(logBody(message));
+}
+
+/// The target of a request banner (`SOCKS5 target: …`, `HTTP CONNECT → …`).
+///
+/// Those lines are written *before* the routing verdict, so on their own they
+/// cannot say which way the flow went; the pane decides that by looking up the
+/// verdict that follows.
+function bannerTargetOf(message: string): string {
+  const body = logBody(message);
+  const prefixes: string[] = ['SOCKS5 target: ', 'HTTP CONNECT → ', 'HTTP proxy → '];
+  for (const prefix of prefixes) {
+    if (!body.startsWith(prefix)) {
+      continue;
+    }
+    const rest = body.substring(prefix.length);
+    const end = rest.indexOf(' (');
+    return end < 0 ? rest : rest.substring(0, end);
+  }
+  return '';
 }
 
 /// `3 天前`, or '' when the entry has never been used.
@@ -414,6 +501,10 @@ struct Index {
   @State showInfo: boolean = false;
   /// `false` = 连接 panel, `true` = 服务端 panel (was the bottom tab bar).
   @State showServer: boolean = false;
+  /// Settings sheet: theme, diagnostics and the things that are not a daily
+  /// control. Kept off the dashboard so the dashboard stays about the tunnel.
+  @State showSettings: boolean = false;
+  @State themeMode: string = ThemeMode.SYSTEM;
   /// Log pane blown up to the whole page; toggled by the expand icon.
   @State logFull: boolean = false;
   @State latency: string = '';
@@ -453,10 +544,23 @@ struct Index {
   private lastUri: string = '';
   @State logLines: string[] = [];
   @State link: ServerLink = emptyLink();
+  /// `versionName` from the bundle, shown in the settings sheet. Read once at
+  /// startup: it cannot change while the process lives.
+  @State appVersion: string = '';
+  /// User whitelist rules in wire format (one `kind:value` per line).
+  @State userRules: string = '';
+  /// Draft line being typed in the whitelist editor, and why it was refused.
+  @State ruleDraft: string = '';
+  @State ruleError: string = '';
+  @State showRuleRange: boolean = false;
+  @State ruleRangeFrom: string = '';
+  @State ruleRangeTo: string = '';
+  @State ruleRangeError: string = '';
 
   aboutToAppear(): void {
     const ctx = getContext(this) as common.UIAbilityContext;
     this.filesDir = ctx.filesDir;
+    this.appVersion = readAppVersion();
     try {
       const prefs = preferences.getPreferencesSync(ctx, { name: 'phantom_ui' });
       const savedUri = prefs.getSync('serverUri', '') as string;
@@ -464,6 +568,8 @@ struct Index {
       const savedShowDirect = prefs.getSync('showDirectLogs', false) as boolean;
       const savedTrace = prefs.getSync('tunTrace', false) as boolean;
       const savedHistory = prefs.getSync('serverHistory', '') as string;
+      const savedTheme = prefs.getSync('themeMode', ThemeMode.SYSTEM) as string;
+      const savedRules = prefs.getSync('userRules', '') as string;
       if (savedUri.length > 0) {
         this.serverUri = savedUri;
       }
@@ -472,6 +578,11 @@ struct Index {
       }
       this.showDirectLogs = savedShowDirect;
       this.tunTrace = savedTrace;
+      this.themeMode = ThemeMode.OPTIONS.includes(savedTheme) ? savedTheme : ThemeMode.SYSTEM;
+      this.userRules = savedRules;
+      // Apply before the first frame is laid out, otherwise a user on dark mode
+      // sees one light flash on every launch.
+      applyThemeMode(ctx, this.themeMode);
       this.history = parseHistory(savedHistory);
       this.link = parseServerUri(this.serverUri);
       // Nothing stored yet but a URI exists (older versions saved only the
@@ -491,10 +602,22 @@ struct Index {
     this.startPolling();
   }
 
-  /// Runs when returning from the scanner: pick up the URI it persisted.
+  /// Runs when this page becomes visible again — returning from the scanner or
+  /// the server page, or coming back from the background. Pick up whatever the
+  /// other page persisted, repaint immediately, then resume watching.
   onPageShow(): void {
     this.reloadPreferences();
     this.refresh();
+    this.startPolling();
+  }
+
+  /// Runs when a cover page is pushed on top of this one, or the app leaves the
+  /// foreground. The tunnel itself lives in the extension process and keeps
+  /// running, so there is nothing to watch while this page cannot be seen —
+  /// stop the 500 ms loop instead of burning UI-thread wake-ups behind a page
+  /// nobody is looking at.
+  onPageHide(): void {
+    this.stopPolling();
   }
 
   aboutToDisappear(): void {
@@ -553,7 +676,9 @@ struct Index {
       prefs.putSync('proxyMode', this.proxyMode);
       prefs.putSync('showDirectLogs', this.showDirectLogs);
       prefs.putSync('tunTrace', this.tunTrace);
+      prefs.putSync('themeMode', this.themeMode);
       prefs.putSync('serverHistory', serializeHistory(this.history));
+      prefs.putSync('userRules', this.userRules);
       prefs.flush();
     } catch (e) {
       console.warn('[Phantom] save preferences failed: ' + JSON.stringify(e));
@@ -569,6 +694,55 @@ struct Index {
     } catch (e) {
       console.warn('[Phantom] persist history failed: ' + JSON.stringify(e));
     }
+  }
+
+  /// Replace the user whitelist rules and hand them to the extension process.
+  ///
+  /// Written straight away rather than only at start time: the rules must
+  /// survive even if the app is killed before the user reconnects. They only
+  /// take effect on the next start, because routing state is built once per
+  /// connection — hence the note shown under the editor.
+  private setUserRules(rows: string[]): void {
+    this.userRules = rows.join('\n');
+    this.savePreferences();
+    if (this.filesDir.length > 0) {
+      publishUserRules(this.filesDir, this.userRules);
+    }
+  }
+
+  private ruleRows(): RuleRow[] {
+    return RuleFormat.fromWire(this.userRules);
+  }
+
+  private addRule(): void {
+    const parsed = RuleFormat.parse(this.ruleDraft);
+    if (!parsed.ok) {
+      this.ruleError = parsed.reason;
+      return;
+    }
+    // A duplicate adds nothing and would only ever confuse the reader.
+    const rows = this.ruleRows();
+    if (rows.some((row) => row.kind === parsed.kind && row.value === parsed.value)) {
+      this.ruleDraft = '';
+      this.ruleError = '';
+      return;
+    }
+    this.setUserRules(this.userRules.length > 0 ? this.userRules + '\n' + parsed.wire : parsed.wire);
+    this.ruleDraft = '';
+    this.ruleError = '';
+  }
+
+  private addRuleRange(): void {
+    const cidrs = RuleFormat.ipRangeToCidrs(this.ruleRangeFrom, this.ruleRangeTo);
+    if (cidrs === null) {
+      this.ruleRangeError = '请填写合法且顺序正确的 IPv4 起止地址';
+      return;
+    }
+    this.ruleRangeError = '';
+    const existing = this.userRules.length > 0 ? this.userRules + '\n' : '';
+    this.setUserRules(existing + cidrs.join('\n'));
+    this.ruleRangeFrom = '';
+    this.ruleRangeTo = '';
   }
 
   /// Remember a connection that was just used, so it appears in the dropdown.
@@ -788,6 +962,17 @@ struct Index {
   private visibleLogLines(text: string): string[] {
     const raw = text.length === 0 ? [] : text.split('\n');
     const out: string[] = [];
+    // A banner is logged before its verdict, so every verdict has to be known
+    // up front before any banner can be judged.
+    const directTargets = new Set<string>();
+    if (!this.showDirectLogs) {
+      for (const line of raw) {
+        const target = directTargetOf(messageOf(line));
+        if (target.length > 0) {
+          directTargets.add(target);
+        }
+      }
+    }
     let prevMessage = '';
     let prevStamp = '';
     let repeat = 0;
@@ -797,8 +982,14 @@ struct Index {
       }
       const stamp = stampOf(line);
       const message = messageOf(line);
-      if (!this.showDirectLogs && message.includes('-> Direct (')) {
-        continue;
+      if (!this.showDirectLogs) {
+        if (isDirectLogLine(message)) {
+          continue;
+        }
+        const banner = bannerTargetOf(message);
+        if (banner.length > 0 && directTargets.has(banner)) {
+          continue;
+        }
       }
       if (message === prevMessage && out.length > 0) {
         repeat++;
@@ -832,7 +1023,7 @@ struct Index {
     }
   }
 
-  private statusColor(): string {
+  private statusColor(): ResourceColor {
     switch (this.statusCode) {
       case VpnStatus.Running: return Theme.success;
       case VpnStatus.Error: return Theme.danger;
@@ -841,7 +1032,7 @@ struct Index {
     }
   }
 
-  private statusBackground(): string {
+  private statusBackground(): ResourceColor {
     switch (this.statusCode) {
       case VpnStatus.Running: return Theme.successSoft;
       case VpnStatus.Error: return Theme.dangerSoft;
@@ -998,6 +1189,46 @@ struct Index {
     }
   }
 
+  /// Hand the session log — or, when only the trace was enabled, that — to the
+  /// system share panel.
+  ///
+  /// Both files sit in the app sandbox, so they are exported by URI: the
+  /// receiving app gets a one-shot grant instead of a path it could not open.
+  private exportLogs(): void {
+    const candidates: string[] = [logFilePath(this.filesDir), traceFilePath(this.filesDir)];
+    let path: string = '';
+    for (const candidate of candidates) {
+      if (fs.accessSync(candidate)) {
+        path = candidate;
+        break;
+      }
+    }
+    if (path.length === 0) {
+      promptAction.showToast({ message: '还没有可导出的日志' });
+      return;
+    }
+    try {
+      const data = new systemShare.SharedData({
+        utd: utd.UniformDataType.FILE,
+        uri: fileUri.getUriFromPath(path),
+        title: 'Phantom 日志',
+        description: 'Phantom 会话日志 / TUN 追踪',
+      });
+      const controller = new systemShare.ShareController(data);
+      const ctx = getContext(this) as common.UIAbilityContext;
+      controller.show(ctx, {
+        selectionMode: systemShare.SelectionMode.SINGLE,
+        previewMode: systemShare.SharePreviewMode.DEFAULT,
+      }).catch((e: BusinessError) => {
+        console.warn('[Phantom] log share failed: ' + JSON.stringify(e));
+        promptAction.showToast({ message: '导出失败: ' + e.code });
+      });
+    } catch (e) {
+      console.warn('[Phantom] log share threw: ' + JSON.stringify(e));
+      promptAction.showToast({ message: '导出失败' });
+    }
+  }
+
   private async measureLatency(): Promise<void> {
     if (this.latencyBusy) {
       return;
@@ -1062,6 +1293,20 @@ struct Index {
     promptAction.showToast({
       message: isOn ? '已开启追踪，重启隧道后写入 ' + traceFilePath(this.filesDir) : '已关闭追踪',
     });
+  }
+
+  /// Three-way appearance choice: system (the default), light, or dark.
+  ///
+  /// Applied through the ability's colour mode rather than a second palette, so
+  /// every page — including the ones already laid out behind the sheet — flips
+  /// at the same moment.
+  private setThemeMode(mode: string): void {
+    if (this.themeMode === mode) {
+      return;
+    }
+    this.themeMode = mode;
+    this.savePreferences();
+    applyThemeMode(getContext(this) as common.UIAbilityContext, mode);
   }
 
   // -------------------------------------------------------------------------
@@ -1432,13 +1677,273 @@ struct Index {
       speedResult: this.speedResult,
       latencyBusy: this.latencyBusy,
       speedBusy: this.speedBusy,
-      tunTrace: this.tunTrace,
       onProbeLatency: () => { this.measureLatency(); },
       onProbeSpeed: () => { this.measureSpeed(); },
       onCopy: () => { this.copyUri(); },
       onShare: () => { this.shareUri(); },
-      onToggleTrace: (value: boolean) => { this.toggleTrace(value); },
     })
+  }
+
+  /// Settings: appearance, diagnostics, and what the built-in whitelist means.
+  ///
+  /// The dashboard has no room for any of it, and none of it is a per-session
+  /// decision — putting it behind the gear keeps the main page about the tunnel.
+  @Builder
+  settingsSheet() {
+    Scroll() {
+      Column({ space: 14 }) {
+        Text('设置')
+          .fontSize(20)
+          .fontWeight(FontWeight.Bold)
+          .fontColor(Theme.textPrimary)
+          .width('100%')
+
+        Text('外观')
+          .fontSize(13)
+          .fontColor(Theme.textSecondary)
+          .width('100%')
+        Row({ space: 8 }) {
+          ForEach(ThemeMode.OPTIONS, (option: string) => {
+            Text(ThemeMode.label(option))
+              .layoutWeight(1)
+              .height(34)
+              .textAlign(TextAlign.Center)
+              .fontSize(13)
+              .fontWeight(this.themeMode === option ? FontWeight.Medium : FontWeight.Normal)
+              .fontColor(this.themeMode === option ? Theme.onBrand : Theme.textSecondary)
+              .backgroundColor(this.themeMode === option ? Theme.brand : Theme.surfaceAlt)
+              .borderRadius(Theme.radiusChip)
+              .onClick(() => { this.setThemeMode(option); })
+          }, (option: string) => option)
+        }
+        .width('100%')
+
+        Divider().color(Theme.divider)
+
+        Row() {
+          Column({ space: 2 }) {
+            Text('记录 TUN 追踪')
+              .fontSize(14)
+              .fontColor(Theme.textPrimary)
+            Text('排查 Google 等应用卡住时用；重启隧道后生效')
+              .fontSize(11)
+              .fontColor(Theme.textTertiary)
+          }
+          .layoutWeight(1)
+          .alignItems(HorizontalAlign.Start)
+
+          Toggle({ type: ToggleType.Switch, isOn: this.tunTrace })
+            .selectedColor(Theme.brand)
+            .onChange((isOn: boolean) => { this.toggleTrace(isOn); })
+        }
+        .width('100%')
+
+        Divider().color(Theme.divider)
+
+        Text('分流白名单')
+          .fontSize(14)
+          .fontColor(Theme.textPrimary)
+          .width('100%')
+        Text('内置被墙域名清单始终生效，这里追加的条目优先于它。' +
+          '支持精确域名、通配（*.example.com）、关键字、正则与 IP 网段。')
+          .fontSize(11)
+          .fontColor(Theme.textTertiary)
+          .width('100%')
+
+        TextInput({ text: this.ruleDraft, placeholder: 'example.com 或 *.example.com' })
+          .fontSize(13)
+          .fontColor(Theme.textPrimary)
+          .backgroundColor(Theme.surface)
+          .borderRadius(Theme.radiusCard)
+          .padding(10)
+          .width('100%')
+          .onChange((value: string) => {
+            this.ruleDraft = value;
+            // Refuse as the user types: a rule the core would drop should say
+            // so here, not after a reconnect that quietly ignores it.
+            const parsed = RuleFormat.parse(value);
+            this.ruleError = parsed.ok ? '' : parsed.reason;
+          })
+
+        if (this.ruleError.length > 0) {
+          Text(this.ruleError)
+            .fontSize(11)
+            .fontColor(Theme.danger)
+            .width('100%')
+        }
+
+        Row({ space: 8 }) {
+          Text('添加')
+            .fontSize(13)
+            .fontColor(Theme.onBrand)
+            .backgroundColor(Theme.brand)
+            .borderRadius(Theme.radiusChip)
+            .padding({ left: 14, right: 14, top: 7, bottom: 7 })
+            .onClick(() => { this.addRule(); })
+          Text(this.showRuleRange ? '收起 IP 段' : '按 IP 段添加')
+            .fontSize(13)
+            .fontColor(Theme.textSecondary)
+            .backgroundColor(Theme.surface)
+            .borderRadius(Theme.radiusChip)
+            .padding({ left: 14, right: 14, top: 7, bottom: 7 })
+            .onClick(() => { this.showRuleRange = !this.showRuleRange; })
+        }
+        .width('100%')
+
+        if (this.showRuleRange) {
+          Row({ space: 8 }) {
+            TextInput({ text: this.ruleRangeFrom, placeholder: '起始 IP' })
+              .fontSize(12)
+              .backgroundColor(Theme.surface)
+              .borderRadius(Theme.radiusCard)
+              .padding(8)
+              .layoutWeight(1)
+              .onChange((value: string) => { this.ruleRangeFrom = value.trim(); })
+            Text('—').fontSize(12).fontColor(Theme.textTertiary)
+            TextInput({ text: this.ruleRangeTo, placeholder: '结束 IP' })
+              .fontSize(12)
+              .backgroundColor(Theme.surface)
+              .borderRadius(Theme.radiusCard)
+              .padding(8)
+              .layoutWeight(1)
+              .onChange((value: string) => { this.ruleRangeTo = value.trim(); })
+          }
+          .width('100%')
+
+          if (this.ruleRangeError.length > 0) {
+            Text(this.ruleRangeError)
+              .fontSize(11)
+              .fontColor(Theme.danger)
+              .width('100%')
+          }
+
+          Text('添加网段')
+            .fontSize(13)
+            .fontColor(Theme.textSecondary)
+            .backgroundColor(Theme.surface)
+            .borderRadius(Theme.radiusChip)
+            .padding({ left: 14, right: 14, top: 7, bottom: 7 })
+            .onClick(() => { this.addRuleRange(); })
+        }
+
+        if (this.ruleRows().length === 0) {
+          Text('还没有自定义条目')
+            .fontSize(12)
+            .fontColor(Theme.textTertiary)
+            .width('100%')
+        } else {
+          ForEach(this.ruleRows(), (row: RuleRow, index: number) => {
+            Row({ space: 8 }) {
+              Text(ruleKindLabel(row.kind))
+                .fontSize(11)
+                .fontColor(Theme.brand)
+                .width(56)
+              Text(row.value)
+                .fontSize(13)
+                .fontFamily('monospace')
+                .fontColor(Theme.textPrimary)
+                .layoutWeight(1)
+                .maxLines(1)
+                .textOverflow({ overflow: TextOverflow.Ellipsis })
+              Text('删除')
+                .fontSize(12)
+                .fontColor(Theme.textSecondary)
+                .padding({ left: 6, right: 6 })
+                .onClick(() => {
+                  this.setUserRules(this.userRules.split('\n')
+                    .filter((_, i) => i !== index));
+                })
+            }
+            .width('100%')
+          }, (row: RuleRow) => row.kind + ':' + row.value)
+        }
+
+        Text('改动在下次连接时生效')
+          .fontSize(11)
+          .fontColor(Theme.textTertiary)
+          .width('100%')
+
+        Divider().color(Theme.divider)
+
+        Text('诊断')
+          .fontSize(14)
+          .fontColor(Theme.textPrimary)
+          .width('100%')
+        Row({ space: 8 }) {
+          Text('导出日志')
+            .fontSize(13)
+            .fontColor(Theme.onBrand)
+            .backgroundColor(Theme.brand)
+            .borderRadius(Theme.radiusChip)
+            .padding({ left: 14, right: 14, top: 7, bottom: 7 })
+            .onClick(() => { this.exportLogs(); })
+          Text('清空连接历史')
+            .fontSize(13)
+            .fontColor(Theme.textSecondary)
+            .backgroundColor(Theme.surface)
+            .borderRadius(Theme.radiusChip)
+            .padding({ left: 14, right: 14, top: 7, bottom: 7 })
+            .onClick(() => { this.clearHistory(); })
+          Text('会话日志优先，缺省时导出 TUN 追踪')
+            .fontSize(11)
+            .fontColor(Theme.textTertiary)
+            .layoutWeight(1)
+        }
+        .width('100%')
+
+        Divider().color(Theme.divider)
+
+        Text('诊断')
+          .fontSize(14)
+          .fontColor(Theme.textPrimary)
+          .width('100%')
+        Row({ space: 8 }) {
+          Text('导出日志')
+            .fontSize(13)
+            .fontColor(Theme.onBrand)
+            .backgroundColor(Theme.brand)
+            .borderRadius(Theme.radiusChip)
+            .padding({ left: 14, right: 14, top: 7, bottom: 7 })
+            .onClick(() => { this.exportLogs(); })
+          Text('会话日志优先，缺省时导出 TUN 追踪')
+            .fontSize(11)
+            .fontColor(Theme.textTertiary)
+            .layoutWeight(1)
+        }
+        .width('100%')
+
+        Divider().color(Theme.divider)
+
+        Text('关于')
+          .fontSize(14)
+          .fontColor(Theme.textPrimary)
+          .width('100%')
+        if (this.appVersion.length > 0) {
+          this.settingsRow('版本', this.appVersion)
+        }
+        this.settingsRow('隧道核心', 'Noise IK · AES-GCM / ChaCha20 / Ascon')
+        this.settingsRow('分流', '内置白名单（FST）+ 用户规则')
+      }
+      .width('100%')
+      .padding(Theme.pagePadding)
+    }
+    .width('100%')
+    .scrollBar(BarState.Off)
+  }
+
+  @Builder
+  settingsRow(label: string, value: string) {
+    Row({ space: 8 }) {
+      Text(label)
+        .fontSize(13)
+        .fontColor(Theme.textSecondary)
+        .width(88)
+      Text(value)
+        .fontSize(13)
+        .fontColor(Theme.textPrimary)
+        .layoutWeight(1)
+    }
+    .width('100%')
   }
 
   @Builder
@@ -1449,6 +1954,17 @@ struct Index {
         .fontWeight(FontWeight.Bold)
         .fontColor(Theme.textPrimary)
         .layoutWeight(1)
+
+      // Settings live behind an icon instead of a word: the top bar already
+      // carries the page switch, and a third text label would crowd it on a
+      // folded phone. The glyph is an image (not a font glyph) so it keeps the
+      // same weight as the other icons and tints with the theme.
+      Image($r('app.media.ic_settings'))
+        .width(20)
+        .height(20)
+        .fillColor(Theme.textSecondary)
+        .padding({ left: 6, right: 6 })
+        .onClick(() => { this.showSettings = true; })
 
       // Page switch. Replaces the bottom `Tabs` bar, which cost ~56 vp of
       // height plus the system navigation inset for two items — and the日志
@@ -1581,6 +2097,11 @@ struct Index {
       height: 640,
       showClose: true,
       onDisappear: () => { this.showInfo = false; },
+    })
+    .bindSheet(this.showSettings, this.settingsSheet(), {
+      height: 560,
+      showClose: true,
+      onDisappear: () => { this.showSettings = false; },
     })
   }
 

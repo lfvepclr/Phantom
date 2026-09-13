@@ -2,83 +2,83 @@
   "color": [
     {
       "name": "start_window_background",
-      "value": "#FFFFFF"
+      "value": "#101214"
     },
     {
       "name": "brand",
-      "value": "#0A59F7"
+      "value": "#4C8DFF"
     },
     {
       "name": "onBrand",
-      "value": "#FFFFFF"
+      "value": "#04121F"
     },
     {
       "name": "brandSoft",
-      "value": "#E8F0FE"
+      "value": "#16273F"
     },
     {
       "name": "success",
-      "value": "#1FA84C"
+      "value": "#43C06C"
     },
     {
       "name": "successSoft",
-      "value": "#E6F5EB"
+      "value": "#14301E"
     },
     {
       "name": "warning",
-      "value": "#E8A33D"
+      "value": "#EFAE4C"
     },
     {
       "name": "warningSoft",
-      "value": "#FDF3E3"
+      "value": "#34290F"
     },
     {
       "name": "danger",
-      "value": "#E84026"
+      "value": "#FF6B52"
     },
     {
       "name": "dangerSoft",
-      "value": "#FCEAE7"
+      "value": "#3A1A15"
     },
     {
       "name": "neutral",
-      "value": "#6B7785"
-    },
-    {
-      "name": "neutralSoft",
-      "value": "#EFF1F4"
-    },
-    {
-      "name": "canvas",
-      "value": "#F4F5F7"
-    },
-    {
-      "name": "surface",
-      "value": "#FFFFFF"
-    },
-    {
-      "name": "surfaceAlt",
-      "value": "#F1F3F5"
-    },
-    {
-      "name": "divider",
-      "value": "#14000000"
-    },
-    {
-      "name": "textPrimary",
-      "value": "#182431"
-    },
-    {
-      "name": "textSecondary",
-      "value": "#6B7785"
-    },
-    {
-      "name": "textTertiary",
       "value": "#9AA4AF"
     },
     {
+      "name": "neutralSoft",
+      "value": "#23272C"
+    },
+    {
+      "name": "canvas",
+      "value": "#101214"
+    },
+    {
+      "name": "surface",
+      "value": "#1A1D21"
+    },
+    {
+      "name": "surfaceAlt",
+      "value": "#23272C"
+    },
+    {
+      "name": "divider",
+      "value": "#1FFFFFFF"
+    },
+    {
+      "name": "textPrimary",
+      "value": "#E8EAED"
+    },
+    {
+      "name": "textSecondary",
+      "value": "#9AA4AF"
+    },
+    {
+      "name": "textTertiary",
+      "value": "#6B7785"
+    },
+    {
       "name": "codeSurface",
-      "value": "#F7F8FA"
+      "value": "#14171A"
     }
   ]
 }

@@ -2,6 +2,7 @@ import { promptAction } from '@kit.ArkUI';
 import { common } from '@kit.AbilityKit';
 import { pasteboard } from '@kit.BasicServicesKit';
 import phantomLib from 'libphantom_harmony.so';
+import { Theme } from '../common/Theme';
 
 /// Embedded-server page: run the Phantom server on this phone and share the
 /// generated phantom:// URI (text + QR) with client devices on the LAN.
@@ -15,17 +16,52 @@ export struct ServerPage {
   @State lastError: string = '';
   private timer: number = -1;
 
+  aboutToAppear(): void {
+    // The listener outlives this page, so it may already be up from an earlier
+    // visit — read once and resume watching if so.
+    this.resumeIfRunning();
+  }
+
+  onPageShow(): void {
+    this.resumeIfRunning();
+  }
+
+  /// Stop watching while another page covers this one.
+  onPageHide(): void {
+    this.stopPolling();
+  }
+
   aboutToDisappear(): void {
     this.stopPolling();
   }
 
+  /// One read, plus a poller only when there is something left to observe.
+  private resumeIfRunning(): void {
+    this.refresh();
+    if (this.isRunning()) {
+      this.startPolling();
+    }
+  }
+
+  /// Read the listener's state once (it lives in the extension process).
+  refresh(): void {
+    this.status = phantomLib.phantomHarmonyServerStatus();
+    if (this.status === 3) {
+      this.lastError = phantomLib.phantomHarmonyServerLastError();
+    }
+  }
+
   startPolling(): void {
-    this.stopPolling();
+    if (this.timer !== -1) {
+      return;
+    }
     this.timer = setInterval(() => {
       try {
-        this.status = phantomLib.phantomHarmonyServerStatus();
-        if (this.status === 3) {
-          this.lastError = phantomLib.phantomHarmonyServerLastError();
+        this.refresh();
+        // A stopped listener has no transition of its own to report; the start
+        // button drives the next one, so there is nothing left to poll for.
+        if (!this.isRunning()) {
+          this.stopPolling();
         }
       } catch (e) {
         console.error('[PhantomServer] poll error: ' + JSON.stringify(e));
@@ -90,6 +126,7 @@ export struct ServerPage {
       console.error('[PhantomServer] stop error: ' + JSON.stringify(e));
     }
     this.status = 0;
+    this.stopPolling();
   }
 
   copyUri(): void {
@@ -105,14 +142,16 @@ export struct ServerPage {
   @Builder
   cipherButton(label: string, value: string) {
     Button(label, { type: ButtonType.Capsule })
-      .backgroundColor(this.cipher === value ? '#007DFF' : '#999999')
+      .backgroundColor(this.cipher === value ? Theme.brand : Theme.surfaceAlt)
+      .fontColor(this.cipher === value ? Theme.onBrand : Theme.textSecondary)
       .onClick(() => { if (!this.isRunning()) this.cipher = value; })
   }
 
   @Builder
   protoButton(label: string, value: string) {
     Button(label, { type: ButtonType.Capsule })
-      .backgroundColor(this.proto === value ? '#007DFF' : '#999999')
+      .backgroundColor(this.proto === value ? Theme.brand : Theme.surfaceAlt)
+      .fontColor(this.proto === value ? Theme.onBrand : Theme.textSecondary)
       .onClick(() => { if (!this.isRunning()) this.proto = value; })
   }
 
@@ -125,11 +164,12 @@ export struct ServerPage {
       Text('Phantom Server')
         .fontSize(24)
         .fontWeight(FontWeight.Bold)
+        .fontColor(Theme.textPrimary)
         .margin({ top: 24 })
 
       Text(this.statusText())
         .fontSize(16)
-        .fontColor(this.isRunning() ? '#0F5132' : (this.status === 3 ? '#FF0000' : '#666666'))
+        .fontColor(this.isRunning() ? Theme.success : (this.status === 3 ? Theme.danger : Theme.textSecondary))
 
       if (!this.isRunning()) {
         TextInput({ placeholder: 'Listen port (0 = 443)', text: this.port })
@@ -152,7 +192,8 @@ export struct ServerPage {
       Button(this.isRunning() ? 'Stop Server' : 'Start Server')
         .width('90%')
         .height(48)
-        .backgroundColor(this.isRunning() ? '#FF4444' : '#007DFF')
+        .backgroundColor(this.isRunning() ? Theme.danger : Theme.brand)
+        .fontColor(Theme.onBrand)
         .onClick(() => {
           if (this.isRunning()) {
             this.stopServer();
@@ -164,7 +205,7 @@ export struct ServerPage {
       if (this.uri.length > 0 && this.isRunning()) {
         Text('Share this URI with clients on the same network:')
           .fontSize(13)
-          .fontColor('#666666')
+          .fontColor(Theme.textSecondary)
 
         QRCode(this.uri)
           .width(220)
@@ -175,17 +216,19 @@ export struct ServerPage {
         Text('Address: ' + this.hostOf(this.uri))
           .fontSize(14)
           .fontWeight(FontWeight.Medium)
+          .fontColor(Theme.textPrimary)
 
         Text(this.uri)
           .width('90%')
           .fontSize(11)
           .fontFamily('monospace')
-          .fontColor('#333333')
+          .fontColor(Theme.textSecondary)
           .maxLines(3)
           .textOverflow({ overflow: TextOverflow.Ellipsis })
 
         Button('Copy URI', { type: ButtonType.Capsule })
-          .backgroundColor('#007DFF')
+          .backgroundColor(Theme.brand)
+          .fontColor(Theme.onBrand)
           .onClick(() => { this.copyUri(); })
       }
     }
@@ -195,6 +238,6 @@ export struct ServerPage {
     .width('100%')
     .height('100%')
     .align(Alignment.Top)
-    .backgroundColor('#FFFFFF')
+    .backgroundColor(Theme.canvas)
   }
 }

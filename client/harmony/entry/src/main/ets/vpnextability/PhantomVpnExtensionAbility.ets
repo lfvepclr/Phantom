@@ -10,6 +10,7 @@ import {
   publishStats,
   publishStatus,
   readStart,
+  readUserRules,
 } from '../common/VpnBridge';
 
 // HarmonyOS VPN extension entry point.
@@ -114,6 +115,14 @@ export default class PhantomVpnExtensionAbility extends VpnExtensionAbility {
 
     this.vpnConn.create(config).then((tunFd: number) => {
       console.info(`[Phantom] TUN established, fd=${tunFd}`);
+      // Routing state is built once per start, so the rules the user edited in
+      // the settings sheet have to be in before `phantomHarmonyStart` — after
+      // it they would silently wait for the next connection.
+      const userRules: string = readUserRules(this.filesDir);
+      if (userRules.length > 0) {
+        const rulesRc: number = phantomLib.phantomHarmonySetUserRules(userRules);
+        console.info(`[Phantom] user rules rc=${rulesRc}`);
+      }
       const rc: number = phantomLib.phantomHarmonyStart(tunFd, request.uri, request.mode);
       console.info(`[Phantom] phantomHarmonyStart rc=${rc}`);
       if (rc !== 0) {

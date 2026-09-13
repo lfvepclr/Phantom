@@ -140,14 +140,16 @@ TCP 发送方。当前实现要点（此前这里是大坑：序列号恒定、�
 - 日志：Rust 侧关闭 ANSI（`with_ansi(false)`）、target 前缀与时间戳，由 ArkTS
   统一加上本地 `HH:MM:SS`；UI 每行不换行（单行 + 省略号），只渲染最后
   **200 行**（`LOG_UI_LINES`），并提供「暂停 / 显示直连 / 清空」。
-- 日志过滤默认是「仅隧道」：`route … -> Direct (…)` 与
-  `route <域名>:53 -> Direct (dns local)` 都带 `-> Direct (`，所以一个开关就能
-  同时滤掉国内 DNS 与国内直连两类噪音；切到「全部」才看明细。
+- 日志过滤默认是「仅隧道」：`route … -> Direct (…)`、`route <域名>:53 -> Direct (dns local)`
+  以及 SOCKS5/HTTP 路径的 `Direct connection established` / `Direct HTTP …` 都算直连，
+  大小写不敏感匹配（TUN 写 `Direct`、SOCKS5/HTTP 写 `DIRECT`，核心现在统一由
+  `whitelist::route_log_line` 生成），所以一个开关就能同时滤掉国内 DNS 与国内直连两类
+  噪音；先于判定打印的 `SOCKS5 target: …` 按紧随其后的判定结果决定去留；切到「全部」才看明细。
 - 连续重复的同一行（同一域名反复解析、同一目标反复重连）在界面上合并为一行并
   追加 `×N`，避免 200 行窗口被刷空；磁盘文件保持原始逐行记录。
 - 磁盘日志是**滚动**的：默认保留最后 **2000 行**（`LOG_MAX_LINES`），不会无限堆积，
   排查问题时即使界面上隐藏了直连流量，文件里仍然完整。
-- `route … -> PROXY|DIRECT`、`dns … via tunnel|local` 均为 INFO 级，便于直接核对分流。
+- `route … -> Proxy|Direct`、`dns … via tunnel|local` 均为 INFO 级，便于直接核对分流。
 - 「记录 TUN 追踪」开关（详情面板，默认关，**重启隧道后生效**）会把用户态 TCP 栈的
   报文级细节写到 `<filesDir>/phantom_tun_trace.log`（上限 5000 行）：对端 SYN 选项
   （MSS / wscale / SACK / TS）、我们发出的 SYN-ACK、每个注入分段的
@@ -202,7 +204,16 @@ Wi-Fi ⇄ 移动数据切换会让隧道里所有 socket 失效（源地址变�
 可点开详情）→ 主按钮（启动/停止 + 一行提示）→ 模式段控件（全局/智能/直连）→
 可折叠的连接卡（已保存 N 个连接 · 扫码图标 · 历史下拉）→ 日志卡。
 
-- 颜色统一走 `common/Theme.ets`，不再散落硬编码 `#007DFF/#999999`。
+- 颜色统一走 `common/Theme.ets`，不再散落硬编码 `#007DFF/#999999`：`Theme` 的每个字段都是
+  `$r('app.color.…')` 资源引用，`resources/base` 与 `resources/dark` 各一套值，平台按当前
+  颜色模式解析——这是「改主题不用改 100 处调用点」的关键。
+- **夜间模式三态**：`themeMode = system | light | dark` 存在 `phantom_ui` 偏好里，由
+  `applyThemeMode()` 调 `ApplicationContext.setColorMode()` 生效（`system` 传
+  `COLOR_MODE_NOT_SET`，把控制权交还系统）。入口在标题栏的齿轮 → 设置面板。
+- **设置面板**（`settingsSheet()`）收纳主题三态、TUN 追踪、**导出日志**、白名单说明与关于
+  （含 `bundleManager` 读出的版本号）；TUN 追踪从连接详情里移过来，避免同一开关出现两处。
+  导出日志优先分享 `phantom_vpn.log`，缺失时退回 `phantom_tun_trace.log`，两个文件都在
+  `filesDir` 里，经 `fileUri.getUriFromPath()` 走系统分享面板。
 - **不展示连接名**：`phantom://…` 的 `#fragment`（服务器自举时写的 `default`）对用户没有
   信息量，卡片、详情标题、历史下拉一律显示 `host:port`（`linkAddress()`）。
 - 顶部不再单独放「详情」按钮：整张服务器卡片就是详情入口，少一个和卡片重复的点击目标。

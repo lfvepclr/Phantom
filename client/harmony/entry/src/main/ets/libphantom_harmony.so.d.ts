@@ -13,6 +13,10 @@ declare namespace PhantomLib {
   function phantomHarmonyOnNetworkChange(): number;
   // Enable the opt-in TUN trace (empty string disables). Returns 0 on success.
   function phantomHarmonySetTrace(path: string): number;
+  // Replace the user "分流白名单" rules, one `kind:value` per line
+  // (domain: / suffix: / keyword: / regex: / cidr:). Empty string clears them.
+  // Call before phantomHarmonyStart; returns 0 on success.
+  function phantomHarmonySetUserRules(text: string): number;
   // Embedded server (phone-as-server). Start returns the phantom:// URI
   // (with PSK) once the listener is up; it throws on failure.
   function phantomHarmonyServerStart(workDir: string, port: number, cipher: string, proto: string): string;

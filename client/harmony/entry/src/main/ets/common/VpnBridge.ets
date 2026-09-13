@@ -30,6 +30,13 @@ const LOG_FILE: string = 'phantom_vpn.log';
 const STATS_FILE: string = 'phantom_vpn_stats.txt';
 const NETCHANGE_FILE: string = 'phantom_vpn_netchange.txt';
 const TRACE_FILE: string = 'phantom_tun_trace.log';
+/// User whitelist rules, written by the UI and read by the extension at start.
+///
+/// Deliberately *not* a fourth line in `START_FILE`: the three-line format is
+/// position-sensitive and already deployed, and appending a multi-line blob to
+/// it would mean re-parsing every existing install. A separate file costs one
+/// `readText` and nothing else.
+const RULES_FILE: string = 'phantom_vpn_rules.txt';
 
 /**
  * Lines a compacted log keeps. Rolling, never unbounded: troubleshooting needs
@@ -197,6 +204,20 @@ export function readStart(dir: string): VpnStartRequest {
   return { uri: uri, mode: mode.length === 0 ? 'smart' : mode, trace: trace };
 }
 
+/// Publish the user's whitelist rules (one `kind:value` per line) for the
+/// extension process to pick up on the next start.
+///
+/// Written on every edit rather than only at start time: the rules must survive
+/// even if the user edits them and the app is killed before reconnecting.
+export function publishUserRules(dir: string, rules: string): void {
+  writeText(dir, RULES_FILE, rules);
+}
+
+/// Read the user's whitelist rules, or `''` when none were published.
+export function readUserRules(dir: string): string {
+  return readText(dir, RULES_FILE);
+}
+
 // ---------------------------------------------------------------------------
 // Network changes (extension -> UI)
 // ---------------------------------------------------------------------------
@@ -204,6 +225,14 @@ export function readStart(dir: string): VpnStartRequest {
 /// Absolute path of the opt-in TUN trace file.
 export function traceFilePath(dir: string): string {
   return pathOf(dir, TRACE_FILE);
+}
+
+/// Absolute path of the rolling session log.
+///
+/// Exported alongside [traceFilePath] because the settings sheet offers both
+/// for export, and the UI must not re-derive names the bridge owns.
+export function logFilePath(dir: string): string {
+  return pathOf(dir, LOG_FILE);
 }
 
 /// Stamp "the radio just changed". The UI shows a short "reconnecting" banner
@@ -226,9 +255,45 @@ export function clearNetworkChange(dir: string): void {
 // Status (extension -> UI)
 // ---------------------------------------------------------------------------
 
+/// Last status payload written, and when it was written.
+///
+/// Empty until the first write of this process, so a restarted extension always
+/// publishes once before the de-duplication can kick in.
+let lastStatusPayload: string = '';
+let lastStatusWriteAt: number = 0;
+
+/**
+ * How often an *unchanged* status is rewritten purely to refresh its timestamp.
+ *
+ * The timestamp is not decoration: the UI uses it to tell "the extension died"
+ * from "the tunnel is fine", so a file that simply stops changing would make a
+ * healthy connection look stale — and trigger the auto-reconnect for it. The
+ * heartbeat therefore has to stay; it only needs to be rare. Writes drop by
+ * this factor, and a dead extension is noticed that much later. Transitions
+ * still write immediately, so nothing the user causes is ever delayed.
+ *
+ * Keep in sync with `STATUS_STALE_AFTER_MS` in `pages/Index.ets` (the window
+ * must comfortably exceed a few heartbeat periods).
+ */
+const STATUS_HEARTBEAT_MS: number = 3000;
+
+/// Publish the tunnel status, skipping the write while nothing has changed.
+///
+/// The extension republishes at 1 Hz, but a healthy tunnel sits on the same
+/// `Running` + empty-error payload for hours; rewriting the file every second
+/// only dirties the disk and wakes the storage stack.
 export function publishStatus(dir: string, status: number, error: string): void {
   const flatError = error.replace(/\r?\n/g, ' ');
-  writeText(dir, STATUS_FILE, status + '\n' + Date.now() + '\n' + flatError);
+  // The timestamp is deliberately *not* part of the compared payload: it is
+  // exactly the part that would otherwise differ on every tick.
+  const payload = status + '\n' + flatError;
+  const now = Date.now();
+  if (payload === lastStatusPayload && now - lastStatusWriteAt < STATUS_HEARTBEAT_MS) {
+    return;
+  }
+  lastStatusPayload = payload;
+  lastStatusWriteAt = now;
+  writeText(dir, STATUS_FILE, status + '\n' + now + '\n' + flatError);
 }
 
 export function readStatus(dir: string): VpnStatusSnapshot {

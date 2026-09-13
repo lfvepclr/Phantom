@@ -111,6 +111,21 @@ pub fn phantom_harmony_set_trace(path: String) -> i32 {
     }
 }
 
+/// Replace the user "分流白名单" rules.
+///
+/// One `kind:value` per line (`domain:` / `suffix:` / `keyword:` / `regex:` /
+/// `cidr:`), the same format the Android client sends — a rule pasted between
+/// the two clients has to mean the same thing on both. Call before
+/// `phantom_harmony_start`: routing state is built once per start, so a set
+/// handed over afterwards waits for the next connection.
+///
+/// An empty string clears the user rules but keeps the built-in list, which is
+/// what the UI's "clear" button wants.
+#[napi]
+pub fn phantom_harmony_set_user_rules(text: String) -> i32 {
+    phantom_android::android_set_user_rules(&text)
+}
+
 // ---------------------------------------------------------------------------
 // Embedded server (phone-as-server)
 //
