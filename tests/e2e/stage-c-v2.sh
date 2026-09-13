@@ -4,8 +4,8 @@
 set -u
 cd "$(dirname "$0")/../.."
 
-KEY='cGhhbnRvbS1lMmUtdGVzdC1zZXJ2ZXIta2V5LTMyYiE=='
-PSK='cGhhbnRvbS1lMmUtcHJlLXNoYXJlZC1rZXktMzJiISE=='
+KEY="${PHANTOM_E2E_KEY:-cGhhbnRvbS1lMmUtdGVzdC1zZXJ2ZXIta2V5LTMyYiE=}"
+PSK="${PHANTOM_E2E_PSK:-cGhhbnRvbS1lMmUtcHJlLXNoYXJlZC1rZXktMzJiISE=}"
 LP=.e2e-ctx/lossy_proxy
 
 run_client_curl() {

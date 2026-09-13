@@ -3,7 +3,10 @@
 set -u
 cd "$(dirname "$0")/../.."
 
-URI_QUIC='phantom://cGhhbnRvbS1lMmUtdGVzdC1zZXJ2ZXIta2V5LTMyYiE==@127.0.0.1:8443?psk=cGhhbnRvbS1lMmUtcHJlLXNoYXJlZC1rZXktMzJiISE==&cipher=auto&proto=quic#default'
+# 凭据从环境变量读取，仓库里只留占位值（PHANTOM_E2E_KEY / PHANTOM_E2E_PSK）。
+KEY="${PHANTOM_E2E_KEY:-cGhhbnRvbS1lMmUtdGVzdC1zZXJ2ZXIta2V5LTMyYiE=}"
+E2E_PSK="${PHANTOM_E2E_PSK:-cGhhbnRvbS1lMmUtcHJlLXNoYXJlZC1rZXktMzJiISE=}"
+URI_QUIC="phantom://${KEY}@127.0.0.1:8443?psk=${E2E_PSK}&cipher=auto&proto=quic#default"
 
 RUST_LOG=info ./target/release/phantom client -s "$URI_QUIC" > .e2e-boot/client-quic2.log 2>&1 &
 CPID=$!

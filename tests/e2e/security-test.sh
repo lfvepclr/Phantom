@@ -3,8 +3,9 @@
 set -u
 cd "$(dirname "$0")/../.."
 
-GOOD_PSK='cGhhbnRvbS1lMmUtcHJlLXNoYXJlZC1rZXktMzJiISE=='
-GOOD_KEY='cGhhbnRvbS1lMmUtdGVzdC1zZXJ2ZXIta2V5LTMyYiE=='
+# 凭据从环境变量读取，仓库里只留占位值（PHANTOM_E2E_KEY / PHANTOM_E2E_PSK）。
+GOOD_PSK="${PHANTOM_E2E_PSK:-cGhhbnRvbS1lMmUtcHJlLXNoYXJlZC1rZXktMzJiISE=}"
+GOOD_KEY="${PHANTOM_E2E_KEY:-cGhhbnRvbS1lMmUtdGVzdC1zZXJ2ZXIta2V5LTMyYiE=}"
 
 server_log_lines() { podman logs phantom-server 2>&1 | wc -l; }
 quic_log_lines()   { podman logs phantom-server-quic 2>&1 | wc -l; }

@@ -5,8 +5,8 @@
 set -u
 cd "$(dirname "$0")/../.."
 
-KEY='cGhhbnRvbS1lMmUtdGVzdC1zZXJ2ZXIta2V5LTMyYiE=='
-PSK='cGhhbnRvbS1lMmUtcHJlLXNoYXJlZC1rZXktMzJiISE=='  # 原样 base64（与自举输出一致，uri.rs 按 & 分隔解析）
+KEY="${PHANTOM_E2E_KEY:-cGhhbnRvbS1lMmUtdGVzdC1zZXJ2ZXIta2V5LTMyYiE=}"
+PSK="${PHANTOM_E2E_PSK:-cGhhbnRvbS1lMmUtcHJlLXNoYXJlZC1rZXktMzJiISE=}"
 
 TCP_SRV=$(podman inspect -f '{{(index .NetworkSettings.Networks "phantom-net").IPAddress}}' phantom-server)
 QUIC_SRV=$(podman inspect -f '{{(index .NetworkSettings.Networks "phantom-net").IPAddress}}' phantom-server-quic)

@@ -3,8 +3,12 @@
 set -u
 cd "$(dirname "$0")/../.."
 
-URI_BASE='phantom://cGhhbnRvbS1lMmUtdGVzdC1zZXJ2ZXIta2V5LTMyYiE==@127.0.0.1'
-PSK='psk=cGhhbnRvbS1lMmUtcHJlLXNoYXJlZC1rZXktMzJiISE==&cipher=auto'
+# 凭据从环境变量读取，仓库里只留占位值；跑真机/容器对测时导出
+# PHANTOM_E2E_KEY / PHANTOM_E2E_PSK（与服务端 server.key 一致）。
+KEY="${PHANTOM_E2E_KEY:-cGhhbnRvbS1lMmUtdGVzdC1zZXJ2ZXIta2V5LTMyYiE=}"
+E2E_PSK="${PHANTOM_E2E_PSK:-cGhhbnRvbS1lMmUtcHJlLXNoYXJlZC1rZXktMzJiISE=}"
+URI_BASE="phantom://${KEY}@127.0.0.1"
+PSK="psk=${E2E_PSK}&cipher=auto"
 
 perf_round() {
   local label="$1" uri="$2" srv="$3"
