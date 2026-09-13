@@ -88,3 +88,8 @@ client/koolshare/phantom/bin/
 # === 四维性能采集产物 ===
 # scripts/measure-*.sh 每次运行落一个 JSON，属本机数据、随版本变
 scripts/measurements/
+
+# === 各 Agent 工具的本地工作目录 ===
+# 规格 / 计划文档的唯一事实来源是 .agents/plans/（见 AGENTS.md §2），
+# 工具专属目录只放各自的本地草稿与权限白名单，不入库。
+.codebuddy/

@@ -14,6 +14,7 @@ Phantom 是一个基于 Rust 的加密代理隧道，使用 Noise IK 协议认�
 - **UDP Relay**: TUN 模式 UDP 流量通过帧协议隧道转发
 - **系统代理自启**: macOS 启动后自动设置系统 SOCKS5 代理
 - **单串配置**: `phantom://` URI 格式，一行配置包含服务器信息
+- **移动端体验一致**: Android / HarmonyOS 客户端共用同一套语义色与偏好键，都提供跟随系统 / 浅色 / 深色三态夜间模式（含系统栏）与独立设置面板；扫码、分享二维码、日志过滤导出、白名单分流、切网自愈、内嵌服务器能力两端对等
 - **配置热重载**: 运行中修改配置文件，规则 / 模式 / DNS 上游 / 服务器列表自动更新
 - **流量统计**: Prometheus `/metrics` 端点，实时监控流量
 - **Failover**: 多服务器自动切换，支持优雅迁移
@@ -94,15 +95,54 @@ SOCKS5 `127.0.0.1:11080` 并用 `networksetup` 自动设置/还原系统代理�
 可选的 TUN 透明模式才需要 root，且 `sudo open X.app` 不会提权，需直接运行可执行文件：
 `sudo client/mac/.build/Phantom.app/Contents/MacOS/Phantom`。完整说明见 `client/mac/README.md`。
 
-菜单栏只放状态与快捷开关，主界面和日志是**可缩放的独立窗口**（日志卡随窗口高度自适应，
-支持 `仅隧道 / 全部` 过滤、暂停、清空与独立日志窗口）。连接信息面板提供地址、协议、加密、
-密钥指纹、连接时长、实时速率与流量、隧道·直连计数，以及**测延迟 / 测速**（都经过当前隧道）
-和分享二维码；退出（底部按钮 / ⋯ 菜单 / ⌘Q）会先断开隧道并还原系统代理。
+点击菜单栏图标直接展开**主面板**：状态头（齿轮 + `⋯`）→ 服务器卡片 → 启动/断开 → 模式 →
+连接串摘要 → 日志卡（占剩余高度，支持 `仅隧道 / 全部` 过滤、暂停、清空）→ 页脚。
+连接串编辑、连接信息、分流白名单与设置放在二级面板；连接信息提供地址、协议、加密、密钥指纹、
+连接时长、实时速率与流量、隧道·直连计数，以及**测延迟 / 测速**（都经过当前隧道）和分享二维码。
+需要长时间盯日志时点日志标题旁的「放大」把它铺满面板（同一个弹窗内，不另开窗口）；退出
+（页脚按钮 / `⋯` 菜单 / ⌘Q）会先断开隧道并还原系统代理。首次启动且未配置连接串时，
+菜单栏图标带提示圆点并弹一次说明。
 
 菜单栏图标是模板图，四个状态按**形状**区分：空心轮廓 = 未连接、轮廓+圆点 = 连接中、
 实心 = 已连接、实心+感叹号 = 错误（彩色图形会被 macOS 渲染成黑块，故不使用颜色）。
 
 macOS 原生客户端启动后，系统代理自动生效，无需手动配置。
+
+### Android 客户端构建与安装
+
+Jetpack Compose 客户端位于 `client/android/`；Rust 侧由 `client/android/rust`
+（crate `phantom-android`，产物 `libphantom_android.so`）提供 JNI 与内嵌服务器桥，
+这样 `phantom-client` 不必依赖 `phantom-server`。
+
+```bash
+cargo xtask build android            # release
+cargo xtask build android --debug    # debug（真机联调用这个）
+```
+
+前置条件（各一次）：
+
+```bash
+~/Library/Android/sdk/cmdline-tools/latest/bin/sdkmanager "ndk;26.1.10909125"  # NDK r26+
+rustup target add aarch64-linux-android
+```
+
+脚本会自动探测 NDK、JDK 17（`JAVA_HOME` → `java_home -v 17` → Android Studio JBR）
+并写入 `local.properties`，最后跑 Gradle `assembleDebug`。产物：
+
+- `client/android/app/build/outputs/apk/debug/app-debug.apk`
+- `client/android/app/src/main/jniLibs/arm64-v8a/libphantom_android.so`
+
+安装到真机：
+
+```bash
+$HOME/Library/Android/sdk/platform-tools/adb install -r \
+  client/android/app/build/outputs/apk/debug/app-debug.apk
+```
+
+> **小米 / 红米（HyperOS）**：报 `INSTALL_FAILED_USER_RESTRICTED` 时，需在手机上打开
+> 「设置 → 更多设置 → 开发者选项 → **USB 安装**」。这是系统侧安装闸门，`adb` 无法绕过。
+
+只构建 `arm64-v8a` 一个 ABI；多 ABI 尚未支持。详见 `client/android/README.md`。
 
 ### 路由器客户端（华硕 RT-AX86U Pro 等）
 
@@ -486,6 +526,22 @@ curl http://127.0.0.1:9150/metrics
 - `phantom_udp_bytes_up/down` — UDP 上下行字节数
 - `phantom_tcp_connections` — TCP 连接总数
 - `phantom_udp_datagrams_up/down` — UDP 数据报总数
+- `phantom_route_direct_total` / `phantom_route_proxy_total` — 直连 / 走隧道的连接数
+- `phantom_tcp_dup_bytes` — 重复注入的重传字节数
+- `phantom_dup_acks_total` — 观察到的重复 ACK 次数
+- `phantom_tun_write_wait_ms_total` / `phantom_tun_write_wait_max_ms` — 等待 TUN 可写的累计/最大耗时
+- `phantom_tun_txq_peak_bytes` — TUN 写队列峰值深度
+- `phantom_retransmit_suppressed_total` / `phantom_retransmit_budget_rst_total` — 被预算抑制的重传 / 因超预算被重置的流
+- `phantom_route_direct_failed_total` — 直连超时后回退到隧道的次数
+
+> 最后一组是**排查「隧道正常但应用卡住」**的关键：卡死的流仍在传输字节（全是重传），
+> 光看 `bytes_up/down` 分辨不出来。无界面的路由器部署尤其依赖它们。
+
+`RUST_LOG` 生效（默认 `info`）；写到文件时建议设 `NO_COLOR=1` 去掉日志里的 ANSI 转义：
+
+```bash
+RUST_LOG=debug NO_COLOR=1 phantom client --server "$URI" --tun
+```
 
 ### 7. 性能调优
 
