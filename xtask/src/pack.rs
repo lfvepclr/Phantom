@@ -266,7 +266,7 @@ pub fn check_static(bin: &Path, spec: &TargetSpec) -> Result<()> {
     Ok(())
 }
 
-fn sha256_file(path: &Path) -> Result<String> {
+pub(crate) fn sha256_file(path: &Path) -> Result<String> {
     // macOS ships shasum; coreutils hosts ship sha256sum.
     let (tool, args): (&str, Vec<&str>) = if have("shasum") {
         ("shasum", vec!["-a", "256"])
@@ -463,7 +463,11 @@ pub fn assemble_koolshare_bundle(root: &Path, aarch64: &Path, armv7: &Path) -> R
         .map(|m| m.len())
         .sum();
 
-    let tarball = root.join("dist").join(format!("phantom-{}.tar.gz", version));
+    // 客户端产物统一用 `client-<名称>-<版本>` 前缀，和 server 的
+    // `phantom-server-<版本>` 区分开，dist/ 里一眼能看出是哪个形态。
+    let tarball = root
+        .join("dist")
+        .join(format!("client-koolshare-{}.tar.gz", version));
     let _ = fs::remove_file(&tarball);
     let mut cmd = Command::new("tar");
     cmd.arg("czf")
@@ -476,8 +480,11 @@ pub fn assemble_koolshare_bundle(root: &Path, aarch64: &Path, armv7: &Path) -> R
     let digest = sha256_file(&tarball)?;
     let sum_path = root
         .join("dist")
-        .join(format!("phantom-{}.tar.gz.sha256", version));
-    fs::write(&sum_path, format!("{}  phantom-{}.tar.gz\n", digest, version))?;
+        .join(format!("client-koolshare-{}.tar.gz.sha256", version));
+    fs::write(
+        &sum_path,
+        format!("{}  client-koolshare-{}.tar.gz\n", digest, version),
+    )?;
 
     println!();
     println!("  Bundle:     {}", tarball.display());

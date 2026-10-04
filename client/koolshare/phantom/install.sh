@@ -126,7 +126,7 @@ exit_install() {
             echo_date "本插件支持机型/平台：https://github.com/koolshare/rogsoft#rogsoft"
             echo_date "退出安装！"
             # 精确删解压目录，不要用 /tmp/phantom* ——那会把用户放在 /tmp 的
-            # 离线包（phantom-0.1.0.tar.gz）一起删掉，想重装就得重新上传
+            # 离线包（client-koolshare-0.1.0.tar.gz）一起删掉，想重装就得重新上传
             rm -rf "/tmp/${module}" >/dev/null 2>&1
             exit 1
             ;;
@@ -152,7 +152,7 @@ verify_package() {
     if [ -n "${missing}" ]; then
         echo_date "错误：安装包不完整，缺少以下文件："
         echo_date "  ${missing}"
-        echo_date "请重新下载完整的离线包（dist/phantom-<version>.tar.gz）后重装。"
+        echo_date "请重新下载完整的离线包（dist/client-koolshare-<version>.tar.gz）后重装。"
         echo_date "注意：必须在解压出的 phantom/ 目录里执行 install.sh，不要单独拷贝个别文件。"
         exit 1
     fi

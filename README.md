@@ -150,7 +150,7 @@ $HOME/Library/Android/sdk/platform-tools/adb install -r \
 
 ```bash
 # A. 带 koolshare 软件中心（官改 / ks 梅林）：出离线插件包，软件中心「离线安装」
-cargo xtask package koolshare          # 双架构（aarch64 + armv7），产物 dist/phantom-<版本>.tar.gz
+cargo xtask package clients            # 全部客户端 → dist/client-<名称>-<版本>.<ext>（macos/android/harmony/koolshare/cli）
 
 # B. 无软件中心（梅林 / 官方固件）：命令行安装
 # 1. 交叉编译静态二进制（aarch64-unknown-linux-musl）

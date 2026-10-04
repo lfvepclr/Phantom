@@ -194,8 +194,10 @@ PHANTOM_STATUS_PIDFILE / PHANTOM_CONF / PHANTOM_DOMAINS / PHANTOM_UI
 ## 5. 构建与安装
 
 ```bash
-# 出离线包（双架构静态二进制，产物 dist/phantom-<version>.tar.gz + .sha256）
-cargo xtask package koolshare
+# 出离线包（双架构静态二进制，产物 dist/client-koolshare-<version>.tar.gz + .sha256）
+# —— 客户端产物统一用 client-<名称> 前缀；`cargo xtask package clients` 会把
+#    macOS / Android / HarmonyOS / koolshare / CLI 五种形态一起出到 dist/
+cargo xtask package clients koolshare
 ```
 
 安装（三选一）：
@@ -204,8 +206,8 @@ cargo xtask package koolshare
 # 1) 软件中心 → 离线安装 → 上传 tar.gz（最省事）
 # 2) scp 后手工执行，等价于软件中心的行为
 tar czf /tmp/phantom.tar.gz -C client/koolshare phantom     # 或直接 dist/phantom-*.tar.gz
-scp -P <SSH端口> dist/phantom-0.1.0.tar.gz admin@<路由器IP>:/tmp/
-ssh -p <SSH端口> admin@<路由器IP> 'tar xzf /tmp/phantom-0.1.0.tar.gz -C /tmp && /bin/sh /tmp/phantom/install.sh'
+scp -P <SSH端口> dist/client-koolshare-0.1.0.tar.gz admin@<路由器IP>:/tmp/
+ssh -p <SSH端口> admin@<路由器IP> 'tar xzf /tmp/client-koolshare-0.1.0.tar.gz -C /tmp && /bin/sh /tmp/phantom/install.sh'
 # 3) 无软件中心的固件：同一个 install.sh 会自动走 /jffs/phantom 降级安装
 ```
 

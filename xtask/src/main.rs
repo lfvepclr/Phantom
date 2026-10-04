@@ -3,7 +3,9 @@
 //! Usage:
 //!   cargo xtask build [all|server|cli|router|mac|android|harmony] [--release|--debug]
 //!   cargo xtask package server [--platform linux/amd64] [--engine auto|podman|docker|none]
-//!   cargo xtask package koolshare                 # 路由器软件中心离线插件（双架构）
+//!   cargo xtask package clients                   # 全部客户端 → dist/client-<名称>-<版本>.*
+//!   cargo xtask package clients macos harmony     # 只打指定形态
+//!   cargo xtask package koolshare                 # 等价于 package clients koolshare（路由器插件）
 //!   cargo xtask verify server
 //!   cargo xtask deploy server --host root@HOST
 //!   cargo xtask speedtest --uri <phantom://...>
@@ -48,10 +50,12 @@ enum Commands {
         #[arg(long)]
         features: Vec<String>,
     },
-    /// Build a deployable bundle: server (pinned container build) or koolshare
-    /// (router software-centre offline plugin, dual-arch)
+    /// Build a deployable bundle: server (pinned container build) or a client
+    /// form — clients | macos | android | harmony | koolshare | cli.
+    /// 客户端产物统一命名 `dist/client-<名称>-<版本>.<ext>`（+ `.sha256`）。
     Package {
-        /// Target(s): server (alias: server-amd64), koolshare
+        /// Target(s): server (alias server-amd64) | clients | macos | android |
+        /// harmony | koolshare | cli；`clients` 不带参数 = 全部客户端形态
         target: Vec<String>,
         /// Target platform: linux/amd64 or linux/arm64
         #[arg(long, default_value = "linux/amd64")]
@@ -773,6 +777,274 @@ fn package_koolshare(release: bool) -> Result<PathBuf> {
     pack::assemble_koolshare_bundle(&root, &aarch64, &armv7)
 }
 
+// ── 客户端产物：dist/client-<名称>-<版本>.<ext> ────────────────────────────────
+//
+// dist/ 里原来只有 server 的 `phantom-server-*` 和插件包 `phantom-<版本>.tar.gz`，
+// 后者既没标形态也没标平台，根本分不清是哪个客户端。这里把五种客户端形态统一
+// 打上 `client-<名称>` 前缀：
+//
+//   client-macos-<版本>.dmg                macOS 菜单栏 App（DMG）
+//   client-android-<版本>.apk              Android VPN App（debug 签名，可直接 adb install）
+//   client-harmony-<版本>.hap              HarmonyOS App（DevEco 自动签名）
+//   client-koolshare-<版本>.tar.gz         路由器软件中心离线插件（aarch64 + armv7）
+//   client-cli-<平台>-<版本>.tar.gz         CLI：macos-arm64 / linux-amd64 / linux-arm64 / linux-armv7
+
+const CLIENT_KINDS: &[&str] = &["macos", "android", "harmony", "koolshare", "cli"];
+
+fn package_clients(names: &[String]) -> Result<()> {
+    let root = project_root();
+    let dist = root.join("dist");
+    fs::create_dir_all(&dist).with_context(|| format!("create {}", dist.display()))?;
+    let version = env!("CARGO_PKG_VERSION");
+
+    // `package clients`（不带形态）= 全部；`package clients macos harmony` = 只要这两个。
+    let picked: Vec<String> = names
+        .iter()
+        .filter(|n| !matches!(n.as_str(), "clients" | "client" | "all"))
+        .cloned()
+        .collect();
+    let wanted: Vec<String> = if picked.is_empty() {
+        CLIENT_KINDS.iter().map(|s| s.to_string()).collect()
+    } else {
+        picked
+    };
+    for name in &wanted {
+        if !CLIENT_KINDS.contains(&name.as_str()) {
+            bail!(
+                "未知客户端：{}（可选：{}，或 clients = 全部）",
+                name,
+                CLIENT_KINDS.join(" / ")
+            );
+        }
+    }
+
+    println!("打包客户端产物 → {}", dist.display());
+    let mut ok: Vec<String> = Vec::new();
+    let mut bad: Vec<String> = Vec::new();
+    for name in &wanted {
+        println!();
+        println!("──── client-{} ────", name);
+        match package_one_client(name, &root, &dist, version) {
+            Ok(artifacts) => {
+                for a in &artifacts {
+                    println!("  ✓ {}", a.display());
+                }
+                ok.push(name.clone());
+            }
+            Err(e) => {
+                // 一个客户端缺工具链（DevEco / NDK / rustup target）不该拖垮其余形态
+                println!("  ✗ 失败：{:#}", e);
+                bad.push(format!("{} — {}", name, e));
+            }
+        }
+    }
+
+    println!();
+    println!("==================== 客户端打包结果 ====================");
+    for name in &wanted {
+        if ok.contains(name) {
+            println!("  ✓ client-{}", name);
+        } else {
+            println!("  ✗ client-{}", name);
+        }
+    }
+    if !bad.is_empty() {
+        println!();
+        for b in &bad {
+            println!("  失败原因：{}", b);
+        }
+        bail!("{} / {} 个客户端打包失败", bad.len(), wanted.len());
+    }
+    println!();
+    println!("全部就绪：{} 个形态", ok.len());
+    Ok(())
+}
+
+fn package_one_client(name: &str, root: &Path, dist: &Path, version: &str) -> Result<Vec<PathBuf>> {
+    match name {
+        "koolshare" => Ok(vec![package_koolshare(true)?]),
+        "macos" => {
+            build_mac(true)?;
+            let dmg = root.join("client/mac/.build/dist/Phantom.dmg");
+            if !dmg.exists() {
+                bail!("DMG 未生成：{}（先跑 scripts/build-mac.sh 看报错）", dmg.display());
+            }
+            Ok(vec![stage_artifact(
+                &dmg,
+                dist,
+                &format!("client-macos-{}.dmg", version),
+            )?])
+        }
+        "android" => {
+            build_android(true)?;
+            let apk = root.join("client/android/app/build/outputs/apk/debug/app-debug.apk");
+            if !apk.exists() {
+                bail!(
+                    "APK 未生成：{}（Gradle 需要 JDK 17 + Android SDK/NDK）",
+                    apk.display()
+                );
+            }
+            Ok(vec![stage_artifact(
+                &apk,
+                dist,
+                &format!("client-android-{}.apk", version),
+            )?])
+        }
+        "harmony" => {
+            let hap = package_harmony_hap(root, true)?;
+            Ok(vec![stage_artifact(
+                &hap,
+                dist,
+                &format!("client-harmony-{}.hap", version),
+            )?])
+        }
+        "cli" => package_client_cli(root, dist, version),
+        other => bail!("未知客户端：{}", other),
+    }
+}
+
+/// 构建并返回可安装的 HarmonyOS HAP。
+///
+/// 优先用 hvigor 产出的 `*-signed.hap`（DevEco 自动签名，工程里已配好）；
+/// 只有本机放了 `client/harmony/signing/*` 时才回退到 xtask 的 hap-sign-tool 流程。
+fn package_harmony_hap(root: &Path, release: bool) -> Result<PathBuf> {
+    build_harmony_unsigned(root, release)?;
+
+    let harmony_dir = root.join("client/harmony");
+    let out_dir = harmony_dir.join("entry/build/default/outputs/default");
+    let release_name = if release {
+        "entry-default-signed.hap"
+    } else {
+        "entry-default-debug-signed.hap"
+    };
+    for candidate in [
+        out_dir.join(release_name),
+        out_dir.join("entry-default-signed.hap"),
+        harmony_dir.join(release_name),
+        harmony_dir.join("entry-default-signed.hap"),
+    ] {
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+    // hvigor 有时把产物名带上 flavor，退一步按后缀扫一遍输出目录
+    if let Ok(entries) = fs::read_dir(&out_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_signed_hap = path
+                .file_name()
+                .map(|n| n.to_string_lossy().ends_with("-signed.hap"))
+                .unwrap_or(false);
+            if is_signed_hap {
+                return Ok(path);
+            }
+        }
+    }
+
+    // 没有自动签名产物：走 xtask 的样例签名材料路径（缺文件会给出明确报错）
+    build_harmony(release)?;
+    let signed = harmony_dir.join(release_name);
+    if signed.exists() {
+        return Ok(signed);
+    }
+    bail!(
+        "没有找到已签名的 HAP。请在 DevEco 里确认 Signing Configs（自动签名）已生成，\
+         或补齐 client/harmony/signing/* 后重试"
+    )
+}
+
+fn package_client_cli(root: &Path, dist: &Path, version: &str) -> Result<Vec<PathBuf>> {
+    let variants: [(&str, Option<&str>); 4] = [
+        ("macos-arm64", None),
+        ("linux-amd64", Some(SERVER_AMD64_TARGET)),
+        ("linux-arm64", Some(ROUTER_TARGET)),
+        ("linux-armv7", Some(ROUTER_ARMV7_TARGET)),
+    ];
+    let mut artifacts = Vec::new();
+    for (platform, target) in variants {
+        if let Some(t) = target {
+            if !rustup_target_installed(t) {
+                bail!(
+                    "CLI {} 需要 rustup target add {}（跳过该平台）",
+                    platform,
+                    t
+                );
+            }
+        }
+        let mut cmd = cargo_cmd();
+        cmd.arg("build")
+            .arg("-p")
+            .arg("phantom-cli")
+            .arg("--release");
+        if let Some(t) = target {
+            cmd.arg("--target").arg(t);
+        }
+        // 路由器/JFFS 空间紧张，符号砍掉一半体积（与 router 构建一致）
+        cmd.env("CARGO_PROFILE_RELEASE_STRIP", "symbols");
+        cmd.current_dir(root);
+        run_cmd(&mut cmd, &format!("Build phantom CLI ({})", platform))?;
+
+        let bin = match target {
+            Some(t) => root.join("target").join(t).join("release").join("phantom"),
+            None => root.join("target").join("release").join("phantom"),
+        };
+        if !bin.exists() {
+            bail!("CLI 二进制未生成：{}", bin.display());
+        }
+
+        // 目录名与 server 包保持一致：先落一个同名目录，再打 tar.gz + .sha256
+        let stage_name = format!("client-cli-{}-{}", platform, version);
+        let stage = dist.join(&stage_name);
+        if stage.exists() {
+            fs::remove_dir_all(&stage)?;
+        }
+        fs::create_dir_all(&stage)?;
+        fs::copy(&bin, stage.join("phantom"))?;
+        let readme = root.join("client/cli/README.md");
+        if readme.exists() {
+            fs::copy(&readme, stage.join("README.md"))?;
+        }
+
+        let tarball = dist.join(format!("{}.tar.gz", stage_name));
+        let _ = fs::remove_file(&tarball);
+        let mut cmd = Command::new("tar");
+        cmd.arg("czf")
+            .arg(&tarball)
+            .arg("-C")
+            .arg(dist)
+            .arg(&stage_name);
+        run_cmd(&mut cmd, "tar czf client cli bundle")?;
+        write_sha256(dist, &tarball, &format!("{}.tar.gz", stage_name))?;
+        println!(
+            "  二进制：{} （{:.1} MiB）",
+            bin.display(),
+            fs::metadata(&bin).map(|m| m.len()).unwrap_or(0) as f64 / (1024.0 * 1024.0)
+        );
+        artifacts.push(tarball);
+    }
+    Ok(artifacts)
+}
+
+/// 把构建产物复制到 dist/ 下的目标名，并写同名 `.sha256`（与 server 包一致）
+fn stage_artifact(src: &Path, dist: &Path, name: &str) -> Result<PathBuf> {
+    let dst = dist.join(name);
+    fs::copy(src, &dst).with_context(|| format!("copy {} -> {}", src.display(), dst.display()))?;
+    let digest = pack::sha256_file(&dst)?;
+    fs::write(dist.join(format!("{}.sha256", name)), format!("{}  {}\n", digest, name))?;
+    println!(
+        "  源文件：{} （{:.2} MiB）",
+        src.display(),
+        fs::metadata(&dst).map(|m| m.len()).unwrap_or(0) as f64 / (1024.0 * 1024.0)
+    );
+    Ok(dst)
+}
+
+fn write_sha256(dist: &Path, artifact: &Path, name: &str) -> Result<()> {
+    let digest = pack::sha256_file(artifact)?;
+    fs::write(dist.join(format!("{}.sha256", name)), format!("{}  {}\n", digest, name))?;
+    Ok(())
+}
+
 fn build_mac(release: bool) -> Result<()> {
     let root = project_root();
     let script = root.join("scripts/build-mac.sh");
@@ -806,70 +1078,14 @@ fn build_android(release: bool) -> Result<()> {
 fn build_harmony(release: bool) -> Result<()> {
     let root = project_root();
     let harmony_dir = root.join("client/harmony");
-    let target = "aarch64-unknown-linux-ohos";
-    let profile = if release { "release" } else { "debug" };
-
-    // ── Step 1: Build Rust .so ──
-    let mut cmd = cargo_cmd();
-    cmd.arg("build")
-        .arg("-p")
-        .arg("phantom-harmony")
-        .arg("--target")
-        .arg(target);
-    if release {
-        cmd.arg("--release");
-    }
-    cmd.current_dir(&root);
-    run_cmd(&mut cmd, "Build phantom-harmony .so")?;
-
-    // ── Step 2: Copy .so to entry/libs/arm64-v8a/ (hvigor native-lib pickup dir) ──
-    let so_src = root
-        .join("target")
-        .join(target)
-        .join(profile)
-        .join("libphantom_harmony.so");
-    if !so_src.exists() {
-        bail!(
-            "Rust .so not found: {}. Build may have failed.",
-            so_src.display()
-        );
-    }
-    let libs_dir = harmony_dir.join("entry/libs/arm64-v8a");
-    fs::create_dir_all(&libs_dir)?;
-    let so_dst = libs_dir.join("libphantom_harmony.so");
-    fs::copy(&so_src, &so_dst)?;
-    println!("  Copied .so -> {}", so_dst.display());
-
-    // ── Step 3: hvigor assembleHap ──
-    let deveco_sdk = env::var("DEVECO_SDK_HOME")
-        .unwrap_or_else(|_| "/Applications/DevEco-Studio.app/Contents/sdk".to_string());
-    let node_home = env::var("NODE_HOME")
-        .unwrap_or_else(|_| "/Applications/DevEco-Studio.app/Contents/tools/node".to_string());
-    let hvigorw = "/Applications/DevEco-Studio.app/Contents/tools/hvigor/bin/hvigorw";
-    if !Path::new(hvigorw).exists() {
-        bail!(
-            "hvigorw not found at {}. Install DevEco Studio NEXT.",
-            hvigorw
-        );
-    }
-
-    let build_mode = if release { "release" } else { "debug" };
-    let mut cmd = Command::new("bash");
-    cmd.arg(hvigorw)
-        .arg("--mode")
-        .arg("module")
-        .arg("-p")
-        .arg("product=default")
-        .arg("-p")
-        .arg(format!("buildMode={}", build_mode))
-        .arg("--no-daemon")
-        .arg("assembleHap")
-        .env("DEVECO_SDK_HOME", &deveco_sdk)
-        .env("NODE_HOME", &node_home)
-        .current_dir(&harmony_dir);
-    run_cmd(&mut cmd, "hvigor assembleHap")?;
+    build_harmony_unsigned(&root, release)?;
 
     // ── Step 4: Sign HAP with hap-sign-tool.jar ──
+    // 只在本机放了 `client/harmony/signing/*`（OpenHarmony 样例材料）时才走这条路；
+    // DevEco 自动签名（build-profile.json5 里的 signingConfigs）已经在 hvigor 阶段
+    // 签好了，打包走 package_harmony_hap，不需要这一步。
+    let deveco_sdk = env::var("DEVECO_SDK_HOME")
+        .unwrap_or_else(|_| "/Applications/DevEco-Studio.app/Contents/sdk".to_string());
     let hap_sign_tool =
         Path::new(&deveco_sdk).join("default/openharmony/toolchains/lib/hap-sign-tool.jar");
     if !hap_sign_tool.exists() {
@@ -938,6 +1154,78 @@ fn build_harmony(release: bool) -> Result<()> {
     println!("  Signed HAP: {}", signed_hap.display());
     println!("  Install:    hdc install {}", signed_hap.display());
 
+    Ok(())
+}
+
+/// HarmonyOS 应用的前三步：Rust .so → entry/libs/arm64-v8a → `hvigorw assembleHap`。
+///
+/// 工程里配的是 **DevEco 自动签名**（`build-profile.json5` 的 signingConfigs 指向
+/// `~/.ohos/config/default_harmony_*.{p12,cer,p7b}`），所以 hvigor 直接产出
+/// `*-signed.hap`；`client/harmony/signing/` 里的 OpenHarmony 样例材料只是备选路径。
+fn build_harmony_unsigned(root: &Path, release: bool) -> Result<()> {
+    let harmony_dir = root.join("client/harmony");
+    let target = "aarch64-unknown-linux-ohos";
+    let profile = if release { "release" } else { "debug" };
+
+    // ── Step 1: Build Rust .so ──
+    let mut cmd = cargo_cmd();
+    cmd.arg("build")
+        .arg("-p")
+        .arg("phantom-harmony")
+        .arg("--target")
+        .arg(target);
+    if release {
+        cmd.arg("--release");
+    }
+    cmd.current_dir(&root);
+    run_cmd(&mut cmd, "Build phantom-harmony .so")?;
+
+    // ── Step 2: Copy .so to entry/libs/arm64-v8a/ (hvigor native-lib pickup dir) ──
+    let so_src = root
+        .join("target")
+        .join(target)
+        .join(profile)
+        .join("libphantom_harmony.so");
+    if !so_src.exists() {
+        bail!(
+            "Rust .so not found: {}. Build may have failed.",
+            so_src.display()
+        );
+    }
+    let libs_dir = harmony_dir.join("entry/libs/arm64-v8a");
+    fs::create_dir_all(&libs_dir)?;
+    let so_dst = libs_dir.join("libphantom_harmony.so");
+    fs::copy(&so_src, &so_dst)?;
+    println!("  Copied .so -> {}", so_dst.display());
+
+    // ── Step 3: hvigor assembleHap ──
+    let deveco_sdk = env::var("DEVECO_SDK_HOME")
+        .unwrap_or_else(|_| "/Applications/DevEco-Studio.app/Contents/sdk".to_string());
+    let node_home = env::var("NODE_HOME")
+        .unwrap_or_else(|_| "/Applications/DevEco-Studio.app/Contents/tools/node".to_string());
+    let hvigorw = "/Applications/DevEco-Studio.app/Contents/tools/hvigor/bin/hvigorw";
+    if !Path::new(hvigorw).exists() {
+        bail!(
+            "hvigorw not found at {}. Install DevEco Studio NEXT.",
+            hvigorw
+        );
+    }
+
+    let build_mode = if release { "release" } else { "debug" };
+    let mut cmd = Command::new("bash");
+    cmd.arg(hvigorw)
+        .arg("--mode")
+        .arg("module")
+        .arg("-p")
+        .arg("product=default")
+        .arg("-p")
+        .arg(format!("buildMode={}", build_mode))
+        .arg("--no-daemon")
+        .arg("assembleHap")
+        .env("DEVECO_SDK_HOME", &deveco_sdk)
+        .env("NODE_HOME", &node_home)
+        .current_dir(&harmony_dir);
+    run_cmd(&mut cmd, "hvigor assembleHap")?;
     Ok(())
 }
 
@@ -1191,21 +1479,17 @@ fn main() -> Result<()> {
             no_verify,
             runtime_image,
         } => {
-            // `package koolshare` 走自己的流水线（双架构 + 离线包组装），
-            // 与 server 的容器打包路径无关，所以先分流。
-            if target.iter().any(|t| t == "koolshare") {
-                let tarball = package_koolshare(true)?;
-                println!();
-                println!("Packaged: {}", tarball.display());
-                println!(
-                    "Next:     软件中心 → 离线安装；或 scp 到路由器 /tmp 后 \
-                     /bin/sh /tmp/phantom/install.sh"
-                );
-                println!(
-                    "注意:     华硕固件上 /usr/sbin/sh 是 memaccess（不是 shell），\
-                     命令必须用绝对路径 /bin/sh"
-                );
-                return Ok(());
+            // 客户端形态（macOS / Android / HarmonyOS / koolshare / CLI）走统一
+            // 打包入口：产物名一律 `client-<名称>-<版本>.<ext>`，与 server 的
+            // 容器打包路径无关，所以先分流。
+            const CLIENT_TARGETS: [&str; 8] = [
+                "clients", "client", "all", "macos", "android", "harmony", "koolshare", "cli",
+            ];
+            if target
+                .iter()
+                .any(|t| CLIENT_TARGETS.contains(&t.as_str()))
+            {
+                return package_clients(&target);
             }
             let _ = target;
             let spec = pack::resolve_platform(&platform)?;

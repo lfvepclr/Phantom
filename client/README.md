@@ -299,11 +299,25 @@ cargo xtask build mac            # macOS 客户端
 cargo xtask build android        # Android 客户端
 cargo xtask build harmony        # HarmonyOS 客户端
 
+# 出可分发产物 → dist/client-<名称>-<版本>.<ext>（+ 同名 .sha256）
+cargo xtask package clients             # 五种形态一起打：macos / android / harmony / koolshare / cli
+cargo xtask package clients macos cli   # 只打指定形态
+
 # 其他命令
 cargo xtask check-deps           # 检查依赖状态（自动安装可安装的）
 cargo xtask icons                # 重新生成所有平台图标
 cargo xtask clean                # 清理所有构建产物
 ```
+
+| 客户端 | 产物 |
+|---|---|
+| macOS | `dist/client-macos-<版本>.dmg` |
+| Android | `dist/client-android-<版本>.apk`（debug 签名，`adb install -r` 可直接装） |
+| HarmonyOS | `dist/client-harmony-<版本>.hap`（DevEco 自动签名） |
+| 路由器（koolshare 插件） | `dist/client-koolshare-<版本>.tar.gz`（aarch64 + armv7 双架构） |
+| CLI | `dist/client-cli-<平台>-<版本>.tar.gz`（macos-arm64 / linux-amd64 / linux-arm64 / linux-armv7） |
+
+产物一律带 `client-` 前缀，和服务端的 `phantom-server-<版本>-linux-<arch>.tar.gz` 区分开。
 
 ### 依赖
 
