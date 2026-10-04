@@ -59,12 +59,45 @@
 <script>
 // 前端修订号：页面右上角会显示，用来确认浏览器加载的是哪一版
 // （改了 UI 就 +1，排查「改了没生效」时先看这个数字）
-var PHANTOM_UI_REV = '5';
+var PHANTOM_UI_REV = '8';
 var dbus = {};
 var _responseLen;
 var noChange = 0;
 var _statusTimer = null;
 var _logTimer = null;
+var _speedTimer = null;
+var _startedTimer = null;
+
+// ---------------------------------------------------------------- 会话预检
+//
+// **本固件有一枚地雷：httpd 在「登录会话已失效」时收到走 httpdb 通道的请求
+// （/_api/…、/_temp/…）会直接 SIGSEGV。** 真机 syslog 里躺着 130 多次
+// `Comm: httpd` 崩溃 + watchdog 反复 start_httpd；用户点「提交」那一刻正好崩了
+// 一次，浏览器只看到「提交失败（请求未完成）」，而配置根本没进 dbus。
+//
+// 崩溃还会自我维持：httpd 一崩，watchdog 重启它 → 所有旧 token 一起失效 →
+// 仍持有旧 token 的客户端下一次请求再把它打崩。本页每 2 秒轮询状态文件、每
+// 5 秒轮询上次动作，正是这台「人肉 DoS」的主力；后台标签页被浏览器限流成
+// 1 分钟一次，恰好解释了真机上「每分钟崩一次、连续两小时」的观测。
+//
+// 唯一安全的通道是 .asp：带失效 cookie 请求它只会拿到跳转登录页的 HTML，
+// 不会崩。所以每次访问 httpdb 之前都先打一发探针，探针说会话没了就彻底停手。
+var SESSION_LOST = false;
+// 探针候选：第一条是专门的探针页，第二条是管理页本体（一定存在）。
+// **文件名必须以 Module_ 开头** —— httpd 只把 /Module_* 路由到 /koolshare/webs
+// （strings 里的 isWebServer / websApply / Module_）；实测 /phantom_ping.asp 直接
+// 404，而 /Module_xxx 会被它的 webs 处理器接管。
+var PING_PATHS = ['/Module_phantom_ping.asp', '/Module_phantom.asp'];
+var PING_MARK = 'phantom-ping-ok';   // 探针页正文里的标记
+var LOGIN_REDIRECT_MARK = 'window.top.location.href';  // 会话失效时 httpd 的跳转页
+var _pingPath = 0;
+var PROBE_MAX_FAILS = 6;             // 探针连续无响应几次才判定会话/服务不可用（约 15s）
+var PROBE_RETRY_MS = 3000;           // httpd 被 watchdog 重启约需 20-30 秒，退避重试
+var _probeBusy = false;
+var _probeFails = 0;
+var _probeTimer = null;
+var _probeWaiters = [];
+
 // 注意：这里只能列「页面上真实存在的 input/select/textarea 的 id」。
 // phantom_cron_time 由 cron_hour + cron_minute 两个下拉合成，没有对应元素，
 // 不能放进这个数组——否则 conf2obj() 会访问 null 并中断整个初始化。
@@ -94,9 +127,9 @@ function init() {
 	// 每一步都独立兜底：任何一处出错都不能让开关和配置区一起消失
 	try { show_menu(menu_hook); } catch (e) { console.log("show_menu: " + e); }
 	try { generate_options(); } catch (e) { console.log("generate_options: " + e); }
+	try { hook_visibility(); } catch (e) { console.log("hook_visibility: " + e); }
 	get_dbus_data();
 	get_run_status();
-	get_last_act();
 }
 
 function conf2obj() {
@@ -123,7 +156,145 @@ function show_error(msg) {
 	if (el) { el.innerHTML = '<span style="color:#FF5252;">配置读取失败：' + msg + '</span>'; }
 }
 
+// ---------------------------------------------------------------- 会话预检
+
+// 停掉所有轮询定时器（后台标签页 / 会话失效时调用）
+function stop_pollers() {
+	if (_statusTimer) { clearTimeout(_statusTimer); _statusTimer = null; }
+	if (_logTimer) { clearTimeout(_logTimer); _logTimer = null; }
+	if (_speedTimer) { clearTimeout(_speedTimer); _speedTimer = null; }
+	if (_startedTimer) { clearTimeout(_startedTimer); _startedTimer = null; }
+}
+
+// 会话失效：彻底停手，并且**不再发出任何 httpdb 请求**（发一个崩一个）
+function session_lost(detail) {
+	if (SESSION_LOST) { return; }
+	SESSION_LOST = true;
+	_probeWaiters = [];
+	stop_pollers();
+	if (_probeTimer) { clearTimeout(_probeTimer); _probeTimer = null; }
+
+	var b = gid("session_banner");
+	if (b) {
+		b.style.display = "";
+		b.innerHTML = '⚠ 路由器登录会话已失效，已停止页面刷新与提交 —— '
+			+ '继续请求会把路由器 Web 服务（httpd）打崩。请先 '
+			+ '<a href="/Main_Login.asp">重新登录</a>，再回到本页'
+			+ (detail ? '（' + detail + '）' : '') + '。隧道本身不受影响，仍在正常转发。';
+	}
+	var b1 = gid("apply_button-1"); if (b1) { b1.disabled = true; }
+	var b2 = gid("apply_button-2"); if (b2) { b2.disabled = true; }
+	var sb = gid("speed_btn");
+	if (sb) { sb.onclick = null; sb.style.opacity = "0.45"; sb.style.pointerEvents = "none"; }
+	var tip = gid("busy_tip");
+	if (tip) { tip.style.display = "none"; }
+	var rs = gid("run_status");
+	if (rs) { rs.innerHTML = '<span class="phantom-badge phantom-badge-stopped">状态未知</span>'; }
+}
+
+function flush_probe(ok) {
+	var ws = _probeWaiters, i;
+	_probeWaiters = [];
+	for (i = 0; i < ws.length; i++) {
+		try { ws[i](ok); } catch (e) { console.log("probe cb: " + e); }
+	}
+}
+
+// 会话探针：走 .asp（httpd 自己的会话检查），不经过 httpdb，因此不会触发崩溃。
+function session_probe(cb) {
+	if (SESSION_LOST) { return; }
+	_probeWaiters.push(cb);
+	if (_probeBusy) { return; }   // 同一时刻只打一发，多个等待者共享结果
+	_probeBusy = true;
+	run_probe();
+}
+
+function run_probe() {
+	_probeTimer = null;
+	$.ajax({
+		url: PING_PATHS[_pingPath],
+		type: 'GET',
+		dataType: 'text',
+		cache: false,
+		success: function(body) {
+			_probeBusy = false;
+			if (is_login_redirect(body)) {
+				// 拿到的不是页面而是登录跳转页 —— 会话确实没了
+				session_lost('会话探针返回登录页');
+				flush_probe(false);
+				return;
+			}
+			if (_pingPath === 0 && (!body || body.indexOf(PING_MARK) < 0)) {
+				// 探针页存在但内容不对（旧包残留 / 被清理过）—— 退回管理页本体
+				use_ping_fallback();
+				return;
+			}
+			_probeFails = 0;
+			flush_probe(true);
+		},
+		error: function(xhr, textStatus) {
+			if (_pingPath === 0 && xhr && xhr.status === 404) {
+				// 本固件只把 /Module_* 交给 koolshare 的 webs 处理器：探针页取不到
+				// （名字不对、旧包残留、被清理）就退回管理页本体，它一定存在。
+				use_ping_fallback();
+				return;
+			}
+			_probeFails++;
+			if (_probeFails < PROBE_MAX_FAILS) {
+				// httpd 可能刚被 watchdog 重启（真机约 20-30 秒），退避重试
+				_probeTimer = setTimeout(run_probe, PROBE_RETRY_MS);
+				return;
+			}
+			_probeBusy = false;
+			session_lost('会话探针无响应（' + (textStatus || '') + '）');
+			flush_probe(false);
+		}
+	});
+}
+
+// httpd 在会话失效时返回的是「跳到登录页」的 HTML（而不是 401/JSON）。
+// 只认这个组合，避免把管理页里「重新登录」链接误判成会话失效。
+function is_login_redirect(body) {
+	return !!body && body.indexOf(LOGIN_REDIRECT_MARK) >= 0
+		&& body.indexOf('Main_Login.asp') >= 0;
+}
+
+// 探针页不可用时固定回退到管理页本体（49KB，只在探针页缺失时才用）
+function use_ping_fallback() {
+	_pingPath = 1;
+	_probeFails = 0;
+	run_probe();   // 立刻用回退候选重试，等待者继续排队
+}
+
+// 所有走 httpdb 通道（/_api/、/_temp/）的请求都必须从这里进：
+// 会话失效时那些请求会把 httpd 打崩，而 .asp 探针不会。
+function probe_then(ok_fn, fail_fn) {
+	if (SESSION_LOST) { return; }
+	session_probe(function(ok) {
+		if (ok) { ok_fn(); } else if (fail_fn) { fail_fn(); }
+	});
+}
+
+// 后台标签页不轮询：浏览器会把定时器限流到 1 分钟一次，而失效会话的请求
+// 正好会让 httpd 每分钟崩一次（真机连续崩了两小时就是这个形态）。
+function hook_visibility() {
+	if (!document.addEventListener) { return; }
+	document.addEventListener("visibilitychange", function() {
+		if (document.hidden) { stop_pollers(); return; }
+		if (SESSION_LOST) { return; }
+		get_run_status();
+		if (gid("tablet_2") && gid("tablet_2").style.display !== "none") { get_log(); }
+	}, false);
+}
+
 function get_dbus_data() {
+	// 先探针再读配置：会话失效时这个 /_api/ 请求会把 httpd 打崩
+	probe_then(fetch_dbus_data, function() {
+		show_error("路由器登录会话已失效，无法读取配置。");
+	});
+}
+
+function fetch_dbus_data() {
 	$.ajax({
 		type: "GET",
 		url: "/_api/phantom",
@@ -131,6 +302,10 @@ function get_dbus_data() {
 		cache: false,
 		async: false,
 		success: function(data) {
+			if (data && data.result == -403) {
+				session_lost('读配置被拒绝（-403）');
+				return;
+			}
 			dbus = (data && data.result && data.result[0]) ? data.result[0] : {};
 			// 分步 try/catch：conf2obj 里任何一个字段对不上 DOM，
 			// 都不能连累后面的界面初始化（否则表现为「页面没反应」）
@@ -141,7 +316,12 @@ function get_dbus_data() {
 		},
 		error: function(XmlHttpRequest, textStatus, errorThrown) {
 			console.log(XmlHttpRequest.responseText);
-			show_error("GET /_api/phantom 无响应（" + textStatus + "）。插件可能没装完整，请重新安装。");
+			// 无响应也可能是 httpd 刚崩过：先探一次会话，会话还在就按普通读取失败提示
+			session_probe(function(ok) {
+				if (ok) {
+					show_error("GET /_api/phantom 无响应（" + textStatus + "）。插件可能没装完整，请重新安装。");
+				}
+			});
 		}
 	});
 }
@@ -182,16 +362,34 @@ function validate_tun() {
 	return ok;
 }
 
+// 白名单按「逗号 / 空格 / 换行」分隔 —— 页面占位符写的是「一行一个域名，或用
+// 逗号分隔」，所以多行输入必须当成多条规则，而不是一条非法规则。
+//
+// 为什么必须在页面就折成单行：**dbus 存不了多行文本**。httpdb 不处理 JSON
+// 转义，`"a.com\nb.com"` 会被原样落库成字面 `a.com\nb.com`（4 个可见字符的
+// `\`+`n`），于是按逗号切只有一条 → 页面标红报错，脚本按逗号切会写出
+// `a.comnb.com` 这种垃圾域名。发送前折成 `a.com,b.com` 就一切正常。
+function split_whitelist(txt) {
+	var parts = String(txt === undefined || txt === null ? "" : txt).split(/[\s,;]+/);
+	var out = [], i, d;
+	for (i = 0; i < parts.length; i++) {
+		d = parts[i].replace(/^\s+|\s+$/g, "");
+		if (d === "" || out.indexOf(d) >= 0) { continue; }   // 去空、去重
+		out.push(d);
+	}
+	return out;
+}
+
+function normalize_whitelist(txt) { return split_whitelist(txt).join(","); }
+
 function update_wl_count() {
-	var txt = gid("phantom_whitelist").value;
-	var parts = txt.split(",");
+	var parts = split_whitelist(gid("phantom_whitelist").value);
 	var n = 0, bad = 0, i;
 	for (i = 0; i < parts.length; i++) {
-		var d = parts[i].replace(/^\s+|\s+$/g, "");
-		if (d === "") { continue; }
-		if (/^[a-z0-9]([a-z0-9.\-_*]*[a-z0-9*])?$/i.test(d)) { n++; } else { bad++; }
+		if (/^[a-z0-9]([a-z0-9.\-_*]*[a-z0-9*])?$/i.test(parts[i])) { n++; } else { bad++; }
 	}
-	gid("wl_tip").innerHTML = "共 " + n + " 条" + (bad > 0 ? "，其中 " + bad + " 条格式不合法（已标红）" : "");
+	gid("wl_tip").innerHTML = "共 " + n + " 条" + (bad > 0 ? "，其中 " + bad + " 条格式不合法（已标红）" : "")
+		+ "（多行/空格会被折成一行逗号分隔）";
 	gid("phantom_whitelist").className = (bad > 0) ? "phantom-textarea phantom-textarea-invalid" : "phantom-textarea";
 }
 
@@ -242,53 +440,70 @@ function set_metric(id, text) {
 	setTimeout(function() { el.className = "phantom-metric-value"; }, 300);
 }
 
+function schedule_status(ms) {
+	if (_statusTimer) { clearTimeout(_statusTimer); }
+	_statusTimer = setTimeout(get_run_status, ms);
+}
+
 function get_run_status() {
+	_statusTimer = null;
+	if (SESSION_LOST) { return; }
 	// 未启用时隧道一定没在跑，没必要每 2 秒去请求状态文件
 	var on = gid("phantom_enable") && gid("phantom_enable").checked;
 	if (!on) {
 		render_stopped();
-		_statusTimer = setTimeout("get_run_status();", 5000);
+		schedule_status(5000);
 		return;
 	}
+	if (document.hidden) { schedule_status(5000); return; }
 	if (statusPath >= STATUS_PATHS.length) {
 		render_stopped();
-		_statusTimer = setTimeout("get_run_status();", 5000);
+		schedule_status(5000);
 		return;
 	}
-	$.ajax({
-		url: STATUS_PATHS[statusPath],
-		type: 'GET',
-		dataType: 'text',
-		async: true,
-		cache: false,
-		success: function(response) {
-			var st = null;
-			try { st = JSON.parse(response); } catch (e) { st = null; }
-			if (!st) { render_stopped(); return; }
-			if (st.running === 1) {
-				gid("run_status").innerHTML = '<span class="phantom-badge phantom-badge-running">运行中</span>';
-				set_metric("m_down", fmt_rate(st.down_rate));
-				set_metric("m_up", fmt_rate(st.up_rate));
-				set_metric("m_total_down", fmt_bytes(st.total_down));
-				set_metric("m_total_up", fmt_bytes(st.total_up));
-				set_metric("m_conns", String(st.conns));
-				set_metric("m_direct", String(st.direct));
-				set_metric("m_proxy", String(st.proxy));
-				set_metric("m_cpu", st.cpu + " %");
-				set_metric("m_gw", gw_label(st.gw));
-				set_metric("m_ipset", String(st.ipset || 0));
-				set_metric("m_fd", (st.fd || 0) + " / " + (st.fdl || 0));
-			} else {
+	// **必须先过会话探针**：会话失效时直接打 /_temp/ 会把 httpd 打崩
+	probe_then(function() {
+		$.ajax({
+			url: status_url(),
+			type: 'GET',
+			dataType: 'text',
+			async: true,
+			cache: false,
+			success: function(response) {
+				var st = null;
+				try { st = JSON.parse(response); } catch (e) { st = null; }
+				if (!st) { render_stopped(); return; }
+				// 「上次动作」随状态文件一起带回，不再单独轮询 /_api/phantom_last_act
+				if (st.last_act !== undefined && gid("last_act")) {
+					gid("last_act").innerHTML = st.last_act;
+				}
+				if (st.running === 1) {
+					gid("run_status").innerHTML = '<span class="phantom-badge phantom-badge-running">运行中</span>';
+					set_metric("m_down", fmt_rate(st.down_rate));
+					set_metric("m_up", fmt_rate(st.up_rate));
+					set_metric("m_total_down", fmt_bytes(st.total_down));
+					set_metric("m_total_up", fmt_bytes(st.total_up));
+					set_metric("m_conns", String(st.conns));
+					set_metric("m_direct", String(st.direct));
+					set_metric("m_proxy", String(st.proxy));
+					set_metric("m_cpu", st.cpu + " %");
+					set_metric("m_gw", gw_label(st.gw));
+					set_metric("m_ipset", String(st.ipset || 0));
+					set_metric("m_fd", (st.fd || 0) + " / " + (st.fdl || 0));
+				} else {
+					render_stopped();
+				}
+			},
+			error: function() {
+				// 这条路径读不到就换下一条（不同固件的 docroot 不一样）
+				statusPath++;
 				render_stopped();
+			},
+			complete: function() {
+				if (!SESSION_LOST) { schedule_status(2000); }
 			}
-		},
-		error: function() {
-			// 这条路径读不到就换下一条（不同固件的 docroot 不一样）
-			statusPath++;
-			render_stopped();
-		}
+		});
 	});
-	_statusTimer = setTimeout("get_run_status();", 2000);
 }
 
 function render_stopped() {
@@ -312,20 +527,10 @@ function gw_label(mode) {
 	return "-";
 }
 
-function get_last_act() {
-	$.ajax({
-		type: "GET",
-		url: "/_api/phantom_last_act",
-		dataType: "json",
-		async: true,
-		cache: false,
-		success: function(data) {
-			var s = data.result[0];
-			if (s && s["phantom_last_act"]) { gid("last_act").innerHTML = s["phantom_last_act"]; }
-		}
-	});
-	setTimeout("get_last_act();", 5000);
-}
+// 「上次动作」以前每 5 秒单独轮询 /_api/phantom_last_act —— 那是每轮多一次
+// 走 httpdb 的请求，会话失效时就多一次把 httpd 打崩的机会。现在由状态文件
+// 带回（phantom_status.sh 把 dbus 的 last_act 写进 JSON），见 get_run_status()。
+// 服务端的 /_api/phantom_last_act 与 dbus 键都保留，SSH / 其它工具照旧可用。
 
 // ---------------------------------------------------------------- 提交
 
@@ -339,21 +544,29 @@ function collect_fields() {
 		el = gid(params_chk[i]);
 		if (el) { dbus_new[params_chk[i]] = el.checked ? '1' : '0'; }
 	}
+	// 白名单折成单行逗号分隔：dbus 存不了多行（httpdb 会把 JSON 的 \n 原样落库，
+	// 结果既是页面标红「格式不合法」，又是脚本写出 github.comnjetbrains.com 这类垃圾域名）
+	if (dbus_new["phantom_whitelist"] !== undefined) {
+		dbus_new["phantom_whitelist"] = normalize_whitelist(dbus_new["phantom_whitelist"]);
+	}
 	dbus_new["phantom_cron_time"] = gid("cron_hour").value + ":" + gid("cron_minute").value;
 	return dbus_new;
 }
 
 // 提交期间给出可见进度，并禁用按钮，避免用户重复点击
 function set_busy(on, msg) {
+	// 会话失效后按钮永久禁用：此时的任何 httpdb 请求都会把 httpd 打崩
+	if (SESSION_LOST) { on = false; }
 	var tip = gid("busy_tip");
 	if (tip) {
 		tip.style.display = on ? "" : "none";
 		if (msg) { tip.innerHTML = msg; }
 	}
+	var off = on || SESSION_LOST;
 	var b1 = gid("apply_button-1");
-	if (b1) { b1.disabled = on; }
+	if (b1) { b1.disabled = off; }
 	var b2 = gid("apply_button-2");
-	if (b2) { b2.disabled = on; }
+	if (b2) { b2.disabled = off; }
 }
 
 // 必须用异步 XHR。
@@ -367,31 +580,100 @@ function set_busy(on, msg) {
 // 因此 **$1 是请求 id，action 在 $2**，脚本必须回包 /_resp/<id>，否则前端
 // 一直转圈、最后弹「后台执行失败」。其它插件（ks_app_install.sh、
 // clash_downyamlsel.sh）都是这个形状，这里保持一致。
-function post_action(flag, after, busyMsg) {
+//
+// 这段代码同时负责「httpd 崩溃」的自救：真机上 httpd 会因为失效会话的
+// httpdb 请求而 SIGSEGV（watchdog 约 20-30 秒后把它拉起来），提交正好撞上
+// 时浏览器只会看到「提交失败（请求未完成）」，而 fields 一个都没进 dbus。
+// 所以：提交前先探针；撞上崩溃时不要拿旧会话盲目重试（那只会再崩一次），
+// 而是等它恢复、确认会话仍在、换新请求 id 再试；最后仍无响应时用 dbus 里
+// 的实际值核对「到底生效没有」，不把已生效的提交误报成失败。
+var POST_MAX_ATTEMPTS = 2;      // 首发 + 1 次重试（每次都用新的请求 id）
+var POST_RETRY_DELAY_MS = 5000; // 等 watchdog 把 httpd 拉起来
+
+function post_action(flag, after, busyMsg, attempt) {
+	if (SESSION_LOST) { return; }
+	if (attempt === undefined) { attempt = 1; }
 	var id = parseInt(Math.random() * 100000000);
 	var postData = {"id": id, "method": "phantom_config.sh", "params": [String(flag)], "fields": collect_fields()};
-	set_busy(true, busyMsg || "正在应用配置，请稍候…（启动隧道需要几秒）");
-	$.ajax({
-		url: "/_api/",
-		cache: false,
-		async: true,
-		type: "POST",
-		dataType: "json",
-		data: JSON.stringify(postData),
-		success: function(response) {
-			set_busy(false);
-			if (response && response.result == id) {
-				if (after) { after(); }
-			} else {
-				alert("后台执行失败，请看日志页");
+	if (attempt === 1) {
+		set_busy(true, busyMsg || "正在应用配置，请稍候…（启动隧道需要几秒）");
+	}
+	probe_then(function() {
+		$.ajax({
+			url: "/_api/",
+			cache: false,
+			async: true,
+			type: "POST",
+			dataType: "json",
+			data: JSON.stringify(postData),
+			success: function(response) {
+				set_busy(false);
+				if (response && response.result == id) {
+					if (after) { after(); }
+					return;
+				}
+				if (response && response.result == -403) {
+					session_lost('提交被拒绝（-403）');
+					return;
+				}
+				alert("后台执行失败（result=" + ((response && response.result !== undefined) ? response.result : "空") + "），请看日志页");
 				get_log();
+			},
+			error: function(xhr, textStatus) {
+				if (attempt < POST_MAX_ATTEMPTS) {
+					set_busy(true, "路由器 Web 服务中断（httpd 崩溃后由 watchdog 重启），正在等它恢复并重试…");
+					setTimeout(function() {
+						// 探针确认会话仍然有效才重试；会话已失效就只提示重新登录
+						probe_then(function() {
+							post_action(flag, after, busyMsg, attempt + 1);
+						}, function() { set_busy(false); });
+					}, POST_RETRY_DELAY_MS);
+					return;
+				}
+				set_busy(true, "没有收到回应，正在核对配置是否已经生效…");
+				verify_applied(postData.fields, function(applied) {
+					set_busy(false);
+					if (applied) {
+						alert("提交已生效（响应在路由器 Web 服务重启时丢失，但配置已经写入）。");
+						if (after) { after(); }
+						return;
+					}
+					alert("提交失败（请求未完成）。\nHTTP " + ((xhr && xhr.status) ? xhr.status : "无响应")
+						+ "（" + (textStatus || "") + "）\n"
+						+ "若页面顶部提示「登录会话已失效」，请重新登录后再提交；\n"
+						+ "否则请用 SSH 排查：\n/bin/sh /koolshare/scripts/phantom_config.sh 1");
+				});
 			}
-		},
-		error: function() {
-			set_busy(false);
-			alert("提交失败（请求未完成）。\n请用 SSH 排查：\n/bin/sh /koolshare/scripts/phantom_config.sh 1");
-		}
+		});
 	});
+}
+
+// 提交（或重试）都没收到回应时，用 dbus 里的实际值判断到底生效没有：
+// 请求可能已经送达、只是响应在 httpd 崩溃时丢了 —— 那种情况不能让用户
+// 以为是失败，否则他会重复提交。
+function verify_applied(fields, cb) {
+	probe_then(function() {
+		$.ajax({
+			url: "/_api/phantom",
+			type: "GET",
+			dataType: "json",
+			cache: false,
+			success: function(data) {
+				var cur = (data && data.result && data.result[0]) ? data.result[0] : {};
+				var keys = ["phantom_whitelist", "phantom_enable", "phantom_uri",
+				            "phantom_mode", "phantom_cron_time"];
+				var match = true, i, k, a;
+				for (i = 0; i < keys.length; i++) {
+					k = keys[i];
+					if (fields[k] === undefined) { continue; }
+					a = (cur[k] === undefined || cur[k] === null) ? "" : String(cur[k]);
+					if (a !== String(fields[k])) { match = false; }
+				}
+				cb(match);
+			},
+			error: function() { cb(false); }
+		});
+	}, function() { cb(false); });
 }
 
 // 当前可用的状态文件路径（两条候选都试完则为 null）
@@ -405,11 +687,14 @@ function status_url() {
 // 起来了就提示成功，超时就提示去看日志，而不是让页面一直转圈。
 var _waitLeft = 0;
 function wait_started(maxSec) {
+	if (_startedTimer) { clearTimeout(_startedTimer); _startedTimer = null; }
 	_waitLeft = maxSec;
 	poll_started();
 }
 
 function poll_started() {
+	_startedTimer = null;
+	if (SESSION_LOST) { return; }
 	var url = status_url();
 	if (!gid("phantom_enable").checked) { set_busy(false); return; }
 	if (url === null) {
@@ -420,24 +705,29 @@ function poll_started() {
 		set_busy(true, "启动较慢或失败，请切到「查看日志」确认。");
 		return;
 	}
-	$.ajax({
-		url: url,
-		type: 'GET',
-		dataType: 'text',
-		cache: false,
-		success: function(response) {
-			var st = null;
-			try { st = JSON.parse(response); } catch (e) { st = null; }
-			if (st && st.running === 1) {
-				set_busy(true, "✔ 隧道已启动");
-				set_metric("m_down", fmt_rate(st.down_rate));
-				set_metric("m_up", fmt_rate(st.up_rate));
-				setTimeout(function() { set_busy(false); }, 1500);
-				return;
+	// 状态文件同样走 httpdb 通道，必须先过会话探针
+	probe_then(function() {
+		$.ajax({
+			url: url,
+			type: 'GET',
+			dataType: 'text',
+			cache: false,
+			success: function(response) {
+				var st = null;
+				try { st = JSON.parse(response); } catch (e) { st = null; }
+				if (st && st.running === 1) {
+					set_busy(true, "✔ 隧道已启动");
+					set_metric("m_down", fmt_rate(st.down_rate));
+					set_metric("m_up", fmt_rate(st.up_rate));
+					setTimeout(function() { set_busy(false); }, 1500);
+					return;
+				}
+				_startedTimer = setTimeout(poll_started, 1000);
+			},
+			error: function() {
+				if (!SESSION_LOST) { _startedTimer = setTimeout(poll_started, 1000); }
 			}
-			setTimeout("poll_started();", 1000);
-		},
-		error: function() { setTimeout("poll_started();", 1000); }
+		});
 	});
 }
 
@@ -449,33 +739,46 @@ function poll_speed_result(maxSec) {
 }
 
 function poll_speed() {
+	_speedTimer = null;
+	if (SESSION_LOST) { return; }
 	if (_speedLeft-- <= 0) {
 		gid("speed_result").innerHTML = "测速完成（结果见日志）";
 		return;
 	}
-	$.ajax({
-		type: "GET",
-		url: "/_api/phantom_speed_last",
-		dataType: "json",
-		cache: false,
-		success: function(data) {
-			var s = data.result[0];
-			var v = s && s["phantom_speed_last"] ? s["phantom_speed_last"] : "";
-			if (v && v.indexOf("测速中") !== 0) {
-				gid("speed_result").innerHTML = v;
-				return;
-			}
-			setTimeout("poll_speed();", 2000);
-		},
-		error: function() { setTimeout("poll_speed();", 2000); }
+	probe_then(function() {
+		$.ajax({
+			type: "GET",
+			url: "/_api/phantom_speed_last",
+			dataType: "json",
+			cache: false,
+			success: function(data) {
+				if (data && data.result == -403) {
+					session_lost('测速通道被拒绝（-403）');
+					return;
+				}
+				var s = (data && data.result) ? data.result[0] : null;
+				var v = (s && s["phantom_speed_last"]) ? s["phantom_speed_last"] : "";
+				if (v && v.indexOf("测速中") !== 0) {
+					gid("speed_result").innerHTML = v;
+					return;
+				}
+				_speedTimer = setTimeout(poll_speed, 2000);
+			},
+			error: function() { _speedTimer = setTimeout(poll_speed, 2000); }
+		});
 	});
 }
 
 function save(flag) {
+	if (SESSION_LOST) { return; }
 	if (!validate_uri() || !validate_tun()) {
 		alert("配置有误，请先修正标红的输入项");
 		return;
 	}
+	// 折成单行再提交：所见即所存（dbus 里就是这一行逗号分隔，避免 httpdb 把
+	// 换行原样落库后又被当成一条非法规则）
+	gid("phantom_whitelist").value = normalize_whitelist(gid("phantom_whitelist").value);
+	update_wl_count();
 	dbus["phantom_enable"] = gid("phantom_enable").checked ? "1" : "0";
 	post_action(flag, function() {
 		get_log();
@@ -488,6 +791,7 @@ function save(flag) {
 }
 
 function speedtest() {
+	if (SESSION_LOST) { return; }
 	gid("speed_result").innerHTML = "测速中…";
 	post_action(3, function() {
 		get_log();
@@ -496,6 +800,7 @@ function speedtest() {
 }
 
 function clear_log() {
+	if (SESSION_LOST) { return; }
 	post_action(2, function() { get_log(); }, "正在清空日志…");
 }
 
@@ -505,31 +810,36 @@ function get_log() {
 	// 单定时器：切到日志 tab 与提交成功回调都会调 get_log()，
 	// 不收敛就会各起一条 1.5s 轮询，白白多一倍请求。
 	if (_logTimer) { clearTimeout(_logTimer); _logTimer = null; }
+	if (SESSION_LOST) { return; }
 	var retArea = gid("log_content_text");
 	if (logPath >= LOG_PATHS.length) {
 		retArea.value = "读取不到日志文件（已试过：" + LOG_PATHS.join("、") + "）。\n"
 			+ "请用 SSH 查看：/bin/sh /koolshare/scripts/phantom_config.sh diag";
 		return;
 	}
-	$.ajax({
-		url: LOG_PATHS[logPath],
-		type: 'GET',
-		dataType: 'html',
-		async: true,
-		cache: false,
-		success: function(response) {
-			if (_responseLen == response.length) { noChange++; } else { noChange = 0; }
-			if (noChange > 200) { return false; }
-			retArea.value = response;
-			retArea.scrollTop = retArea.scrollHeight;
-			_responseLen = response.length;
-			_logTimer = setTimeout("get_log();", 1500);
-		},
-		error: function() {
-			// 换下一条候选路径；全试完时 get_log() 会显示 SSH 提示并停止轮询
-			logPath++;
-			get_log();
-		}
+	if (document.hidden) { return; }
+	// 日志同样走 httpdb 通道（/_temp/），会话失效时必须先停手
+	probe_then(function() {
+		$.ajax({
+			url: LOG_PATHS[logPath],
+			type: 'GET',
+			dataType: 'html',
+			async: true,
+			cache: false,
+			success: function(response) {
+				if (_responseLen == response.length) { noChange++; } else { noChange = 0; }
+				if (noChange > 200) { return false; }
+				retArea.value = response;
+				retArea.scrollTop = retArea.scrollHeight;
+				_responseLen = response.length;
+				_logTimer = setTimeout(get_log, 1500);
+			},
+			error: function() {
+				// 换下一条候选路径；全试完时 get_log() 会显示 SSH 提示并停止轮询
+				logPath++;
+				get_log();
+			}
+		});
 	});
 }
 
@@ -598,6 +908,10 @@ function reload_Soft_Center() {
 										<div style="margin-left:5px;" id="head_illustrate">
 											<li><em>Phantom</em> 把路由器变成透明网关：LAN 内设备无需任何配置，命中白名单的流量自动经加密隧道出网。</li>
 										</div>
+										<!-- 会话失效横幅：ASUS 默认 30 分钟无操作自动登出，而失效会话的
+										     httpdb 请求会把本固件的 httpd 打崩，所以一旦探针发现会话没了
+										     就停掉全部轮询并在这里提示重新登录 -->
+										<div id="session_banner" class="phantom-warn" style="display:none;margin:8px 0 0 5px;"></div>
 										<div id="phantom_switch" style="margin:5px 0px 0px 0px;">
 											<table width="100%" border="1" align="center" cellpadding="4" cellspacing="0" bordercolor="#6b8fa3" class="FormTable">
 												<thead>
@@ -813,7 +1127,7 @@ function reload_Soft_Center() {
 														          placeholder="一行一个域名，或用逗号分隔，例如：&#10;example.com&#10;sub.example.org"
 														          onkeyup="update_wl_count();"></textarea>
 														<div class="phantom-hint" id="wl_tip"></div>
-														<div class="phantom-hint">Phantom 默认直连，只有命中白名单的目标才进隧道。保存后会自动重启隧道生效。</div>
+														<div class="phantom-hint">Phantom 默认直连，只有命中白名单的目标才进隧道。多行/空格会自动折成一行逗号分隔（路由器配置库只能存单行）。保存后隧道生效。</div>
 													</td>
 												</tr>
 											</table>
@@ -845,7 +1159,7 @@ function reload_Soft_Center() {
 												<tr>
 													<th>测速</th>
 													<td>
-														<a type="button" class="ks_btn" style="width:auto;padding:5px 14px;" onclick="speedtest();">开始测速</a>
+														<a id="speed_btn" type="button" class="ks_btn" style="width:auto;padding:5px 14px;" onclick="speedtest();">开始测速</a>
 														<span id="speed_result" class="phantom-hint" style="margin-left:10px;"></span>
 														<div class="phantom-hint">经 SOCKS5 127.0.0.1:1080 下载测速（默认 5MB 样本），得到的是 phantom 用户态转发吞吐上限；不含 LAN→TUN 的 NAT 转发路径，因此不等于客户端实测网速。日志里会给出「达到服务端带宽上限的百分之多少」的结论。</div>
 													</td>

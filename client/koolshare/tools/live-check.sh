@@ -109,6 +109,32 @@ ls -l /www/_temp/phantom_log.txt /www/_temp/phantom_status.txt 2>/dev/null || ec
 echo "httpdb   : $(netstat -lntp 2>/dev/null | grep -c ':3030 ') 个监听（应为 1，127.0.0.1:3030）"
 
 echo ""
+echo "########## 3.5 httpd 健康（失效会话会把它打崩） ##########"
+# 本固件的 httpd 在「登录会话已失效」时收到走 httpdb 通道的请求（/_api/、
+# /_temp/）会直接 SIGSEGV，watchdog 约 20-30 秒后 start_httpd 把它拉起来。
+# 崩溃瞬间的在途请求全部被重置 —— 页面点「提交」就是这个症状：弹
+# 「提交失败（请求未完成）」，而 fields 根本没进 dbus（日志页也没有新行）。
+#
+# 插件侧已改成「.asp 会话预检 + 失效即停」：探针页不经过 httpdb，会话没了
+# 就停掉全部轮询，不再反复把 httpd 打崩。这里用来确认现场状态。
+echo "http_autologout : $(nvram get http_autologout 2>/dev/null) 分钟（ASUS 无操作自动登出）"
+echo "会话探针页      : $([ -f /koolshare/webs/phantom_ping.asp ] && echo /koolshare/webs/phantom_ping.asp || echo '(缺失 —— 旧版页面没有会话预检，失效会话会打崩 httpd)')"
+if [ -f /tmp/syslog.log ]; then
+    crashes=$(grep -c 'Comm: httpd' /tmp/syslog.log 2>/dev/null)
+    echo "httpd 崩溃次数  : ${crashes:-0}"
+    if [ "${crashes:-0}" -gt 0 ]; then
+        echo "最近一次崩溃    : $(grep 'Comm: httpd' /tmp/syslog.log 2>/dev/null | tail -n 1)"
+    fi
+    echo "watchdog 重启   : $(grep -c 'watchdog: start httpd' /tmp/syslog.log 2>/dev/null) 次"
+    if [ "${crashes:-0}" -gt 0 ]; then
+        echo "提示: 有崩溃记录。计数仍在增长 = 还有页面/App 拿着失效会话在轮询；"
+        echo "      重新登录路由器 Web（必要时 killall httpd 让 watchdog 起一个干净的）即可收敛。"
+    fi
+else
+    echo "httpd 崩溃次数  : (无 /tmp/syslog.log，跳过)"
+fi
+
+echo ""
 echo "########## 4. 进程 / 钩子 / 规则残留（未启用时应全空） ##########"
 pid=$(cat /tmp/phantom.pid 2>/dev/null)
 echo "pidfile   : ${pid:-（无）}"

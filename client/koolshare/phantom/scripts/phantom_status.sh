@@ -76,6 +76,29 @@ CURL="${PHANTOM_CURL:-}"
 WGET="${PHANTOM_WGET:-}"
 [ -n "$WGET" ] && [ -x "$WGET" ] || WGET=$(cmd_path wget)
 
+# 「上次动作」随状态文件一起带给页面。
+#
+# 页面原来每 5 秒单独轮询 httpdb 的 /_api/phantom_last_act —— 那是每轮多一次
+# 走 httpdb 的请求，而本固件的 httpd 碰上「失效会话 + httpdb 请求」会直接
+# SIGSEGV（真机 syslog 里 130 多次 Comm: httpd 崩溃）。少一个通道就少一次
+# 把路由器 Web 服务打崩的机会，所以并进状态文件。/_api/phantom_last_act 与
+# dbus 键都保留，SSH / 其它工具照旧可用。
+DBUS="${PHANTOM_DBUS:-}"
+[ -n "$DBUS" ] && [ -x "$DBUS" ] || DBUS=$(cmd_path dbus)
+USE_DBUS=0
+if [ "${PHANTOM_KS:-1}" = "1" ] && [ -n "$DBUS" ] \
+   && "$DBUS" get ${module}_version >/dev/null 2>&1; then
+    USE_DBUS=1
+fi
+
+read_last_act() {
+    if [ "$USE_DBUS" = "1" ]; then
+        "$DBUS" get ${module}_last_act 2>/dev/null
+    else
+        sed -n "s/^last_act='\(.*\)'\$/\1/p" "${RUNTIME_DIR}/etc/phantom.conf" 2>/dev/null | head -n 1
+    fi
+}
+
 # curl 优先，没有就退到 busybox wget（部分精简固件只带 wget）
 fetch() {
     if [ -n "$CURL" ]; then
@@ -87,7 +110,7 @@ fetch() {
 
 write_empty() {
     cat >"${STATUS_JSON}.tmp" 2>/dev/null <<EOF
-{"ts":$(date +%s),"running":0,"up_rate":0,"down_rate":0,"total_up":0,"total_down":0,"udp_up":0,"udp_down":0,"conns":0,"direct":0,"proxy":0,"cpu":0,"gw":"-","ipset":0,"fd":0,"fdl":0}
+{"ts":$(date +%s),"running":0,"up_rate":0,"down_rate":0,"total_up":0,"total_down":0,"udp_up":0,"udp_down":0,"conns":0,"direct":0,"proxy":0,"cpu":0,"gw":"-","ipset":0,"fd":0,"fdl":0,"last_act":"$(read_last_act | tr -d '\\"')"}
 EOF
     mv "${STATUS_JSON}.tmp" "${STATUS_JSON}" 2>/dev/null
     chmod 644 "${STATUS_JSON}" 2>/dev/null
@@ -167,7 +190,7 @@ while :; do
         prev_ticks=$ticks
 
         cat >"${STATUS_JSON}.tmp" 2>/dev/null <<EOF
-{"ts":${now},"running":1,"up_rate":${up_rate},"down_rate":${down_rate},"total_up":${total_up},"total_down":${total_down},"udp_up":${udp_up},"udp_down":${udp_down},"conns":${conns},"direct":${direct},"proxy":${proxy},"cpu":${cpu},"gw":"${gw}","ipset":${ipset_entries},"fd":${fd_used},"fdl":${fd_limit}}
+{"ts":${now},"running":1,"up_rate":${up_rate},"down_rate":${down_rate},"total_up":${total_up},"total_down":${total_down},"udp_up":${udp_up},"udp_down":${udp_down},"conns":${conns},"direct":${direct},"proxy":${proxy},"cpu":${cpu},"gw":"${gw}","ipset":${ipset_entries},"fd":${fd_used},"fdl":${fd_limit},"last_act":"$(read_last_act | tr -d '\\"')"}
 EOF
         mv "${STATUS_JSON}.tmp" "${STATUS_JSON}" 2>/dev/null
         chmod 644 "${STATUS_JSON}" 2>/dev/null

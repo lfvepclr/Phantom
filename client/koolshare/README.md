@@ -93,7 +93,9 @@ client/koolshare/
     │             phantom_cron.sh       定时任务
     │             phantom_watchdog.sh   看门狗
     │             phantom_diag.sh       一键诊断
-    ├── webs/     Module_phantom.asp
+    ├── webs/     Module_phantom.asp     管理页（rev 见页头）
+    │             Module_phantom_ping.asp  会话探针页（httpdb 请求前的 .asp 预检）
+    │                                    名字必须以 Module_ 开头，见 §9
     ├── bin/      phantom-aarch64 / phantom-armv7（打包注入，不入库）
     └── tests/    mock-bin/（dbus / nvram / cru / curl / phantom 替身）+ smoke.sh
 ```
@@ -145,7 +147,7 @@ httpdb 先把 `fields` 写进 dbus，再执行 `/koolshare/scripts/<method> <id>
 | `phantom_table` | `200` | 策略路由表 |
 | `phantom_dns_hijack` | `1` | LAN 53 端口导入隧道 |
 | `phantom_builtin_wl` | `1` | 内置被墙域名表 |
-| `phantom_whitelist` | 空 | 自定义域名，**逗号分隔单行** |
+| `phantom_whitelist` | 空 | 自定义域名，**逗号分隔单行**（dbus 存不了多行：页面把多行/空格折成逗号分隔，脚本侧再把字面 `\n`、空白一并当分隔符兜底） |
 | `phantom_cron_enable` / `phantom_cron_time` | `0` / `4:30` | 定时重启 |
 | `phantom_watchdog` | `1` | 看门狗 |
 | `phantom_log_level` | `warn` | error / warn / info / debug（info 会为每条连接/路由打一行，夜里费 CPU 与 tmpfs） |
@@ -161,8 +163,10 @@ httpdb 先把 `fields` 写进 dbus，再执行 `/koolshare/scripts/<method> <id>
 |---|---|
 | 读配置 | `GET /_api/phantom` → `data.result[0]` |
 | 提交 | `POST /_api/`，体 `{"id":N,"method":"phantom_config.sh","params":["1"],"fields":{…}}`；脚本执行时 `$1=id`、`$2=action`，并回包 `/_resp/<id>` |
+| 会话探针 | `GET /Module_phantom_ping.asp`（正文含 `phantom-ping-ok`；取不到时回退 `GET /Module_phantom.asp` 本体）；**httpdb 请求之前必须先打它**，见 §9 |
 | 状态 | `GET /_temp/phantom_status.txt`（首选，物理文件 `/tmp/upload/phantom_status.txt`） |
 | 日志 | `GET /_temp/phantom_log.txt`（首选，物理文件 `/tmp/upload/phantom_log.txt`） |
+| 上次动作 | 随状态文件带回（`"last_act"` 字段）；`GET /_api/phantom_last_act` 仍保留给 SSH / 其它工具 |
 
 > **运行期文件在 tmpfs，经 httpdb 的 `/_temp/` 暴露。**
 > 状态每 2 秒更新一次，写 JFFS 会磨损 flash，所以文件本身在 `/tmp/upload`；
@@ -253,6 +257,19 @@ ssh -p <SSH端口> admin@<路由器IP> '/bin/sh /koolshare/scripts/phantom_confi
 - 直接 `GET /_temp/phantom_status.txt`、`/_temp/phantom_log.txt` 验证可读
   （物理文件在 `/tmp/upload/`；docroot 下的 `.txt` 恒 404，别在那浪费时间）
 - 皮肤：改完标记行强制刷新，确认三套主色
+- **「提交失败（请求未完成）」先看 httpd 崩没崩**（本固件最容易踩的一条）：
+
+  ```bash
+  # 崩溃计数与最近一次崩溃时间（有崩溃就是它把在途的 POST 掐断了）
+  ssh -p <SSH端口> admin@<路由器IP> "grep -c 'Comm: httpd' /tmp/syslog.log; grep 'Comm: httpd' /tmp/syslog.log | tail -1"
+  # 会话自动登出时长（默认 30 分钟；过期后页面拿着旧 token 访问 httpdb 通道）
+  ssh -p <SSH端口> admin@<路由器IP> 'nvram get http_autologout'
+  ```
+
+  复现：带着任意无效 cookie 请求 httpdb 通道即可让 httpd SIGSEGV
+  （`curl -H 'Cookie: x=y' http://<路由器IP>/_api/phantom_last_act` 会直接断连，
+  而同样带 cookie 请求 `.asp`、或不带 cookie 请求 `/_api/` 都正常）。
+  页面侧的对策见 §9「失效会话会把 httpd 打崩」。
 
 ### 6.3 数据面（不经过 UI）
 
@@ -511,6 +528,42 @@ ts,cpu_pct,conns,fd,fd_limit,ct,fc_hw,fc_sw,d_up,d_dn,t_up,t_dn,ipset,gw,dns_ms,
   `GET /Lang_Hdr.txt` 同为 404（`.asp`/`.js`/`.css`/`.png` 都正常），所以状态与日志
   只能走 httpdb 的 `/_temp/` 通道（物理目录 `/tmp/upload`）。别再尝试往
   `/koolshare/webs` 或 `/www/_temp` 铺软链。
+- **`/koolshare/webs` 里的页面必须以 `Module_` 开头才可访问**：httpd 里硬编码了
+  `Module_` 前缀 + `/koolshare/webs`（`strings /usr/sbin/httpd` 里可见 `isWebServer` /
+  `websApply Updateing asp` / `Module_`），实测 `GET /phantom_ping.asp` → **404**，
+  而 `/Module_xxx.css` 会被它的 webs 处理器接管（200）。所以会话探针页命名为
+  `Module_phantom_ping.asp`；页面另有兜底（取不到探针页时用 `Module_phantom.asp`
+  本体判会话）。往这个目录加任何页面都要遵守这条。
+- **白名单只能存单行，多行会变成一条垃圾域名**：dbus 存不了多行文本，而 httpdb
+  不处理 JSON 转义 —— 用户在「自定义域名」里敲两行 `github.com` / `jetbrains.com`，
+  `"github.com\njetbrains.com"` 会被**原样**落库成字面 `\n`。此时按逗号切只有一条：
+  页面标红「1 条格式不合法」，脚本写出 `github.comnjetbrains.com`（真机复现过）。
+  现在页面在发送前把换行/空格/逗号统一折成单行逗号分隔（`split_whitelist` /
+  `normalize_whitelist`），`write_domains` 再把字面 `\n` 和空白一并当分隔符兜底；
+  冒烟测试两种形态都有断言。
+- **失效会话会把 httpd 打崩（本固件最坑的一条）**：`http_autologout` 默认 30 分钟，
+  会话过期后页面还攥着旧 token，而 httpd 收到**走 httpdb 通道**（`/_api/…`、
+  `/_temp/…`）的失效会话请求会直接 SIGSEGV —— 崩溃那一刻在途请求全被重置，
+  页面点「提交」就是这个症状：弹「提交失败（请求未完成）」，而 `fields` 一个都没进
+  dbus（白名单还是空、日志页没有新行）。更糟的是它会自我维持：httpd 一崩，
+  watchdog 重启它 → 所有旧 token 一起失效 → 攥着旧 token 的页面下一次请求又把它
+  打崩。真机上观测到过**每分钟一次、连续 2 小时 10 分**的崩溃循环（后台标签页被
+  浏览器限流成 1 分钟一次，正好对上）。
+
+  页面侧的对策（`Module_phantom.asp` rev 8 起）：
+
+  - 每次访问 httpdb 之前先 GET `Module_phantom_ping.asp` 做**会话探针**（`.asp` 不经过
+    httpdb，会话失效只会返回登录跳转页，不会崩）；
+  - 探针发现会话失效 → 立刻停掉状态/日志/测速全部轮询、禁用「提交」，顶部横幅提示
+    重新登录，**在重新登录前不再发出任何 httpdb 请求**；
+  - 标签页切到后台（`document.hidden`）时停止轮询，杜绝「限流成 1 分钟一次 →
+    每分钟崩一次」的循环；
+  - 提交撞上 httpd 崩溃时先用探针确认会话仍在、**换新请求 id 重试一次**（拿旧会话
+    盲目重试等于再崩一次），最后一次仍无响应就用 dbus 实际值核对是否已经生效，
+    不把「响应丢了但配置已写入」误报成失败。
+
+  崩溃计数只增不减时：重新登录路由器 Web 即可收敛；实在卡住就
+  `killall httpd` 让 watchdog 起一个干净的（本页已停手，不会再把它打崩）。
 - **软件中心 POST 的调用约定**：`$1` 是请求 id、action 在 `$2`，并且脚本必须回包
   `http://127.0.0.1:3030/_resp/<id>`。这两条任缺其一，页面的表现都是「卡住 →
   后台执行失败」。参照 `ks_app_install.sh` / `clash_downyamlsel.sh` 的写法。

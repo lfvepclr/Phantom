@@ -103,8 +103,11 @@ conf_write() {
     key="$1"
     val=$(printf '%s' "$2" | tr -d "'")
     [ -f "$CONF_FILE_T" ] || { mkdir -p "$(dirname "$CONF_FILE_T")"; touch "$CONF_FILE_T"; }
+    # 与 phantom_config.sh 的 conf_set 保持一致：sed 替换串里的 \ & | 必须转义，
+    # 否则测试自己就把值改掉了（&\n 在连接串与白名单里都真实存在）
+    val_esc=$(printf '%s' "$val" | sed 's/[\\&|]/\\&/g')
     if grep -q "^${key}=" "$CONF_FILE_T" 2>/dev/null; then
-        sed_inplace "s|^${key}=.*|${key}='${val}'|" "$CONF_FILE_T"
+        sed_inplace "s|^${key}=.*|${key}='${val_esc}'|" "$CONF_FILE_T"
     else
         echo "${key}='${val}'" >>"$CONF_FILE_T"
     fi
@@ -204,6 +207,7 @@ for f in phantom_config.sh phantom_status.sh phantom_speedtest.sh phantom_cron.s
     [ -f "$SCRIPTS_DIR_T/$f" ] && ok "$f 已安装" || bad "$f 缺失"
 done
 [ -f "$INST_DIR/webs/Module_phantom.asp" ] && ok "Module_phantom.asp 已安装" || bad "Module_phantom.asp 缺失"
+[ -f "$INST_DIR/webs/Module_phantom_ping.asp" ] && ok "会话探针页 Module_phantom_ping.asp 已安装" || bad "会话探针页缺失（页面无法做会话预检）"
 [ -f "$INST_DIR/res/phantom.css" ] && ok "phantom.css 已安装" || bad "phantom.css 缺失"
 [ -x "$INST_DIR/bin/phantom" ] && ok "二进制已安装且可执行" || bad "二进制缺失"
 [ -f "$RUNTIME_T/phantom.env" ] && ok "phantom.env 已生成" || bad "phantom.env 缺失"
@@ -294,6 +298,77 @@ if grep -q 'async: false' "${ROOT:-/tmp}/pa.js"; then
     bad "post_action 里仍有同步 XHR"
 else
     ok "post_action 无同步 XHR"
+fi
+
+# 本固件的地雷：httpd 碰到「登录会话已失效 + 走 httpdb 通道（/_api/、/_temp/）」
+# 的请求会直接 SIGSEGV。真机 syslog 里 130+ 次 `Comm: httpd` 崩溃 + watchdog
+# 反复 start_httpd；用户点「提交」那一刻正好崩了一次 —— 浏览器弹
+# 「提交失败（请求未完成）」，而 fields 一个都没进 dbus（dbus 白名单仍为空、
+# 日志页没有新行）。崩溃还会自我维持：httpd 一崩、watchdog 重启 → 所有旧
+# token 失效 → 拿着旧 token 的页面下一次请求又把它打崩。
+# 因此页面必须：每次访问 httpdb 之前先用 .asp 探针确认会话（.asp 不会崩），
+# 探针说会话没了就停掉全部轮询；后台标签页也不轮询（浏览器把定时器限流到
+# 1 分钟一次，正是真机上「每分钟崩一次、连崩两小时」的形态）。
+if grep -q "PHANTOM_UI_REV = '8'" "$ASP"; then
+    ok "UI rev 已推进到 8（改了页面要能看出浏览器加载的是哪一版）"
+else
+    bad "UI rev 未推进（仍为 $(sed -n "s/.*PHANTOM_UI_REV *= *'\([0-9]*\)'.*/\1/p" "$ASP" | head -n 1)）"
+fi
+# 探针文件名必须以 Module_ 开头：httpd 只把 /Module_* 路由到 /koolshare/webs，
+# 真机实测 /phantom_ping.asp 恒 404（/Module_xxx.css 则由它的 webs 处理器接管）。
+if grep -q "'/Module_phantom_ping\.asp'" "$ASP" && grep -q 'phantom-ping-ok' "$ASP"; then
+    ok "页面通过 Module_phantom_ping.asp 做会话预检（标记 phantom-ping-ok）"
+else
+    bad "页面缺少可解析的 .asp 会话探针（名字必须以 Module_ 开头）"
+fi
+if grep -q "'/Module_phantom\.asp'\]" "$ASP" && grep -q 'function use_ping_fallback' "$ASP" \
+   && grep -q 'function is_login_redirect' "$ASP"; then
+    ok "探针页不可用时回退到管理页本体，并只认「登录跳转页」判会话失效"
+else
+    bad "缺少探针回退 / 登录跳转判定（探针取不到时会误判或漏判）"
+fi
+if grep -q 'function session_probe' "$ASP" && grep -q 'function probe_then' "$ASP" \
+   && grep -q 'SESSION_LOST' "$ASP"; then
+    ok "会话失效即停手（session_probe / probe_then / SESSION_LOST）"
+else
+    bad "缺少会话失效处理：会话过期后会持续把 httpd 打崩"
+fi
+if grep -q 'id="session_banner"' "$ASP" && grep -q 'id="speed_btn"' "$ASP"; then
+    ok "会话失效横幅与测速按钮句柄齐备"
+else
+    bad "缺少会话失效横幅 / 测速按钮 id（失效后无法提示与禁用）"
+fi
+if grep -q 'document.hidden' "$ASP"; then
+    ok "后台标签页停止轮询（避免浏览器限流造成的 1 次/分钟崩溃循环）"
+else
+    bad "未处理 document.hidden：后台标签页会每分钟把 httpd 打崩一次"
+fi
+for fn in get_run_status get_log poll_started; do
+    awk "/^function ${fn}/,/^}/" "$ASP" >"${ROOT:-/tmp}/${fn}.js"
+    if grep -q 'probe_then' "${ROOT:-/tmp}/${fn}.js"; then
+        ok "${fn} 先过会话探针再访问 httpdb"
+    else
+        bad "${fn} 未过会话探针：会话失效时会把 httpd 打崩"
+    fi
+done
+if grep -q 'url: "/_api/phantom_last_act"' "$ASP"; then
+    bad "页面仍在轮询 /_api/phantom_last_act（应改由状态文件带回 last_act）"
+else
+    ok "「上次动作」改由状态文件带回（少一个 httpdb 通道）"
+fi
+# 白名单必须按「逗号 / 空格 / 换行」切分并折成单行再发送：
+# dbus 存不了多行，直接把两行原样发过去会被 httpdb 落成字面 \n，
+# 结果既是页面标红报错、又是脚本写出 github.comnjetbrains.com 这类垃圾域名。
+if grep -q 'function split_whitelist' "$ASP" && grep -q 'function normalize_whitelist' "$ASP"; then
+    ok "页面按空白/逗号切分白名单并折成单行"
+else
+    bad "页面缺少白名单折行处理（多行输入会被当成一条非法规则）"
+fi
+awk '/^function collect_fields/,/^}/' "$ASP" >"${ROOT:-/tmp}/cf.js"
+if grep -q 'normalize_whitelist' "${ROOT:-/tmp}/cf.js"; then
+    ok "collect_fields 发送前折成单行（dbus 只存单行）"
+else
+    bad "collect_fields 未折叠白名单：dbus 会存进字面 \\n"
 fi
 
 # 被软件中心 POST 同步调用的入口必须「立即返回 + 后台派发」。
@@ -504,6 +579,32 @@ else
 fi
 grep -q 'builtin_proxy_whitelist = true' "$RUNTIME_T/etc/phantom.toml" && ok "内置白名单开关写入正确" || bad "内置白名单开关错误（TOML 需要 true/false）"
 
+step "白名单分隔符（dbus 存不了多行）"
+# 页面占位符写的是「一行一个域名，或用逗号分隔」，但 **dbus 存不了多行文本**：
+# httpdb 不处理 JSON 转义，用户输入两行时 `"github.com\njetbrains.com"` 会被原样
+# 落库成字面 `\n`。只按逗号切 → 页面标红「1 条格式不合法」，脚本写出
+# `github.comnjetbrains.com` 这种垃圾域名。所以：页面折成单行，脚本也要兜底。
+DOMAINS_F="$RUNTIME_T/etc/proxy_domains.txt"
+setcfg whitelist 'github.com,jetbrains.com'
+"$SH" "$CONF_SH" restart >/dev/null 2>&1
+sleep 1
+if [ "$(grep -c . "$DOMAINS_F" 2>/dev/null | tr -d ' ')" = "2" ] \
+   && grep -qx 'github.com' "$DOMAINS_F" && grep -qx 'jetbrains.com' "$DOMAINS_F"; then
+    ok "逗号分隔写成两条规则"
+else
+    bad "逗号分隔没有写成两条：$(tr '\n' '|' <"$DOMAINS_F" 2>/dev/null)"
+fi
+setcfg whitelist 'github.com\njetbrains.com'
+"$SH" "$CONF_SH" restart >/dev/null 2>&1
+sleep 1
+if grep -qx 'github.com' "$DOMAINS_F" && grep -qx 'jetbrains.com' "$DOMAINS_F" \
+   && ! grep -q 'comnjetbrains' "$DOMAINS_F"; then
+    ok "字面 \\n 也按两个域名切（不再产生 github.comnjetbrains.com）"
+else
+    bad "字面 \\n 处理错误：$(tr '\n' '|' <"$DOMAINS_F" 2>/dev/null)"
+fi
+setcfg whitelist 'github.com'
+
 step "URI 处理与启动参数"
 grep -q -- "--gateway" "$LOG" && ok "启动参数含 --gateway" || bad "启动参数缺少 --gateway"
 grep -q -- "--lan-interface br0" "$LOG" && ok "启动参数含 --lan-interface br0" || bad "启动参数缺少 --lan-interface"
@@ -526,6 +627,18 @@ setcfg protocol quic
 sleep 1
 grep -q "proto=quic" "$LOG" && ok "URI 已追加 proto=quic" || bad "proto=quic 未写入 URI"
 setcfg protocol tcp
+
+step "配置文件写入转义（连接串里的 & 不能被 sed 吃掉）"
+# 连接串天然带 &（`?psk=…&cipher=auto`），而降级模式（jffs）的配置存在文件里、
+# 由 conf_set 走 sed 替换。sed 替换串里的 & 会展开成「整个匹配」、\n 会变真换行，
+# 不转义就会把整行配置写坏（真机上一直没暴露是因为软件中心模式走 dbus 不走 sed）。
+setcfg uri "phantom://AAAA@1.2.3.4:443?psk=BBBB&cipher=auto&proto=quic"
+case "$(getcfg uri)" in
+    *'?psk=BBBB&cipher=auto&proto=quic'*) ok "含 & 的连接串原样落库" ;;
+    *) bad "含 & 的连接串被 sed 写坏：$(getcfg uri)" ;;
+esac
+# 还原成启动时用的连接串，后面的步骤继续用
+setcfg uri "phantom://AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA@1.2.3.4:443?psk=BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"
 
 step "状态采样"
 "$SH" "$CONF_SH" restart >/dev/null 2>&1
@@ -696,7 +809,7 @@ fi
 
 step "状态文件新字段（CPU/分流模式/ipset/fd）"
 if [ -f "$RUN_STATUS" ]; then
-    for f in '"cpu"' '"gw"' '"ipset"' '"fd"' '"fdl"'; do
+    for f in '"cpu"' '"gw"' '"ipset"' '"fd"' '"fdl"' '"last_act"'; do
         grep -q "$f" "$RUN_STATUS" && ok "状态含 $f 字段" || bad "状态缺 $f 字段"
     done
     grep -q '"gw":"kernel-split"' "$RUN_STATUS" \
@@ -726,6 +839,7 @@ fi
 [ -f "$CONF_SH" ] && bad "卸载后 config.sh 仍存在" || ok "config.sh 已删除"
 [ -f "$INST_DIR/bin/phantom" ] && bad "卸载后二进制仍存在" || ok "二进制已删除"
 [ -f "$INST_DIR/webs/Module_phantom.asp" ] && bad "卸载后 ASP 仍存在" || ok "ASP 已删除"
+[ -f "$INST_DIR/webs/Module_phantom_ping.asp" ] && bad "卸载后会话探针页仍存在" || ok "会话探针页已删除"
 if [ -f "$MOCK_IPSET_FILE" ] && grep -q "ipset destroy phantom_proxy" "$MOCK_IPSET_FILE" 2>/dev/null; then
     ok "卸载清理了内核 ipset（phantom_proxy）"
 else

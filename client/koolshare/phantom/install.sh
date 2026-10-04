@@ -329,6 +329,9 @@ setup_runtime_files() {
 
     # 清理历史版本遗留的死软链（升级安装时）
     rm -f "${WEBS_DIR}/phantom_status.txt" "${WEBS_DIR}/phantom_log.txt" >/dev/null 2>&1
+    # 会话探针页早期版本叫 phantom_ping.asp —— httpd 只路由 /Module_* 到
+    # /koolshare/webs（strings: isWebServer / websApply），那个名字恒 404，清掉
+    rm -f "${WEBS_DIR}/phantom_ping.asp" >/dev/null 2>&1
     rm -f /www/_temp/phantom_status.txt /www/_temp/phantom_log.txt >/dev/null 2>&1
     rm -f /tmp/phantom_log.txt /tmp/phantom_status.txt >/dev/null 2>&1
 

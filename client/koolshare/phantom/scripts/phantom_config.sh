@@ -133,8 +133,13 @@ conf_set() {
     key="$1"
     val=$(printf '%s' "$2" | tr -d "'\"\`")
     [ -f "$USER_CONF" ] || { touch "$USER_CONF"; chmod 600 "$USER_CONF"; }
+    # **sed 的替换串里 `\`、`&`、`|` 都有特殊含义**：`&` 会展开成整个匹配
+    # （连接串里就带 `&`，如 `?psk=…&cipher=auto`，不转义会把整行配置写坏），
+    # `\n` 会变成真换行（值被截断）。降级模式（无软件中心）配置就存在这个文件里，
+    # 所以这里必须转义。追加分支不经过 sed，直接原样写。
+    val_esc=$(printf '%s' "$val" | sed 's/[\\&|]/\\&/g')
     if grep -q "^${key}=" "$USER_CONF" 2>/dev/null; then
-        sed_inplace "s|^${key}=.*|${key}='${val}'|" "$USER_CONF"
+        sed_inplace "s|^${key}=.*|${key}='${val_esc}'|" "$USER_CONF"
     else
         echo "${key}='${val}'" >>"$USER_CONF"
     fi
@@ -334,9 +339,15 @@ sanitize_domain() {
 
 write_domains() {
     wl=$(get_cfg whitelist)
+    # **dbus 存不了多行文本。** 页面虽然会先把多行折成一行逗号分隔，但历史值里
+    # 可能已经躺着字面 "\n"（httpdb 不处理 JSON 转义，`"a.com\nb.com"` 会被原样
+    # 落库成 a.com\nb.com 这 4 个可见字符）。只按逗号切就会得到
+    # 「github.comnjetbrains.com」这种垃圾域名并被写进白名单文件，所以这里把
+    # 字面 \n、逗号、空格、制表、换行统一当分隔符再切。
+    wl=$(printf '%s' "$wl" | sed 's/\\n/ /g' | tr ',\t\r\n' '    ' | tr -s ' ')
     : >"$DOMAINS_FILE" 2>/dev/null
     oldifs="$IFS"
-    IFS=','
+    IFS=' '
     for d in $wl; do
         d=$(sanitize_domain "$d")
         [ -n "$d" ] && echo "$d" >>"$DOMAINS_FILE"

@@ -18,8 +18,13 @@ case "$1" in
         kv="$2"
         key="${kv%%=*}"
         val="${kv#*=}"
+        # 真机的 dbus 是「原样存字符串」：值里的反斜杠就是反斜杠（httpdb 传下来
+        # 的字面 \n 会原样躺在库里）。而 sed 的替换串里 `\n` 会被解释成换行、
+        # `&` 会展开成整个匹配 —— 不转义的话 mock 会把值改掉，测试就测不到真机
+        # 形态（真机上用户输入两行 = dbus 里的字面 \n，正是那条垃圾域名的来源）。
+        val_esc=$(printf '%s' "$val" | sed 's/\\/\\\\/g; s/&/\\&/g')
         if grep -q "^${key}=" "$DB" 2>/dev/null; then
-            sed_inplace "s|^${key}=.*|${key}=${val}|" "$DB"
+            sed_inplace "s|^${key}=.*|${key}=${val_esc}|" "$DB"
         else
             echo "${key}=${val}" >>"$DB"
         fi

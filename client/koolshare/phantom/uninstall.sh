@@ -79,6 +79,11 @@ rm -f "${SCRIPTS_DIR}/${module}_config.sh" \
       "${SCRIPTS_DIR}/${module}_perf.sh" >/dev/null 2>&1
 rm -f "${BIN_DIR}/phantom" >/dev/null 2>&1
 rm -f /koolshare/webs/Module_${module}.asp >/dev/null 2>&1
+# 会话探针页（页面每次访问 httpdb 前的 .asp 预检；失效会话的 httpdb 请求
+# 会把本固件的 httpd 打崩，详见 Module_phantom.asp 顶部注释）。
+# 名字必须是 Module_* —— httpd 只把 /Module_* 路由到 /koolshare/webs；
+# 旧版叫 phantom_ping.asp（恒 404），一并清掉。
+rm -f /koolshare/webs/Module_phantom_ping.asp /koolshare/webs/phantom_ping.asp >/dev/null 2>&1
 rm -f /koolshare/res/phantom.css /koolshare/res/icon-phantom.png >/dev/null 2>&1
 rm -f /koolshare/init.d/S98${module}.sh /koolshare/init.d/N98${module}.sh >/dev/null 2>&1
 # 运行期文件在 tmpfs（/tmp/upload 是页面的文本通道）；顺带清历史版本留下的
