@@ -118,12 +118,33 @@ pub async fn handle_socks5_connection(
     // 4. Establish encrypted tunnel via selected transport protocol
     // Per-server cipher (URI `cipher=`) wins over the client-wide default.
     let effective_cipher = CipherPreference::effective_for(server.cipher, config.client.cipher);
-    tracing::info!("Connecting to server {} ({})", server.name, server.address);
+    // The transport is part of the line on purpose: "is my switch actually
+    // being used?" is the first question when comparing TCP against QUIC.
+    tracing::info!(
+        "Connecting to server {} ({}, {})",
+        server.name,
+        server.address,
+        match server.protocol {
+            TransportProtocol::Tcp => "tcp",
+            TransportProtocol::Quic => "quic",
+        }
+    );
+    // Outer-path instrumentation: "how often does the client have to build a
+    // new tunnel, and how long does it take" is invisible in the byte
+    // counters, and on a lossy link it is exactly the number that separates
+    // "the path was slow" from "we kept reconnecting".
+    stats.record_tunnel_connect();
+    let tunnel_opened_at = std::time::Instant::now();
     match server.protocol {
         TransportProtocol::Tcp => {
             match open_tcp_tunnel(tcp_pool, &server, &local_secret, &target, effective_cipher).await
             {
                 Ok((frame_reader, frame_writer, stream_id)) => {
+                    crate::tun_trace!(
+                        "tunnel connect {} ok tcp {}ms",
+                        server.address,
+                        tunnel_opened_at.elapsed().as_millis()
+                    );
                     tracing::info!(
                         "Tunnel established → {} (cipher={:?})",
                         target,
@@ -143,6 +164,13 @@ pub async fn handle_socks5_connection(
                     .await
                 }
                 Err(e) => {
+                    stats.record_tunnel_connect_failure();
+                    crate::tun_trace!(
+                        "tunnel connect {} fail tcp {}ms: {}",
+                        server.address,
+                        tunnel_opened_at.elapsed().as_millis(),
+                        e
+                    );
                     tracing::info!("Tunnel failed → {}: {}", target, e);
                     // Datapath evidence: transport/handshake failures (Io,
                     // Timeout) mean the server itself is unreachable — feed
@@ -174,6 +202,11 @@ pub async fn handle_socks5_connection(
             .await
             {
                 Ok((frame_reader, frame_writer, stream_id)) => {
+                    crate::tun_trace!(
+                        "tunnel connect {} ok quic {}ms",
+                        server.address,
+                        tunnel_opened_at.elapsed().as_millis()
+                    );
                     tracing::info!(
                         "Tunnel established → {} (cipher={:?})",
                         target,
@@ -193,6 +226,13 @@ pub async fn handle_socks5_connection(
                     .await
                 }
                 Err(e) => {
+                    stats.record_tunnel_connect_failure();
+                    crate::tun_trace!(
+                        "tunnel connect {} fail quic {}ms: {}",
+                        server.address,
+                        tunnel_opened_at.elapsed().as_millis(),
+                        e
+                    );
                     tracing::info!("Tunnel failed → {}: {}", target, e);
                     // Same datapath evidence as the TCP branch above.
                     if matches!(
@@ -972,15 +1012,23 @@ where
     // bumps the migration epoch and in-flight tunnels must drop instead of
     // draining on the old server. Under the default graceful policy the
     // epoch never moves and this branch is inert.
-    tokio::select! {
-        res = relay => res?,
+    let outcome = tokio::select! {
+        res = relay => res,
         _ = migration_rx.changed() => {
             tracing::info!("Tunnel → {} cut over: server migration", target);
-            return Err(PhantomError::Io(std::io::Error::new(
+            Err(PhantomError::Io(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
                 "server migration",
-            )));
+            )))
         }
-    }
-    Ok(())
+    };
+    // One line per outer tunnel that ends, with the reason. In a weak-network
+    // capture this pairs with `tunnel connect …` above and answers "were we
+    // reconnecting because the link died, or because we tore it down?".
+    crate::tun_trace!(
+        "tunnel closed {} reason={}",
+        target,
+        if outcome.is_ok() { "done" } else { "error" }
+    );
+    outcome
 }

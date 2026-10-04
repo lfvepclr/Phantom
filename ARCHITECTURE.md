@@ -330,6 +330,28 @@ LAN 客户端 ──转发──▶ ip rule iif br0 ─▶ table 200 ─▶ defa
 指令集的构造（`GatewayConfig::plan` / `teardown_plan`）与执行分离，因此可在
 无 root、无真实网卡的情况下单测；`Gateway` 的 `Drop` 负责完整回滚。
 
+#### 7.0.0 两种分流模式（`--gateway-mode`）
+
+路由器形态有两种把 LAN 流量送进隧道的方式，差别是**判定发生在内核还是用户态**：
+
+| 模式 | 规则 | 数据流 | 直连流量 |
+|---|---|---|---|
+| `kernel-split`（默认） | ipset `phantom_proxy` + `iptables -t mangle … MARK` + `ip rule fwmark 0x1`；另单独标记 53 端口进隧道 | 命中白名单/53 的包才进 `phantom0` | **不进 TUN**，留在 `main` 表，走内核（Broadcom 上还有 Runner/Flow Cache 硬件加速） |
+| `relay`（兼容） | `ip rule iif br0 lookup 200` | 全部 LAN 转发流量进 `phantom0`，逐连接在用户态判定 | 也进 TUN，由 `tcp_direct_relay_task` 明文转发 |
+
+为什么默认 kernel-split：实测同一台 RT-AX86U Pro，本机内核路径 8 路并行 420 Mbps，
+而全部流量经 TUN 的用户态 relay 只有 114–140 Mbps 且吃 1.2 核，`/proc/fcache/nflist`
+的 125 条流硬件命中全为 0。家用场景里直连流量占绝大多数（实测 17593 条连接里 15263
+条是 direct），把它们从用户态摘出去，才不会"晚上人多时连非 VPN 的网站都慢"。
+
+白名单 IP 的三个来源（不预热、不写死单 IP）：DNS 实时学习（隧道解析白名单域名后把
+A 记录批量写入 ipset，1s 合并、30 min 超时）、内置 CIDR（`client/data/proxy_cidrs.txt`
+= Telegram 段 + Google 官方 `goog.json` 段，覆盖 YouTube/googlevideo）、以及默认开启的
+加密 DNS 拦截（DoT/DoH，保证学习链不断）。缺 `ipset`/`xt_set` 时自动回退 `relay`。
+
+直连是否被加密，可用数据自证：`phantom_direct_bytes_*` 与 `phantom_tunnel_bytes_*`
+是两套独立计数，只有后者进 AEAD 与服务端。
+
 ### 7.0.1 koolshare 软件中心插件（路由器控制面）
 
 `client/koolshare/` 是路由器形态的**控制面外壳**，不引入任何新的数据面代码：

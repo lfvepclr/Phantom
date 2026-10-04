@@ -45,6 +45,44 @@ pub struct TrafficStats {
     /// Direct connections that failed or timed out and had to be retried
     /// through the tunnel. Each one cost the app `DIRECT_FALLBACK_TIMEOUT`.
     pub route_direct_failed: AtomicU64,
+    /// Network-epoch bumps. Every bump invalidates in-flight flows, so on a
+    /// lossy mobile link this counter is the difference between "the link was
+    /// bad" and "we kept tearing the link down ourselves".
+    pub net_epoch_bumps: AtomicU64,
+    /// Flows given up on after a stall (no acknowledgement progress).
+    ///
+    /// Distinct from `retransmit_budget_rst`: a stall give-up is the client
+    /// telling the app "start over", which is only acceptable when the path is
+    /// genuinely dead. A flutter of these means the tolerance window is wrong.
+    pub flow_stall_drops: AtomicU64,
+    /// Outer tunnel connections opened (TCP or QUIC).
+    pub tunnel_connects: AtomicU64,
+    /// Outer tunnel connects that never produced a usable session.
+    pub tunnel_connect_failures: AtomicU64,
+
+    // ---- Direct vs tunnel byte split -------------------------------------
+    //
+    // "Is my non-VPN traffic being encrypted?" is a question that deserves a
+    // number rather than an opinion. Direct bytes ride a plain `TcpStream` to
+    // the destination; only the tunnel counters are AEAD-protected. Comparing
+    // the two against the server's own accounting is the proof.
+    /// Bytes the LAN sent to a destination over a **plaintext** direct socket.
+    pub direct_bytes_up: AtomicU64,
+    pub direct_bytes_down: AtomicU64,
+    /// Bytes relayed through the encrypted tunnel.
+    pub tunnel_bytes_up: AtomicU64,
+    pub tunnel_bytes_down: AtomicU64,
+
+    // ---- Kernel-split gateway --------------------------------------------
+    /// How many entries the whitelist ipset currently holds.
+    pub whitelist_ipset_entries: AtomicU64,
+    /// 1 when the gateway marks only whitelisted destinations into the TUN
+    /// (kernel-split), 0 when every LAN packet is relayed in user space.
+    pub gateway_kernel_split: AtomicU64,
+    /// Packets that reached the TUN for an unknown flow that was not a SYN.
+    /// They are answered with RST so the app reconnects at once instead of
+    /// waiting out its own retransmit timers.
+    pub unknown_flow_rst: AtomicU64,
 }
 
 impl TrafficStats {
@@ -62,7 +100,10 @@ impl TrafficStats {
         format!(
             "{{\"up\":{},\"down\":{},\"udp_up\":{},\"udp_down\":{},\"conns\":{},\"route_direct\":{},\"route_proxy\":{},\
              \"tcp_dup\":{},\"dup_acks\":{},\"tun_wq_ms\":{},\"tun_wq_max_ms\":{},\"tun_txq_peak\":{},\
-             \"retx_suppressed\":{},\"retx_budget_rst\":{},\"route_direct_failed\":{}}}",
+             \"retx_suppressed\":{},\"retx_budget_rst\":{},\"route_direct_failed\":{},\
+             \"net_epoch_bumps\":{},\"flow_stall_drops\":{},\"tunnel_connects\":{},\"tunnel_connect_failures\":{},\
+             \"direct_up\":{},\"direct_down\":{},\"tunnel_up\":{},\"tunnel_down\":{},\
+             \"ipset_entries\":{},\"kernel_split\":{},\"unknown_flow_rst\":{}}}",
             self.tcp_bytes_up.load(Ordering::Relaxed),
             self.tcp_bytes_down.load(Ordering::Relaxed),
             self.udp_bytes_up.load(Ordering::Relaxed),
@@ -78,6 +119,17 @@ impl TrafficStats {
             self.retransmit_suppressed.load(Ordering::Relaxed),
             self.retransmit_budget_rst.load(Ordering::Relaxed),
             self.route_direct_failed.load(Ordering::Relaxed),
+            self.net_epoch_bumps.load(Ordering::Relaxed),
+            self.flow_stall_drops.load(Ordering::Relaxed),
+            self.tunnel_connects.load(Ordering::Relaxed),
+            self.tunnel_connect_failures.load(Ordering::Relaxed),
+            self.direct_bytes_up.load(Ordering::Relaxed),
+            self.direct_bytes_down.load(Ordering::Relaxed),
+            self.tunnel_bytes_up.load(Ordering::Relaxed),
+            self.tunnel_bytes_down.load(Ordering::Relaxed),
+            self.whitelist_ipset_entries.load(Ordering::Relaxed),
+            self.gateway_kernel_split.load(Ordering::Relaxed),
+            self.unknown_flow_rst.load(Ordering::Relaxed),
         )
     }
 
@@ -88,7 +140,10 @@ impl TrafficStats {
     pub fn zero_snapshot_json() -> String {
         "{\"up\":0,\"down\":0,\"udp_up\":0,\"udp_down\":0,\"conns\":0,\"route_direct\":0,\"route_proxy\":0,\
          \"tcp_dup\":0,\"dup_acks\":0,\"tun_wq_ms\":0,\"tun_wq_max_ms\":0,\"tun_txq_peak\":0,\
-         \"retx_suppressed\":0,\"retx_budget_rst\":0,\"route_direct_failed\":0}"
+         \"retx_suppressed\":0,\"retx_budget_rst\":0,\"route_direct_failed\":0,\
+         \"net_epoch_bumps\":0,\"flow_stall_drops\":0,\"tunnel_connects\":0,\"tunnel_connect_failures\":0,\
+         \"direct_up\":0,\"direct_down\":0,\"tunnel_up\":0,\"tunnel_down\":0,\
+         \"ipset_entries\":0,\"kernel_split\":0,\"unknown_flow_rst\":0}"
             .to_string()
     }
 
@@ -158,6 +213,55 @@ impl TrafficStats {
         self.route_direct_failed.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One network-epoch bump: every in-flight flow was invalidated.
+    pub fn record_net_epoch_bump(&self) {
+        self.net_epoch_bumps.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One flow given up on after a stall (RST sent to the app).
+    pub fn record_flow_stall_drop(&self) {
+        self.flow_stall_drops.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One outer tunnel connection attempt (TCP or QUIC).
+    pub fn record_tunnel_connect(&self) {
+        self.tunnel_connects.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// One outer tunnel connect that failed before a session existed.
+    pub fn record_tunnel_connect_failure(&self) {
+        self.tunnel_connect_failures.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_direct_up(&self, bytes: u64) {
+        self.direct_bytes_up.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn record_direct_down(&self, bytes: u64) {
+        self.direct_bytes_down.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn record_tunnel_up(&self, bytes: u64) {
+        self.tunnel_bytes_up.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn record_tunnel_down(&self, bytes: u64) {
+        self.tunnel_bytes_down.fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    pub fn set_whitelist_ipset_entries(&self, n: u64) {
+        self.whitelist_ipset_entries.store(n, Ordering::Relaxed);
+    }
+
+    pub fn set_gateway_kernel_split(&self, on: bool) {
+        self.gateway_kernel_split
+            .store(u64::from(on), Ordering::Relaxed);
+    }
+
+    pub fn record_unknown_flow_rst(&self) {
+        self.unknown_flow_rst.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Render stats in Prometheus exposition format.
     ///
     /// The TUN-health counters are included on purpose: "the tunnel is up but
@@ -182,7 +286,18 @@ impl TrafficStats {
              # HELP phantom_tun_txq_peak_bytes Peak TUN write-queue depth\n# TYPE phantom_tun_txq_peak_bytes gauge\nphantom_tun_txq_peak_bytes {}\n\
              # HELP phantom_retransmit_suppressed_total Retransmissions suppressed by the budget guard\n# TYPE phantom_retransmit_suppressed_total counter\nphantom_retransmit_suppressed_total {}\n\
              # HELP phantom_retransmit_budget_rst_total Flows reset for exceeding the duplicate-injection budget\n# TYPE phantom_retransmit_budget_rst_total counter\nphantom_retransmit_budget_rst_total {}\n\
-             # HELP phantom_route_direct_failed_total Direct connects that timed out and fell back to the tunnel\n# TYPE phantom_route_direct_failed_total counter\nphantom_route_direct_failed_total {}\n",
+             # HELP phantom_route_direct_failed_total Direct connects that timed out and fell back to the tunnel\n# TYPE phantom_route_direct_failed_total counter\nphantom_route_direct_failed_total {}\n\
+             # HELP phantom_net_epoch_bumps_total Network changes that invalidated every in-flight flow\n# TYPE phantom_net_epoch_bumps_total counter\nphantom_net_epoch_bumps_total {}\n\
+             # HELP phantom_flow_stall_drops_total Flows given up on after a stall (no acknowledgement progress)\n# TYPE phantom_flow_stall_drops_total counter\nphantom_flow_stall_drops_total {}\n\
+             # HELP phantom_tunnel_connects_total Outer tunnel connections opened\n# TYPE phantom_tunnel_connects_total counter\nphantom_tunnel_connects_total {}\n\
+             # HELP phantom_tunnel_connect_failures_total Outer tunnel connects that never produced a session\n# TYPE phantom_tunnel_connect_failures_total counter\nphantom_tunnel_connect_failures_total {}\n\
+             # HELP phantom_direct_bytes_up Bytes taken from the LAN and sent to a destination **without** the tunnel (plaintext)\n# TYPE phantom_direct_bytes_up counter\nphantom_direct_bytes_up {}\n\
+             # HELP phantom_direct_bytes_down Bytes received from a direct destination (plaintext)\n# TYPE phantom_direct_bytes_down counter\nphantom_direct_bytes_down {}\n\
+             # HELP phantom_tunnel_bytes_up Bytes sent into the encrypted tunnel\n# TYPE phantom_tunnel_bytes_up counter\nphantom_tunnel_bytes_up {}\n\
+             # HELP phantom_tunnel_bytes_down Bytes received from the encrypted tunnel\n# TYPE phantom_tunnel_bytes_down counter\nphantom_tunnel_bytes_down {}\n\
+             # HELP phantom_whitelist_ipset_entries Destinations currently marked into the TUN by the kernel-split gateway\n# TYPE phantom_whitelist_ipset_entries gauge\nphantom_whitelist_ipset_entries {}\n\
+             # HELP phantom_gateway_kernel_split 1 when only whitelisted destinations enter the TUN, 0 when every packet is relayed in user space\n# TYPE phantom_gateway_kernel_split gauge\nphantom_gateway_kernel_split {}\n\
+             # HELP phantom_tun_unknown_flow_rst_total Non-SYN packets for unknown flows answered with RST\n# TYPE phantom_tun_unknown_flow_rst_total counter\nphantom_tun_unknown_flow_rst_total {}\n",
             self.tcp_bytes_up.load(Ordering::Relaxed),
             self.tcp_bytes_down.load(Ordering::Relaxed),
             self.udp_bytes_up.load(Ordering::Relaxed),
@@ -200,6 +315,17 @@ impl TrafficStats {
             self.retransmit_suppressed.load(Ordering::Relaxed),
             self.retransmit_budget_rst.load(Ordering::Relaxed),
             self.route_direct_failed.load(Ordering::Relaxed),
+            self.net_epoch_bumps.load(Ordering::Relaxed),
+            self.flow_stall_drops.load(Ordering::Relaxed),
+            self.tunnel_connects.load(Ordering::Relaxed),
+            self.tunnel_connect_failures.load(Ordering::Relaxed),
+            self.direct_bytes_up.load(Ordering::Relaxed),
+            self.direct_bytes_down.load(Ordering::Relaxed),
+            self.tunnel_bytes_up.load(Ordering::Relaxed),
+            self.tunnel_bytes_down.load(Ordering::Relaxed),
+            self.whitelist_ipset_entries.load(Ordering::Relaxed),
+            self.gateway_kernel_split.load(Ordering::Relaxed),
+            self.unknown_flow_rst.load(Ordering::Relaxed),
         )
     }
 }
@@ -265,6 +391,11 @@ mod tests {
         stats.record_retransmit_suppressed(3);
         stats.record_retransmit_budget_rst();
         stats.record_route_direct_failed();
+        stats.record_net_epoch_bump();
+        stats.record_net_epoch_bump();
+        stats.record_flow_stall_drop();
+        stats.record_tunnel_connect();
+        stats.record_tunnel_connect_failure();
 
         let output = stats.render_prometheus();
         for name in [
@@ -276,6 +407,10 @@ mod tests {
             "phantom_retransmit_suppressed_total 3",
             "phantom_retransmit_budget_rst_total 1",
             "phantom_route_direct_failed_total 1",
+            "phantom_net_epoch_bumps_total 2",
+            "phantom_flow_stall_drops_total 1",
+            "phantom_tunnel_connects_total 1",
+            "phantom_tunnel_connect_failures_total 1",
         ] {
             assert!(output.contains(name), "missing {name} in:\n{output}");
         }
@@ -308,8 +443,40 @@ mod tests {
             "{\"up\":1024,\"down\":2048,\"udp_up\":16,\"udp_down\":32,\
              \"conns\":1,\"route_direct\":2,\"route_proxy\":1,\
              \"tcp_dup\":0,\"dup_acks\":0,\"tun_wq_ms\":0,\"tun_wq_max_ms\":0,\"tun_txq_peak\":0,\
-             \"retx_suppressed\":0,\"retx_budget_rst\":0,\"route_direct_failed\":0}"
+             \"retx_suppressed\":0,\"retx_budget_rst\":0,\"route_direct_failed\":0,\
+             \"net_epoch_bumps\":0,\"flow_stall_drops\":0,\"tunnel_connects\":0,\"tunnel_connect_failures\":0,\
+             \"direct_up\":0,\"direct_down\":0,\"tunnel_up\":0,\"tunnel_down\":0,\
+             \"ipset_entries\":0,\"kernel_split\":0,\"unknown_flow_rst\":0}"
         );
+    }
+
+    #[test]
+    fn path_split_counters_separate_direct_from_tunnel() {
+        // The whole point of the split: prove on the device that "direct"
+        // traffic is plaintext and never touches the tunnel counters.
+        let stats = TrafficStats::new();
+        stats.record_direct_up(1_000);
+        stats.record_direct_down(9_000);
+        stats.record_tunnel_up(500);
+        stats.record_tunnel_down(700);
+        stats.set_whitelist_ipset_entries(142);
+        stats.set_gateway_kernel_split(true);
+
+        let out = stats.render_prometheus();
+        for line in [
+            "phantom_direct_bytes_up 1000",
+            "phantom_direct_bytes_down 9000",
+            "phantom_tunnel_bytes_up 500",
+            "phantom_tunnel_bytes_down 700",
+            "phantom_whitelist_ipset_entries 142",
+            "phantom_gateway_kernel_split 1",
+        ] {
+            assert!(out.contains(line), "missing `{line}` in:\n{out}");
+        }
+        let json = stats.snapshot_json();
+        assert!(json.contains("\"direct_up\":1000"));
+        assert!(json.contains("\"ipset_entries\":142"));
+        assert!(json.contains("\"kernel_split\":1"));
     }
 
     #[test]

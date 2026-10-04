@@ -27,7 +27,10 @@ case "$1" in
             del)
                 [ -n "$spec" ] || exit 1
                 grep -q -- "$spec" "$F" 2>/dev/null || exit 1
-                grep -v -- "$spec" "$F" >"$F.tmp" 2>/dev/null && mv "$F.tmp" "$F"
+                # 同 iptables mock：不能用 `grep -v ... && mv`，删最后一行时
+                # grep 返回 1，文件没被改写、但这里已经判定「删掉了」。
+                grep -v -- "$spec" "$F" >"$F.tmp" 2>/dev/null
+                mv "$F.tmp" "$F" 2>/dev/null
                 exit 0
                 ;;
             show)
@@ -54,7 +57,8 @@ case "$1" in
                 done <"$F"
                 ;;
             flush)
-                grep -v -- "route table $spec " "$F" >"$F.tmp" 2>/dev/null && mv "$F.tmp" "$F"
+                grep -v -- "route table $spec " "$F" >"$F.tmp" 2>/dev/null
+                mv "$F.tmp" "$F" 2>/dev/null
                 ;;
         esac
         exit 0

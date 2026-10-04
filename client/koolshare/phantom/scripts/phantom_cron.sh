@@ -21,6 +21,7 @@ RUNTIME_DIR="${PHANTOM_RUNTIME_DIR:-/koolshare/etc/phantom}"
 USER_CONF="${RUNTIME_DIR}/etc/phantom.conf"
 CONFIG="${SCRIPTS_DIR}/${module}_config.sh"
 WATCHDOG="${SCRIPTS_DIR}/${module}_watchdog.sh"
+PERF="${SCRIPTS_DIR}/${module}_perf.sh"
 
 # 见 phantom_config.sh：Asuswrt 上 /usr/sbin/sh 是 memaccess 的软链，不是 shell。
 # cron 的 PATH 同样把 /usr/sbin 排在前面，所以写进 crontab 的命令也要用绝对路径。
@@ -110,10 +111,16 @@ cron_del() {
 clear_all() {
     cron_del phantom_restart
     cron_del phantom_watchdog
+    cron_del phantom_perf
     echo "已清理 phantom 定时任务"
 }
 
 sync_all() {
+    # 性能采样：每 5 分钟一行，专门给"晚上人多才慢"这类问题留证据
+    if [ -f "$PERF" ]; then
+        cron_add phantom_perf "*/5 * * * *" "${SH} ${PERF}"
+    fi
+
     # 看门狗：每 5 分钟检查一次，进程不在且已启用则拉起
     watchdog=$(get_cfg watchdog)
     [ -n "$watchdog" ] || watchdog="1"

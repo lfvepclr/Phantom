@@ -21,7 +21,8 @@ use tokio::sync::{Mutex, Notify};
 
 use crate::dns::{
     DnsCache, DnsProxy, DnsQueryContext, DnsRoute, build_dns_response_packet,
-    build_refused_response, extract_a_records, extract_query_domain, parse_dns_addr,
+    build_refused_response, extract_a_records, extract_addr_records, extract_query_domain,
+    parse_dns_addr,
 };
 use crate::failover::FailoverManager;
 use crate::rules::RuleEngine;
@@ -125,12 +126,25 @@ fn udp_proxy_idle_expired(idle_for: std::time::Duration) -> bool {
 /// so the cost of letting it go is one round trip.
 const DNS_TUNNEL_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Consecutive *unproductive* retransmissions tolerated before a flow is
-/// dropped. A retransmission only counts when the app acknowledged nothing
-/// since the previous one, so a long download that keeps making progress is
-/// never mistaken for a wedged flow (which is exactly what used to happen:
-/// 20 ticks × 500 ms = the 10 s stall Google apps showed before retrying).
-const MAX_STALLED_RETRANSMITS: u32 = 12;
+/// How long a flow may make *no* acknowledgement progress before it is given
+/// up on.
+///
+/// This used to be a tick count (12 × 500 ms = 6 s), which turned every
+/// weak-link fade into a dead flow: a subway tunnel, a cell handover or a
+/// radio that is busy for a few seconds all look identical to a wedged app
+/// from inside this loop. A backoff-and-retry window is the difference
+/// between "the page reloads 10 s later" and "the page never loads".
+///
+/// The deadline only starts counting from the last real progress, and the
+/// give-up also requires [`STALL_MIN_ROUNDS`] retransmissions to have gone
+/// out, so a flow that is merely idle is never killed by this path (that is
+/// the idle reclaimer's job).
+const STALL_GIVEUP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Retransmission rounds that must have happened before a stall may be
+/// declared fatal. Guards against tearing down a flow that has been quiet but
+/// never actually probed.
+const STALL_MIN_ROUNDS: u32 = 3;
 
 /// Upper bound on the retransmission back-off, so a stalled flow is still
 /// probed often enough to recover quickly when the app's window reopens.
@@ -264,7 +278,12 @@ pub fn bump_network_epoch() -> u64 {
     // A new link may not be censored the way the old one was, so the "direct
     // does not work here" memory is scoped to one network.
     direct_failures().clear();
-    NETWORK_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+    let epoch = NETWORK_EPOCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    // The per-flow "retired: network changed" lines that follow are the
+    // accompanying detail; this one marks the moment, so a weak-network trace
+    // can be read as "how many times did we tear the datapath down".
+    crate::tun_trace!("epoch {epoch}: network change, in-flight flows invalidated");
+    epoch
 }
 
 /// Current network epoch (0 until the first change is reported).
@@ -990,11 +1009,26 @@ async fn deliver_dns_response(
     route: DnsRoute,
     cache: DnsCache,
     writer: Arc<TunWriter>,
+    ipset: Option<Arc<crate::ipset::IpsetPublisher>>,
 ) -> Result<()> {
     if let Some(ref domain) = domain {
-        let ips = extract_a_records(&payload);
-        for ip in &ips {
+        // Every family goes into the reverse cache: the routing decision for
+        // an IPv6 destination is only correct if the AAAA it came from is
+        // mapped back to its domain (see `DnsCache`).
+        let all_ips = extract_addr_records(&payload);
+        for ip in &all_ips {
             cache.insert(*ip, domain.clone()).await;
+        }
+        // The kernel-split gateway and its ipset are IPv4-only.
+        let ips = extract_a_records(&payload);
+        // Kernel-split gateway: a whitelisted answer is also the instruction
+        // that tells the kernel where to send this destination. Publishing it
+        // here — before the response reaches the app — is what keeps the very
+        // first connection of a session on the tunnel path.
+        if route == DnsRoute::Tunnel {
+            if let Some(ipset) = &ipset {
+                ipset.add_ips(&ips);
+            }
         }
         if !ips.is_empty() {
             let joined = ips
@@ -1043,6 +1077,10 @@ pub struct TunProxy<D: TunIo = TunDevice> {
     config_path: Option<String>,
     failover: Option<Arc<FailoverManager>>,
     stats: Arc<TrafficStats>,
+    /// Kernel ipset that decides which destinations enter the TUN
+    /// (kernel-split gateway). `None` in relay mode and on platforms without
+    /// an ipset.
+    ipset: Option<Arc<crate::ipset::IpsetPublisher>>,
 }
 
 impl<D: TunIo> TunProxy<D> {
@@ -1067,6 +1105,7 @@ impl<D: TunIo> TunProxy<D> {
             config_path: None,
             failover: None,
             stats,
+            ipset: None,
         }
     }
 
@@ -1113,6 +1152,16 @@ impl<D: TunIo> TunProxy<D> {
     /// server pool used by the local SOCKS5 relay as well.
     pub fn with_failover(mut self, failover: Arc<FailoverManager>) -> Self {
         self.failover = Some(failover);
+        self
+    }
+
+    /// Attach the whitelist ipset publisher.
+    ///
+    /// With the kernel-split gateway the kernel only hands the TUN the
+    /// destinations in that set, so every whitelisted DNS answer has to land
+    /// there before the app dials it.
+    pub fn with_ipset(mut self, ipset: Arc<crate::ipset::IpsetPublisher>) -> Self {
+        self.ipset = Some(ipset);
         self
     }
 
@@ -1277,6 +1326,7 @@ impl<D: TunIo> TunProxy<D> {
                 let dns_task = Arc::clone(&dns);
                 let cache = self.dns_cache.clone();
                 let device = Arc::clone(&self.writer);
+                let ipset = self.ipset.clone();
                 tokio::spawn(async move {
                     let mut on_response = move |payload: Bytes,
                                                 ctx: DnsQueryContext,
@@ -1284,8 +1334,10 @@ impl<D: TunIo> TunProxy<D> {
                                                 route| {
                         let cache = cache.clone();
                         let device = device.clone();
+                        let ipset = ipset.clone();
                         async move {
-                            deliver_dns_response(payload, ctx, domain, route, cache, device).await
+                            deliver_dns_response(payload, ctx, domain, route, cache, device, ipset)
+                                .await
                         }
                     };
                     loop {
@@ -1333,6 +1385,7 @@ impl<D: TunIo> TunProxy<D> {
             let dns = Arc::clone(dns);
             let cache = self.dns_cache.clone();
             let device = Arc::clone(&self.writer);
+            let ipset = self.ipset.clone();
             tokio::spawn(async move {
                 let mut on_response = move |payload: Bytes,
                                             ctx: DnsQueryContext,
@@ -1340,7 +1393,11 @@ impl<D: TunIo> TunProxy<D> {
                                             route| {
                     let cache = cache.clone();
                     let device = device.clone();
-                    async move { deliver_dns_response(payload, ctx, domain, route, cache, device).await }
+                    let ipset = ipset.clone();
+                    async move {
+                        deliver_dns_response(payload, ctx, domain, route, cache, device, ipset)
+                            .await
+                    }
                 };
                 let _ = dns.run_local(&mut on_response).await;
             });
@@ -1588,10 +1645,9 @@ impl<D: TunIo> TunProxy<D> {
                 tcp.window_size(),
                 tcp_options_summary(&tcp)
             );
-            let domain = match dst_ip {
-                IpAddr::V4(v4) => self.dns_cache.lookup(v4).await,
-                _ => None,
-            };
+            // Both families: an IPv6 destination is only recognised as
+            // whitelisted if the AAAA that produced it is in the cache.
+            let domain = self.dns_cache.lookup(dst_ip).await;
             let hot = self.hot.lock().await;
             let proxy_mode = hot.proxy_mode;
             let rule_engine = hot.rule_engine.clone();
@@ -1779,6 +1835,30 @@ impl<D: TunIo> TunProxy<D> {
                 // Pure ACK/window update: whatever was blocked may now flow.
                 flush_send_queue(&mut st, &self.writer).await?;
             }
+        } else if !syn {
+            // Unknown flow and not a SYN. Two situations produce this:
+            //   * a kernel-split flow that only became tunnel-bound after it
+            //     was established (the destination was learned from DNS while
+            //     the connection was already open), and
+            //   * a TUN that was restarted under an established connection.
+            // Dropping the packet silently stalls the app until its own
+            // retransmit timers give up; an RST makes it reconnect at once,
+            // and the fresh SYN is handled normally.
+            self.stats.record_unknown_flow_rst();
+            crate::tun_trace!(
+                "unknown flow {}:{} (no SYN) -> RST",
+                dst_ip,
+                dst_port
+            );
+            self.send_tcp_rst(
+                key,
+                src_ip,
+                dst_ip,
+                src_port,
+                dst_port,
+                tcp.sequence_number(),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -1806,10 +1886,7 @@ impl<D: TunIo> TunProxy<D> {
 
         self.stats.record_udp_up(data.len() as u64);
 
-        let domain = match dst_ip {
-            IpAddr::V4(v4) => self.dns_cache.lookup(v4).await,
-            _ => None,
-        };
+        let domain = self.dns_cache.lookup(dst_ip).await;
         let hot = self.hot.lock().await;
         let proxy_mode = hot.proxy_mode;
         let rule_engine = hot.rule_engine.clone();
@@ -1958,6 +2035,7 @@ impl<D: TunIo> TunProxy<D> {
         let device = Arc::clone(&self.writer);
         let flows = self.flows.clone();
         let socks5_addr = self.socks5_addr;
+        let stats = Arc::clone(&self.stats);
         tokio::spawn(async move {
             if let Err(e) = tcp_relay_task(
                 rx_from_tun,
@@ -1968,6 +2046,7 @@ impl<D: TunIo> TunProxy<D> {
                 socks5_addr,
                 dst_ip,
                 dst_port,
+                stats,
             )
             .await
             {
@@ -2161,7 +2240,10 @@ impl<D: TunIo> TunProxy<D> {
         let stats = Arc::clone(&self.stats);
         let flows = self.flows.clone();
         tokio::spawn(async move {
-            let mut stalled = 0u32;
+            // Unproductive retransmission rounds since SND.UNA last moved.
+            // Wall-clock time decides when to give up (see `STALL_GIVEUP`); this
+            // only ensures the flow was actually probed first.
+            let mut stall_rounds = 0u32;
             let mut rto = RETRANSMIT_TICK;
             let mut last_check = std::time::Instant::now();
             loop {
@@ -2188,7 +2270,7 @@ impl<D: TunIo> TunProxy<D> {
                 let unacked = st.seq.wrapping_sub(st.snd_una);
                 let now = std::time::Instant::now();
                 if unacked == 0 {
-                    stalled = 0;
+                    stall_rounds = 0;
                     last_check = now;
                     if st.fin_queued && !st.fin_sent {
                         let _ = flush_send_queue(&mut st, &writer).await;
@@ -2236,24 +2318,42 @@ impl<D: TunIo> TunProxy<D> {
                 // Any acknowledgement since the previous tick means the flow is
                 // alive; restart the budget instead of counting down to a kill.
                 if st.last_progress_at > last_check {
-                    stalled = 0;
+                    stall_rounds = 0;
                     rto = RETRANSMIT_TICK;
+                } else {
+                    stall_rounds = stall_rounds.saturating_add(1);
                 }
                 last_check = now;
-                stalled += 1;
-                if stalled > MAX_STALLED_RETRANSMITS {
-                    st.end_reason = "no ack";
+                // A weak link stalls for seconds at a time and then recovers.
+                // Only give up once nothing has moved for the full deadline
+                // *and* we have spent retransmissions on the flow.
+                let stalled_for = now.duration_since(st.last_progress_at);
+                if stall_rounds >= STALL_MIN_ROUNDS && stalled_for >= STALL_GIVEUP {
+                    st.end_reason = "stall";
+                    let rst = build_tcp_rst_packet(&st).ok();
                     drop(st);
+                    // Same cleanup as the idle reclaimer: the empty payload is
+                    // the relay task's stop signal, so the upstream socket is
+                    // actually released instead of leaking with the flow entry.
+                    if let Some(flow) = flows.get(&key).await {
+                        let _ = flow.tx_to_relay.send(Bytes::new());
+                    }
+                    if let Some(pkt) = rst {
+                        writer.send(pkt).await;
+                    }
+                    stats.record_flow_stall_drop();
                     crate::tun_trace!(
-                        "flow {}:{} dropped after {} stalled retransmits",
+                        "flow {}:{} retired: stall (no progress for {}s, {} rounds)",
                         key.dst_ip,
                         key.dst_port,
-                        stalled
+                        stalled_for.as_secs(),
+                        stall_rounds
                     );
-                    tracing::debug!(
-                        "TCP flow {}:{} stopped acknowledging; dropping",
+                    tracing::info!(
+                        "TCP flow {}:{} stalled for {}s; resetting so the app reconnects",
                         key.dst_ip,
-                        key.dst_port
+                        key.dst_port,
+                        stalled_for.as_secs()
                     );
                     flows.remove(&key).await;
                     return;
@@ -2452,6 +2552,7 @@ async fn retry_through_tunnel(
     socks5_addr: SocketAddr,
     dst_ip: IpAddr,
     dst_port: u16,
+    stats: Arc<TrafficStats>,
 ) -> Result<()> {
     crate::tun_trace!(
         "flow {}:{} retried through the tunnel",
@@ -2467,6 +2568,7 @@ async fn retry_through_tunnel(
         socks5_addr,
         dst_ip,
         dst_port,
+        stats,
     )
     .await
 }
@@ -2480,6 +2582,7 @@ async fn tcp_relay_task(
     socks5_addr: SocketAddr,
     dst_ip: IpAddr,
     dst_port: u16,
+    stats: Arc<TrafficStats>,
 ) -> Result<()> {
     let mut socks5 = TcpStream::connect(socks5_addr)
         .await
@@ -2542,6 +2645,9 @@ async fn tcp_relay_task(
                 tracing::debug!("Write to SOCKS5 failed: {}", e);
                 break;
             }
+            // Tunnel-side accounting: these bytes are AEAD-protected and leave
+            // through the server, unlike the direct-path counters.
+            stats.record_tunnel_up(data.len() as u64);
         }
         let _ = s5_write.shutdown().await;
         Ok::<_, PhantomError>(())
@@ -2558,6 +2664,7 @@ async fn tcp_relay_task(
                     break;
                 }
             };
+            stats.record_tunnel_down(n as u64);
             if let Err(e) = queue_tunnel_payload(&state, &device, &buf[..n]).await {
                 tracing::debug!("TUN write error: {}", e);
                 break;
@@ -2626,6 +2733,7 @@ async fn tcp_direct_relay_task(
             socks5_addr,
             dst_ip,
             dst_port,
+            stats,
         )
         .await;
     }
@@ -2662,6 +2770,7 @@ async fn tcp_direct_relay_task(
                 socks5_addr,
                 dst_ip,
                 dst_port,
+                stats,
             )
             .await;
         }
@@ -2687,6 +2796,7 @@ async fn tcp_direct_relay_task(
                 socks5_addr,
                 dst_ip,
                 dst_port,
+                stats,
             )
             .await;
         }
@@ -2711,6 +2821,10 @@ async fn tcp_direct_relay_task(
                 tracing::debug!("Write to direct target failed: {}", e);
                 break;
             }
+            // Direct-path accounting: plaintext, straight out of the WAN. The
+            // gap between these counters and the tunnel ones is the answer to
+            // "is my non-VPN traffic being encrypted?".
+            stats.record_direct_up(data.len() as u64);
         }
         let _ = target_write.shutdown().await;
         Ok::<_, PhantomError>(())
@@ -2727,6 +2841,7 @@ async fn tcp_direct_relay_task(
                     break;
                 }
             };
+            stats.record_direct_down(n as u64);
             if let Err(e) = queue_tunnel_payload(&state, &device, &buf[..n]).await {
                 tracing::debug!("TUN write error: {}", e);
                 break;
@@ -3471,6 +3586,155 @@ mod tests {
     // -----------------------------------------------------------------------
     // Retransmission discipline
     // -----------------------------------------------------------------------
+
+    /// A stalled flow must be given a weak-link-sized grace window, and when
+    /// it *is* finally torn down the app has to hear about it (RST) and the
+    /// relay task has to be released.
+    ///
+    /// The old policy gave up after 6 s of ticks and then removed the table
+    /// entry without either: the app sat on a connection that would never move
+    /// again, and the relay task kept its upstream socket.
+    #[tokio::test]
+    async fn stalled_flow_is_reset_only_past_the_grace_window_and_releases_the_relay() {
+        use std::time::Duration;
+
+        let written: Arc<std::sync::Mutex<Vec<Vec<u8>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let proxy = Arc::new(TunProxy::new(
+            MockTun::new(Arc::clone(&written)),
+            "127.0.0.1:1080".parse().unwrap(),
+        ));
+        let pump_proxy = Arc::clone(&proxy);
+        let pump_written = Arc::clone(&written);
+        let pump = tokio::spawn(async move {
+            let mut device = MockTun::new(pump_written);
+            let _ = pump_proxy.run_pump(&mut device).await;
+        });
+
+        // One flow that has made no progress for longer than the deadline, and
+        // one that is merely quiet. Both have data in flight, so both reach the
+        // retransmission path.
+        let stalled_key = FlowKey {
+            src_ip: "10.8.0.2".parse().unwrap(),
+            dst_ip: "142.251.91.201".parse().unwrap(),
+            src_port: 40000,
+            dst_port: 443,
+            proto: 6,
+        };
+        let quiet_key = FlowKey {
+            src_ip: "10.8.0.2".parse().unwrap(),
+            dst_ip: "142.251.80.226".parse().unwrap(),
+            src_port: 40001,
+            dst_port: 443,
+            proto: 6,
+        };
+
+        let mut stalled = new_flow_state(
+            stalled_key.src_ip,
+            stalled_key.dst_ip,
+            stalled_key.src_port,
+            stalled_key.dst_port,
+            5000,
+        );
+        stalled.send_queue = vec![7u8; 4 * TCP_MSS];
+        stalled.seq = stalled.snd_una.wrapping_add(TCP_MSS as u32);
+        // Back-dating the progress stamp is how the deadline is exercised
+        // without waiting the full 30 s in the test.
+        stalled.last_progress_at = std::time::Instant::now()
+            .checked_sub(STALL_GIVEUP + Duration::from_secs(1))
+            .expect("instant arithmetic");
+        let stalled = Arc::new(Mutex::new(stalled));
+
+        let mut quiet = new_flow_state(
+            quiet_key.src_ip,
+            quiet_key.dst_ip,
+            quiet_key.src_port,
+            quiet_key.dst_port,
+            6000,
+        );
+        quiet.send_queue = vec![7u8; 4 * TCP_MSS];
+        quiet.seq = quiet.snd_una.wrapping_add(TCP_MSS as u32);
+        let quiet = Arc::new(Mutex::new(quiet));
+
+        let (stalled_tx, mut stalled_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+        let (quiet_tx, mut quiet_rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+        proxy
+            .flows
+            .insert(
+                stalled_key,
+                FlowHandle {
+                    src_addr: SocketAddr::new(stalled_key.src_ip, stalled_key.src_port),
+                    dst_addr: SocketAddr::new(stalled_key.dst_ip, stalled_key.dst_port),
+                    state: Arc::clone(&stalled),
+                    tx_to_relay: stalled_tx,
+                },
+            )
+            .await;
+        proxy
+            .flows
+            .insert(
+                quiet_key,
+                FlowHandle {
+                    src_addr: SocketAddr::new(quiet_key.src_ip, quiet_key.src_port),
+                    dst_addr: SocketAddr::new(quiet_key.dst_ip, quiet_key.dst_port),
+                    state: Arc::clone(&quiet),
+                    tx_to_relay: quiet_tx,
+                },
+            )
+            .await;
+
+        proxy.spawn_retransmit_supervisor(Arc::clone(&stalled), stalled_key);
+        proxy.spawn_retransmit_supervisor(Arc::clone(&quiet), quiet_key);
+
+        // Wait for the reclaim. Polling rather than sleeping a fixed number of
+        // ticks keeps the test honest about what it is asserting (the flow is
+        // reclaimed) instead of about scheduler timing.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while proxy.flows.get(&stalled_key).await.is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a flow with no progress past the grace window was never reclaimed"
+            );
+            tokio::time::sleep(RETRANSMIT_TICK).await;
+        }
+        assert!(
+            proxy.flows.get(&quiet_key).await.is_some(),
+            "a flow inside the grace window must survive its neighbour's reset"
+        );
+        assert!(
+            quiet_rx.try_recv().is_err(),
+            "the quiet flow's relay was released early"
+        );
+
+        // The empty payload is the relay's stop signal; without it the task and
+        // its upstream socket leak.
+        match stalled_rx.try_recv() {
+            Ok(payload) => assert!(payload.is_empty(), "unexpected payload: {payload:?}"),
+            Err(e) => panic!("relay was never released: {e:?}"),
+        }
+
+        // And the app is told, so it reconnects instead of hanging.
+        let saw_rst = written
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .any(|pkt| {
+                etherparse::Ipv4HeaderSlice::from_slice(pkt)
+                    .ok()
+                    .and_then(|ip| {
+                        etherparse::TcpHeaderSlice::from_slice(&pkt[ip.slice().len()..]).ok()
+                    })
+                    .is_some_and(|tcp| tcp.rst())
+            });
+        assert!(saw_rst, "no RST was written for the stalled flow");
+
+        let snapshot = proxy.stats.snapshot_json();
+        assert!(
+            snapshot.contains("\"flow_stall_drops\":1"),
+            "stall give-up was not counted: {snapshot}"
+        );
+        pump.abort();
+    }
 
     fn flow_with_queue(bytes: usize) -> TcpFlowState {
         let mut state = new_flow_state(

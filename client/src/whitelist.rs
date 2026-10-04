@@ -23,6 +23,23 @@ static BUILTIN_FST: &[u8] = include_bytes!("../data/proxy_domains.fst");
 /// CIDR entries for services only reachable by IP (e.g. Telegram).
 static BUILTIN_CIDRS: &str = include_str!("../data/proxy_cidrs.txt");
 
+/// IPv4 CIDRs from the compiled whitelist data, as plain strings.
+///
+/// Used by the kernel-split gateway to seed the `phantom_proxy` ipset: a
+/// service that is only reachable by IP (Telegram, and Google/YouTube via its
+/// published ranges) must enter the tunnel even before this session has seen a
+/// DNS answer for it.
+pub fn builtin_ipv4_cidrs() -> Vec<String> {
+    BUILTIN_CIDRS
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| l.parse::<IpNet>().ok())
+        .filter(|n| n.addr().is_ipv4())
+        .map(|n| n.to_string())
+        .collect()
+}
+
 pub struct ProxyWhitelist {
     domains: Option<fst::Set<&'static [u8]>>,
     /// User-supplied suffixes (config file / macOS UI), matched alongside the

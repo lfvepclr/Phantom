@@ -41,6 +41,14 @@ enum Commands {
         /// TUN MTU. Default: 1500.
         #[arg(long, requires = "tun")]
         tun_mtu: Option<u16>,
+        /// Write the packet-level TUN trace to this file (truncated on start).
+        ///
+        /// Also honoured from the `PHANTOM_TUN_TRACE` environment variable, so
+        /// a desktop client can be measured with the same
+        /// `scripts/tun-trace-report.py` analyzer the phone uses. Diagnostics
+        /// only: the trace never gates the data path.
+        #[arg(long)]
+        tun_trace: Option<String>,
         /// Linux only: install policy routing + firewall rules so forwarded LAN
         /// traffic goes through the tunnel. Reverted on exit.
         #[arg(long, requires = "tun")]
@@ -59,6 +67,16 @@ enum Commands {
         /// Do not redirect LAN port-53 traffic into the tunnel.
         #[arg(long, requires = "gateway")]
         no_lan_dns_hijack: bool,
+        /// How much LAN traffic is handed to the TUN.
+        ///   kernel-split (default): only whitelisted destinations enter the
+        ///     TUN; everything else stays on the kernel fast path (hardware
+        ///     NAT / flow cache), which is what keeps direct browsing and
+        ///     domestic video at full speed.
+        ///   relay: every forwarded packet is judged in user space. Slower,
+        ///     but also catches destinations dialled by IP without DNS.
+        /// Falls back to relay automatically when the firmware has no ipset.
+        #[arg(long = "gateway-mode", requires = "gateway", default_value = "kernel-split")]
+        gateway_mode: String,
     },
     /// Run as server (auto / load / interactive)
     Server {
@@ -97,11 +115,13 @@ async fn main() -> Result<()> {
             tun_name,
             tun_addr,
             tun_mtu,
+            tun_trace,
             gateway,
             lan_interfaces,
             bypass_cidrs,
             table,
             no_lan_dns_hijack,
+            gateway_mode,
         } => {
             let config_path = config.clone();
             let mut config = match config_path.as_deref() {
@@ -119,6 +139,18 @@ async fn main() -> Result<()> {
                 ));
             }
             init_tracing("info");
+            // Packet-level trace before anything can move a packet. The flag
+            // wins over the environment so a scripted run can override a shell
+            // that has the variable exported.
+            let trace_path = tun_trace
+                .or_else(|| std::env::var("PHANTOM_TUN_TRACE").ok())
+                .filter(|p| !p.is_empty());
+            if let Some(path) = trace_path {
+                match phantom_client::tun_trace::set_path(Some(&path)) {
+                    Ok(()) => tracing::info!("TUN trace enabled -> {}", path),
+                    Err(e) => tracing::warn!("TUN trace disabled ({}): {}", path, e),
+                }
+            }
             let client = phantom_client::PhantomClient::new(config)?;
             if tun {
                 let mut opts = TunRuntimeOptions {
@@ -143,6 +175,7 @@ async fn main() -> Result<()> {
                     bypass_cidrs,
                     table,
                     !no_lan_dns_hijack,
+                    &gateway_mode,
                 )?;
                 client.run_tun(opts).await?;
             } else {
@@ -266,14 +299,22 @@ fn apply_gateway_options(
     bypass_cidrs: Vec<String>,
     table: Option<u32>,
     lan_dns_hijack: bool,
+    gateway_mode: &str,
 ) -> Result<()> {
     if !gateway {
         return Ok(());
     }
+    let mode = phantom_client::gateway::GatewayMode::parse(gateway_mode).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Invalid --gateway-mode '{}': expected kernel-split or relay",
+            gateway_mode
+        )
+    })?;
     let mut config = phantom_client::gateway::GatewayConfig {
         tun_name: opts.tun.name.clone(),
         tun_addr: opts.tun.address,
         lan_dns_hijack,
+        mode,
         ..Default::default()
     };
     if !lan_interfaces.is_empty() {
@@ -297,6 +338,7 @@ fn apply_gateway_options(
     _bypass_cidrs: Vec<String>,
     _table: Option<u32>,
     _lan_dns_hijack: bool,
+    _gateway_mode: &str,
 ) -> Result<()> {
     if gateway {
         return Err(anyhow::anyhow!(

@@ -411,6 +411,13 @@ pub fn android_get_stats_json() -> String {
 /// Returns the new epoch so the caller can log it.
 pub fn android_notify_network_change() -> u64 {
     let epoch = crate::tun::bump_network_epoch();
+    if let Some(stats) = TRAFFIC_STATS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        stats.record_net_epoch_bump();
+    }
     if let Some(dns) = SHARED_DNS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -696,6 +703,14 @@ fn start_with_config(fd: RawFd, config: ClientConfig) -> i32 {
             tcp_pool.spawn_sweeper();
             *SHARED_TCP_POOL.lock().unwrap_or_else(|e| e.into_inner()) =
                 Some(std::sync::Arc::clone(&tcp_pool));
+            // A single-server phone deployment has nothing to fail over to, so
+            // "the server is unreachable" has to reset the datapath itself.
+            crate::tunnel::install_datapath_reset_hook(
+                &failover_socks5,
+                &tcp_pool,
+                &quic_pool,
+                &stats_socks5,
+            );
             // Warm one session up front: the first page after "connect" is when
             // a saved round trip is most visible.
             if let Some(server) = config_clone

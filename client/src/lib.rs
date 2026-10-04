@@ -4,6 +4,7 @@ pub mod failover;
 pub mod gateway;
 pub mod hello;
 pub mod http_proxy;
+pub mod ipset;
 pub mod net_tune;
 pub mod platform;
 pub mod quic_pool;

@@ -12,6 +12,44 @@ use crate::quic_pool::QuicPool;
 use crate::tcp_pool::TcpSessionPool;
 use crate::tun::TunSettings;
 
+/// Wire the "the active server is down and there is nowhere to fail over to"
+/// hook.
+///
+/// Failover can migrate between servers, but the common personal deployment has
+/// exactly one. Without this, a dead path is only noticed by the kernel (or by
+/// the app), and everything in between looks like a hang. The hook drops the
+/// pooled sessions — they are bound to an address that no longer works — and
+/// bumps the network epoch so in-flight flows are reset and the app reconnects
+/// immediately.
+///
+/// Safe to call from any runtime: it stores a closure and does the pool
+/// clearing on whatever Tokio handle is current when the outage is detected.
+pub fn install_datapath_reset_hook(
+    failover: &Arc<FailoverManager>,
+    tcp_pool: &Arc<TcpSessionPool>,
+    quic_pool: &Arc<QuicPool>,
+    stats: &Arc<crate::stats::TrafficStats>,
+) {
+    let tcp_pool = Arc::clone(tcp_pool);
+    let quic_pool = Arc::clone(quic_pool);
+    let stats = Arc::clone(stats);
+    failover.set_datapath_reset_hook(Arc::new(move || {
+        // Invalidating the epoch also clears the "direct does not work here"
+        // memory, which is scoped to one network by design.
+        crate::tun::bump_network_epoch();
+        stats.record_net_epoch_bump();
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let tcp = Arc::clone(&tcp_pool);
+        let quic = Arc::clone(&quic_pool);
+        handle.spawn(async move {
+            tcp.clear().await;
+            quic.clear().await;
+        });
+    }));
+}
+
 /// Options for the TUN transparent-proxy runtime (`phantom client --tun`).
 ///
 /// Only used by the CLI: the macOS / Android / HarmonyOS apps build their TUN
@@ -81,13 +119,17 @@ impl PhantomClient {
     pub fn new(config: ClientConfig) -> Result<Self> {
         let key_pair = KeyPair::generate()?;
         let failover = Arc::new(FailoverManager::new(&config)?);
+        let stats = crate::stats::TrafficStats::new();
+        let quic_pool = Arc::new(QuicPool::new());
+        let tcp_pool = Arc::new(TcpSessionPool::new());
+        install_datapath_reset_hook(&failover, &tcp_pool, &quic_pool, &stats);
         Ok(Self {
             config,
             local_secret: key_pair.secret,
             failover,
-            quic_pool: Arc::new(QuicPool::new()),
-            tcp_pool: Arc::new(TcpSessionPool::new()),
-            stats: crate::stats::TrafficStats::new(),
+            quic_pool,
+            tcp_pool,
+            stats,
         })
     }
 
@@ -136,10 +178,40 @@ impl PhantomClient {
 
         // Held for the lifetime of the tunnel; Drop reverts the routing changes.
         #[cfg(target_os = "linux")]
-        let _gateway = match options.gateway {
+        let gateway = match options.gateway {
             Some(config) => Some(crate::gateway::Gateway::install(config)?),
             None => None,
         };
+
+        // Kernel-split gateway: the kernel only hands the TUN the destinations
+        // in this ipset, so whitelisted DNS answers have to be published into
+        // it. Relay mode (and platforms without ipset) needs none of this.
+        #[cfg(target_os = "linux")]
+        let ipset = gateway.as_ref().and_then(|gw| {
+            if let Some(reason) = gw.fallback_reason() {
+                tracing::warn!(
+                    "gateway requested kernel-split but fell back to user-space relay: {}",
+                    reason
+                );
+            }
+            self.stats.set_gateway_kernel_split(
+                gw.effective_mode() == crate::gateway::GatewayMode::KernelSplit,
+            );
+            gw.ipset_name().map(|name| {
+                tracing::info!(
+                    "kernel-split gateway active: ipset={} ttl={}s",
+                    name,
+                    crate::gateway::IPSET_ENTRY_TTL_SECS
+                );
+                crate::ipset::IpsetPublisher::spawn(
+                    name.to_string(),
+                    crate::gateway::IPSET_ENTRY_TTL_SECS,
+                    gw.ipset_seed_entries(),
+                )
+            })
+        });
+        #[cfg(not(target_os = "linux"))]
+        let ipset: Option<std::sync::Arc<crate::ipset::IpsetPublisher>> = None;
 
         let socks5_addr =
             self.config.client.listen.parse().map_err(|e| {
@@ -151,6 +223,20 @@ impl PhantomClient {
             .with_failover(Arc::clone(&self.failover))
             .with_stats(Arc::clone(&self.stats))
             .with_whitelist(crate::whitelist::shared(&self.config).whitelist());
+
+        if let Some(ipset) = &ipset {
+            proxy = proxy.with_ipset(std::sync::Arc::clone(ipset));
+            // Publish the set size for the UI/perf sampler.
+            let stats = Arc::clone(&self.stats);
+            let handle = std::sync::Arc::clone(ipset);
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+                loop {
+                    ticker.tick().await;
+                    stats.set_whitelist_ipset_entries(handle.entries());
+                }
+            });
+        }
 
         if let Some(server) = self.config.servers.first() {
             proxy = proxy.with_server(server.clone(), self.local_secret);

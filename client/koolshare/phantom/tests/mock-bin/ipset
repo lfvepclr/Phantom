@@ -1,0 +1,14 @@
+#!/bin/sh
+# ipset mock：只记录被调用过什么（内核对象在测试里没法真的建）。
+# 每次调用追加一行；`restore` 还会把 stdin 的批量内容一起记下来。
+F="${MOCK_IPSET_FILE:-/tmp/mock-ipset.txt}"
+[ -f "$F" ] || : >"$F"
+echo "ipset $*" >>"$F" 2>/dev/null
+case "$*" in
+    *restore*)
+        while IFS= read -r line; do
+            echo "  $line" >>"$F" 2>/dev/null
+        done
+        ;;
+esac
+exit 0

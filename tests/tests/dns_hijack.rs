@@ -7,7 +7,7 @@
 //! - A-record extraction from DNS responses
 
 use phantom_client::dns::{DnsCache, DnsHeader, extract_a_records, extract_query_domain};
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 /// Verify that a well-formed DNS header is decoded correctly.
 #[test]
@@ -75,8 +75,9 @@ fn extract_domain_no_questions() {
 async fn dns_cache_insert_and_lookup() {
     let cache = DnsCache::new();
 
-    let ip1 = Ipv4Addr::new(93, 184, 216, 34);
-    let ip2 = Ipv4Addr::new(1, 1, 1, 1);
+    // DnsCache is keyed by IpAddr (v4 and v6 answers share the cache).
+    let ip1 = IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34));
+    let ip2 = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
 
     // Lookup before insert should return None
     assert!(cache.lookup(ip1).await.is_none());
@@ -92,7 +93,7 @@ async fn dns_cache_insert_and_lookup() {
 #[tokio::test]
 async fn dns_cache_overwrite() {
     let cache = DnsCache::new();
-    let ip = Ipv4Addr::new(10, 0, 0, 1);
+    let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
 
     cache.insert(ip, "old.example.com".to_string()).await;
     assert_eq!(cache.lookup(ip).await.unwrap(), "old.example.com");

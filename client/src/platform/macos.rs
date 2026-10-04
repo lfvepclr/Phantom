@@ -346,6 +346,14 @@ fn start_with_config(config: ClientConfig) -> i32 {
             // plus a Noise handshake on every new connection.
             let tcp_pool = std::sync::Arc::new(crate::tcp_pool::TcpSessionPool::new());
             tcp_pool.spawn_sweeper();
+            // Single-server deployments: turn "the server is unreachable into
+            // the void" into "reset the pools and let the app reconnect".
+            crate::tunnel::install_datapath_reset_hook(
+                &failover_socks5,
+                &tcp_pool,
+                &quic_pool,
+                &stats_socks5,
+            );
             if let Some(server) = config_clone
                 .servers
                 .first()

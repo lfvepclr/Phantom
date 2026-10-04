@@ -162,7 +162,9 @@ bash deploy/router/install.sh <路由器IP> "phantom://KEY@vpn.example.com:443"
 
 软件中心插件带 Web 管理界面（开关、连接串、模式、白名单、定时重启、测速、上下行速率、
 日志），装在 `/koolshare` 下，控制面与数据面分离、不改 Rust 核心；
-完整说明见 [client/koolshare/README.md](client/koolshare/README.md)。
+默认走**内核分流**（只有白名单目标进隧道，直连流量留在内核快路径吃硬件 NAT 加速；
+缺 ipset 的固件自动回退兼容模式），Broadcom 平台的转发路径与调优说明见
+[client/koolshare/README.md](client/koolshare/README.md) §7.0。
 
 命令行方式的完整说明（前置条件、路由原理、DNS 取舍、故障排查）见
 [deploy/router/README.md](deploy/router/README.md)。

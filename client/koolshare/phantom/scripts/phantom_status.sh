@@ -23,14 +23,30 @@ STATUS_JSON="${PHANTOM_STATUS:-/tmp/upload/phantom_status.txt}"
 PIDFILE="${PHANTOM_PIDFILE:-/tmp/phantom.pid}"
 STATUS_PIDFILE="${PHANTOM_STATUS_PIDFILE:-/tmp/phantom_status.pid}"
 METRICS="http://127.0.0.1:9150/metrics"
-INTERVAL=2
+INTERVAL=3
 
 prev_up=0
 prev_down=0
 prev_udp_up=0
 prev_udp_down=0
 prev_ts=0
+prev_ticks=0
 first=1
+
+# 本机 busybox 的 ps 没有 `-o`（`ps: invalid option -- 'o'`），所以页面上的
+# CPU 一直是 0 —— 夜里真出问题时反而看不到证据。直接读 /proc/<pid>/stat 的
+# utime+stime 自己算差值。
+HZ=$(getconf CLK_TCK 2>/dev/null)
+case "$HZ" in ''|*[!0-9]*) HZ=100 ;; esac
+
+proc_cpu_ticks() {
+    _line=$(cat "/proc/$1/stat" 2>/dev/null) || return 0
+    _rest=${_line##*') '}
+    # 去掉 "pid (comm)" 之后，第 12/13 个字段就是 utime/stime（stat 的 14/15）。
+    # shellcheck disable=SC2086
+    set -- $_rest
+    echo $(( ${12:-0} + ${13:-0} ))
+}
 
 metric() {
     printf '%s' "$1" | sed -n "s/^$2 \([0-9]\{1,\}\)\$/\1/p" | head -n 1
@@ -71,7 +87,7 @@ fetch() {
 
 write_empty() {
     cat >"${STATUS_JSON}.tmp" 2>/dev/null <<EOF
-{"ts":$(date +%s),"running":0,"up_rate":0,"down_rate":0,"total_up":0,"total_down":0,"udp_up":0,"udp_down":0,"conns":0,"direct":0,"proxy":0,"cpu":0}
+{"ts":$(date +%s),"running":0,"up_rate":0,"down_rate":0,"total_up":0,"total_down":0,"udp_up":0,"udp_down":0,"conns":0,"direct":0,"proxy":0,"cpu":0,"gw":"-","ipset":0,"fd":0,"fdl":0}
 EOF
     mv "${STATUS_JSON}.tmp" "${STATUS_JSON}" 2>/dev/null
     chmod 644 "${STATUS_JSON}" 2>/dev/null
@@ -106,14 +122,27 @@ while :; do
         [ -n "$direct" ] || direct=0
         [ -n "$proxy" ] || proxy=0
 
-        cpu=$(ps -o pcpu= -p "$pid" 2>/dev/null | tr -d ' ')
-        [ -n "$cpu" ] || cpu=0
-        cpu=$(printf '%s' "$cpu" | cut -d. -f1)
-        [ -n "$cpu" ] || cpu=0
+        ipset_entries=$(metric "$body" phantom_whitelist_ipset_entries)
+        [ -n "$ipset_entries" ] || ipset_entries=0
+        kernel_split=$(metric "$body" phantom_gateway_kernel_split)
+        case "$kernel_split" in
+            1) gw="kernel-split" ;;
+            0) gw="relay" ;;
+            *) gw="-" ;;
+        esac
+
+        fd_used=$(ls /proc/"$pid"/fd 2>/dev/null | wc -l | tr -d ' ')
+        [ -n "$fd_used" ] || fd_used=0
+        fd_limit=$(awk '/Max open files/ {print $4}' /proc/"$pid"/limits 2>/dev/null | head -n 1)
+        [ -n "$fd_limit" ] || fd_limit=0
+
+        ticks=$(proc_cpu_ticks "$pid")
+        [ -n "$ticks" ] || ticks=0
 
         if [ "$first" = "1" ]; then
             up_rate=0
             down_rate=0
+            cpu=0
             first=0
         else
             dt=$((now - prev_ts))
@@ -124,6 +153,10 @@ while :; do
             [ "$dd" -lt 0 ] && dd=0
             up_rate=$((du / dt))
             down_rate=$((dd / dt))
+            dticks=$((ticks - prev_ticks))
+            [ "$dticks" -lt 0 ] && dticks=0
+            # 百分比按整机（多核）算：ticks/HZ 秒的 CPU 时间占 dt 秒的比例。
+            cpu=$((dticks * 100 / (HZ * dt)))
         fi
 
         prev_up=$total_up
@@ -131,9 +164,10 @@ while :; do
         prev_udp_up=$udp_up
         prev_udp_down=$udp_down
         prev_ts=$now
+        prev_ticks=$ticks
 
         cat >"${STATUS_JSON}.tmp" 2>/dev/null <<EOF
-{"ts":${now},"running":1,"up_rate":${up_rate},"down_rate":${down_rate},"total_up":${total_up},"total_down":${total_down},"udp_up":${udp_up},"udp_down":${udp_down},"conns":${conns},"direct":${direct},"proxy":${proxy},"cpu":${cpu}}
+{"ts":${now},"running":1,"up_rate":${up_rate},"down_rate":${down_rate},"total_up":${total_up},"total_down":${total_down},"udp_up":${udp_up},"udp_down":${udp_down},"conns":${conns},"direct":${direct},"proxy":${proxy},"cpu":${cpu},"gw":"${gw}","ipset":${ipset_entries},"fd":${fd_used},"fdl":${fd_limit}}
 EOF
         mv "${STATUS_JSON}.tmp" "${STATUS_JSON}" 2>/dev/null
         chmod 644 "${STATUS_JSON}" 2>/dev/null

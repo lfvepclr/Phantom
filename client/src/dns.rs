@@ -19,7 +19,7 @@
 use bytes::{Bytes, BytesMut};
 use phantom_core::{PhantomError, Result};
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
@@ -448,7 +448,11 @@ struct DnsCacheEntry {
 
 #[derive(Debug, Clone, Default)]
 pub struct DnsCache {
-    inner: Arc<Mutex<HashMap<Ipv4Addr, DnsCacheEntry>>>,
+    /// Keyed by `IpAddr`, not `Ipv4Addr`: on a dual-stack mobile network the
+    /// app connects to the AAAA it was handed, and a v4-only map turned every
+    /// IPv6 destination into "no domain known" — which the router then treated
+    /// as an unlisted destination and sent out over the physical link.
+    inner: Arc<Mutex<HashMap<IpAddr, DnsCacheEntry>>>,
 }
 
 impl DnsCache {
@@ -456,7 +460,7 @@ impl DnsCache {
         Self::default()
     }
 
-    pub async fn insert(&self, ip: Ipv4Addr, domain: String) {
+    pub async fn insert(&self, ip: IpAddr, domain: String) {
         let mut map = self.inner.lock().await;
         if map.len() >= DNS_CACHE_MAX_ENTRIES && !map.contains_key(&ip) {
             // Evict the least recently touched entry: the one an active route is
@@ -483,7 +487,7 @@ impl DnsCache {
     /// A hit means this address is still being routed through its domain, which
     /// is exactly the entry worth keeping; renewing it also keeps it ahead of
     /// the eviction order.
-    pub async fn lookup(&self, ip: Ipv4Addr) -> Option<String> {
+    pub async fn lookup(&self, ip: IpAddr) -> Option<String> {
         let mut map = self.inner.lock().await;
         let expired = match map.get(&ip) {
             Some(entry) => entry.touched_at.elapsed() > DNS_CACHE_TTL,
@@ -509,10 +513,12 @@ impl DnsCache {
     }
 }
 
-/// Extract IPv4 addresses from A-record answers in a DNS response.
-/// Returns the first A-record IP found (MVP).  Does not follow compression
-/// pointers deeply.
-pub fn extract_a_records(buf: &[u8]) -> Vec<Ipv4Addr> {
+/// Extract A (1) and AAAA (28) record addresses from a DNS response.
+///
+/// Both families matter on a dual-stack path: the app may well connect to the
+/// AAAA it was given first, and the reverse lookup that drives the routing
+/// decision has to know which domain that address belongs to.
+pub fn extract_addr_records(buf: &[u8]) -> Vec<IpAddr> {
     let mut ips = Vec::new();
     let header = match DnsHeader::decode(buf) {
         Some(h) => h,
@@ -584,13 +590,16 @@ pub fn extract_a_records(buf: &[u8]) -> Vec<Ipv4Addr> {
         let rdlength = u16::from_be_bytes([buf[offset + 8], buf[offset + 9]]) as usize;
         offset += 10;
         if rtype == 1 && rclass == 1 && rdlength == 4 && offset + 4 <= buf.len() {
-            let ip = Ipv4Addr::new(
+            ips.push(IpAddr::V4(Ipv4Addr::new(
                 buf[offset],
                 buf[offset + 1],
                 buf[offset + 2],
                 buf[offset + 3],
-            );
-            ips.push(ip);
+            )));
+        } else if rtype == 28 && rclass == 1 && rdlength == 16 && offset + 16 <= buf.len() {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&buf[offset..offset + 16]);
+            ips.push(IpAddr::V6(Ipv6Addr::from(octets)));
         }
         offset += rdlength;
     }
@@ -598,40 +607,59 @@ pub fn extract_a_records(buf: &[u8]) -> Vec<Ipv4Addr> {
     ips
 }
 
+/// IPv4 addresses only, in the order they appear.
+///
+/// The kernel-split ipset and the gateway plumbing are IPv4-only, so they take
+/// this view of the same parse.
+pub fn extract_a_records(buf: &[u8]) -> Vec<Ipv4Addr> {
+    extract_addr_records(buf)
+        .into_iter()
+        .filter_map(|ip| match ip {
+            IpAddr::V4(v4) => Some(v4),
+            IpAddr::V6(_) => None,
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Helpers for TUN packet construction
 // ---------------------------------------------------------------------------
 
-/// Build a raw IPv4/UDP packet containing `payload` destined back to the
-/// original querier.  `payload` should be the raw DNS response bytes.
+/// Build a raw UDP packet (IPv4 or IPv6, matching the querier) containing
+/// `payload`, destined back to the original querier.
+///
+/// `payload` should be the raw DNS response bytes. The family is taken from
+/// the query's addresses, so a query that arrived over IPv6 is answered over
+/// IPv6 — answering it over IPv4 would produce a packet the app never sees.
 pub fn build_dns_response_packet(payload: &[u8], ctx: &DnsQueryContext) -> Result<Vec<u8>> {
     use etherparse::PacketBuilder;
 
-    let src_ip = match ctx.dst_ip {
-        IpAddr::V4(v4) => v4,
-        _ => {
-            return Err(PhantomError::Protocol(
-                "IPv6 DNS not yet supported".to_string(),
-            ));
+    match (ctx.dst_ip, ctx.src_ip) {
+        (IpAddr::V4(src_ip), IpAddr::V4(dst_ip)) => {
+            let builder = PacketBuilder::ipv4(src_ip.octets(), dst_ip.octets(), 64)
+                .udp(ctx.dst_port, ctx.src_port);
+            let mut pkt = Vec::with_capacity(20 + 8 + payload.len());
+            builder
+                .write(&mut pkt, payload)
+                .map_err(|e| PhantomError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            Ok(pkt)
         }
-    };
-    let dst_ip = match ctx.src_ip {
-        IpAddr::V4(v4) => v4,
-        _ => {
-            return Err(PhantomError::Protocol(
-                "IPv6 DNS not yet supported".to_string(),
-            ));
+        (IpAddr::V6(src_ip), IpAddr::V6(dst_ip)) => {
+            let builder = PacketBuilder::ipv6(src_ip.octets(), dst_ip.octets(), 64)
+                .udp(ctx.dst_port, ctx.src_port);
+            let mut pkt = Vec::with_capacity(40 + 8 + payload.len());
+            builder
+                .write(&mut pkt, payload)
+                .map_err(|e| PhantomError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
+            Ok(pkt)
         }
-    };
-
-    let builder =
-        PacketBuilder::ipv4(src_ip.octets(), dst_ip.octets(), 64).udp(ctx.dst_port, ctx.src_port);
-
-    let mut pkt = Vec::with_capacity(20 + 8 + payload.len());
-    builder
-        .write(&mut pkt, payload)
-        .map_err(|e| PhantomError::Io(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
-    Ok(pkt)
+        // A v4 query answered from a v6 address (or vice versa) is a bug in
+        // the caller, not something to paper over: say so instead of building
+        // a packet the app cannot accept.
+        (src, dst) => Err(PhantomError::Protocol(format!(
+            "DNS query family mismatch: src {src} dst {dst}"
+        ))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -642,6 +670,32 @@ pub fn build_dns_response_packet(payload: &[u8], ctx: &DnsQueryContext) -> Resul
 mod tests {
     use super::*;
 
+    /// A minimal DNS response with one AAAA answer, built by hand so the parser
+    /// tests do not depend on a resolver.
+    fn aaaa_response(domain: &str, addr: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&1u16.to_be_bytes()); // id
+        out.extend_from_slice(&0x8180u16.to_be_bytes()); // QR, RD, RA, RCODE=0
+        out.extend_from_slice(&1u16.to_be_bytes()); // questions
+        out.extend_from_slice(&1u16.to_be_bytes()); // answers
+        out.extend_from_slice(&0u16.to_be_bytes()); // authority
+        out.extend_from_slice(&0u16.to_be_bytes()); // additional
+        for label in domain.split('.') {
+            out.push(label.len() as u8);
+            out.extend_from_slice(label.as_bytes());
+        }
+        out.push(0);
+        out.extend_from_slice(&28u16.to_be_bytes()); // QTYPE = AAAA
+        out.extend_from_slice(&1u16.to_be_bytes()); // QCLASS = IN
+        out.extend_from_slice(&[0xC0, 0x0C]); // name -> question
+        out.extend_from_slice(&28u16.to_be_bytes()); // TYPE = AAAA
+        out.extend_from_slice(&1u16.to_be_bytes()); // CLASS = IN
+        out.extend_from_slice(&300u32.to_be_bytes()); // TTL
+        out.extend_from_slice(&16u16.to_be_bytes()); // RDLENGTH
+        out.extend_from_slice(&addr.parse::<Ipv6Addr>().unwrap().octets());
+        out
+    }
+
     /// Reverse-lookup round trip, and the empty result a miss produces.
     ///
     /// The miss case is the routing-critical one: an unknown address must come
@@ -650,10 +704,33 @@ mod tests {
     #[tokio::test]
     async fn lookup_round_trips_and_misses_cleanly() {
         let cache = DnsCache::new();
-        let ip = Ipv4Addr::new(142, 250, 72, 14);
+        let ip = IpAddr::V4(Ipv4Addr::new(142, 250, 72, 14));
         assert_eq!(cache.lookup(ip).await, None, "unknown IP must not guess");
         cache.insert(ip, "www.google.com".to_string()).await;
         assert_eq!(cache.lookup(ip).await.as_deref(), Some("www.google.com"));
+    }
+
+    /// The IPv6 half of the same contract.
+    ///
+    /// This is the fix for "Wi-Fi works, cellular does not": the app gets a
+    /// real AAAA on a dual-stack mobile network and connects to it, and a
+    /// v4-only cache meant that address had no domain — so the whitelist could
+    /// not match and the connection was sent out over the physical link.
+    #[tokio::test]
+    async fn cache_maps_ipv6_addresses_to_their_domain() {
+        let cache = DnsCache::new();
+        let v6: Ipv6Addr = "2404:6800:4005:827::200e".parse().unwrap();
+        assert_eq!(cache.lookup(IpAddr::V6(v6)).await, None);
+        cache
+            .insert(IpAddr::V6(v6), "ipv6.google.com".to_string())
+            .await;
+        assert_eq!(
+            cache.lookup(IpAddr::V6(v6)).await.as_deref(),
+            Some("ipv6.google.com")
+        );
+        // The families are distinct keys: the v4 address of the same domain is
+        // a separate entry, not an accidental hit.
+        assert_eq!(cache.lookup(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))).await, None);
     }
 
     /// The cache must be bounded: a long session fills it, and eviction picks
@@ -663,21 +740,21 @@ mod tests {
         let cache = DnsCache::new();
         for i in 0..DNS_CACHE_MAX_ENTRIES as u32 {
             cache
-                .insert(Ipv4Addr::from(i), format!("host-{i}.example"))
+                .insert(IpAddr::V4(Ipv4Addr::from(i)), format!("host-{i}.example"))
                 .await;
         }
         assert_eq!(cache.len().await, DNS_CACHE_MAX_ENTRIES);
 
         // Touch one entry so it is clearly the most recently used, then force
         // an eviction and make sure *it* survived rather than the oldest.
-        let touched = Ipv4Addr::from(0);
+        let touched = IpAddr::V4(Ipv4Addr::from(0));
         assert_eq!(
             cache.lookup(touched).await.as_deref(),
             Some("host-0.example")
         );
         cache
             .insert(
-                Ipv4Addr::from(DNS_CACHE_MAX_ENTRIES as u32),
+                IpAddr::V4(Ipv4Addr::from(DNS_CACHE_MAX_ENTRIES as u32)),
                 "newest.example".to_string(),
             )
             .await;
@@ -694,16 +771,64 @@ mod tests {
     #[tokio::test]
     async fn lookup_renews_the_lease() {
         let cache = DnsCache::new();
-        let first = Ipv4Addr::new(10, 0, 0, 1);
-        let second = Ipv4Addr::new(10, 0, 0, 2);
+        let first = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let second = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
         cache.insert(first, "a.example".to_string()).await;
         cache.insert(second, "b.example".to_string()).await;
         // `first` is now older than `second`; touching it must make it survive a
         // single-entry eviction instead.
         assert_eq!(cache.lookup(first).await.as_deref(), Some("a.example"));
-        cache.insert(Ipv4Addr::new(10, 0, 0, 3), "c.example".to_string()).await;
+        cache
+            .insert(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3)), "c.example".to_string())
+            .await;
         assert_eq!(cache.len().await, 3, "nothing evicted below the cap");
         assert_eq!(cache.lookup(second).await.as_deref(), Some("b.example"));
+    }
+
+    /// An AAAA answer must be parsed and mapped, and the IPv4-only view must
+    /// keep ignoring it (the kernel-split ipset cannot hold v6 addresses).
+    #[test]
+    fn addr_extraction_reads_both_families_and_a_records_stay_v4() {
+        let response = aaaa_response("ipv6.google.com", "2404:6800:4005:827::200e");
+        let all = extract_addr_records(&response);
+        assert_eq!(all.len(), 1);
+        assert_eq!(
+            all[0],
+            IpAddr::V6("2404:6800:4005:827::200e".parse().unwrap())
+        );
+        assert!(extract_a_records(&response).is_empty());
+    }
+
+    /// A DNS answer that came in over IPv6 is answered over IPv6.
+    ///
+    /// Building the reply as an IPv4 packet (the old behaviour) produced
+    /// something the app never saw, so a query sent to a v6 resolver looked
+    /// like a silent drop.
+    #[test]
+    fn dns_response_packet_round_trips_over_ipv6() {
+        let ctx = DnsQueryContext {
+            src_ip: "fd00:8:8::2".parse().unwrap(),
+            src_port: 41000,
+            dst_ip: "2001:4860:4860::8888".parse().unwrap(),
+            dst_port: 53,
+        };
+        let payload = b"\x00\x01\x81\x80";
+        let pkt = build_dns_response_packet(payload, &ctx).expect("v6 response packet");
+        let parsed = etherparse::Ipv6HeaderSlice::from_slice(&pkt).expect("ipv6 header");
+        assert_eq!(IpAddr::V6(parsed.source_addr()), ctx.dst_ip);
+        assert_eq!(IpAddr::V6(parsed.destination_addr()), ctx.src_ip);
+    }
+
+    /// Mixed families are a caller bug and must be reported, not guessed at.
+    #[test]
+    fn dns_response_packet_rejects_mixed_families() {
+        let ctx = DnsQueryContext {
+            src_ip: "10.8.0.2".parse().unwrap(),
+            src_port: 41000,
+            dst_ip: "2001:4860:4860::8888".parse().unwrap(),
+            dst_port: 53,
+        };
+        assert!(build_dns_response_packet(b"x", &ctx).is_err());
     }
 
     #[test]

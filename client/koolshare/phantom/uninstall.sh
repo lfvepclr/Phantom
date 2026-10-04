@@ -75,7 +75,8 @@ rm -f "${SCRIPTS_DIR}/${module}_config.sh" \
       "${SCRIPTS_DIR}/${module}_speedtest.sh" \
       "${SCRIPTS_DIR}/${module}_cron.sh" \
       "${SCRIPTS_DIR}/${module}_diag.sh" \
-      "${SCRIPTS_DIR}/${module}_watchdog.sh" >/dev/null 2>&1
+      "${SCRIPTS_DIR}/${module}_watchdog.sh" \
+      "${SCRIPTS_DIR}/${module}_perf.sh" >/dev/null 2>&1
 rm -f "${BIN_DIR}/phantom" >/dev/null 2>&1
 rm -f /koolshare/webs/Module_${module}.asp >/dev/null 2>&1
 rm -f /koolshare/res/phantom.css /koolshare/res/icon-phantom.png >/dev/null 2>&1
@@ -83,9 +84,34 @@ rm -f /koolshare/init.d/S98${module}.sh /koolshare/init.d/N98${module}.sh >/dev/
 # 运行期文件在 tmpfs（/tmp/upload 是页面的文本通道）；顺带清历史版本留下的
 # /tmp 直放文件与 docroot / /www/_temp 死软链
 rm -f /tmp/upload/phantom_log.txt /tmp/upload/phantom_status.txt >/dev/null 2>&1
+rm -f /tmp/upload/phantom_perf.log /tmp/phantom_perf.state >/dev/null 2>&1
 rm -f /tmp/phantom_log.txt /tmp/phantom_status.txt /tmp/phantom.pid /tmp/phantom_status.pid >/dev/null 2>&1
 rm -f "/koolshare/webs/phantom_status.txt" "/koolshare/webs/phantom_log.txt" >/dev/null 2>&1
 rm -f /www/_temp/phantom_log.txt /www/_temp/phantom_status.txt >/dev/null 2>&1
+
+# 内核分流留下的内核对象（ipset / mangle 标记 / fwmark 路由 / DoH 拦截）。
+# 正常路径由 phantom 的 Drop 与 stop 清理，这里兜底掉任何残留。
+echo_date "清理内核分流对象..."
+uninstall_lan=""
+[ "$KS_MODE" = "1" ] && uninstall_lan=$("$DBUS" get ${module}_lan_if 2>/dev/null)
+[ -n "$uninstall_lan" ] || uninstall_lan="br0"
+for iface in $uninstall_lan; do
+    for proto in udp tcp; do
+        while iptables -t mangle -D PREROUTING -i "$iface" -p "$proto" --dport 53 \
+            -j MARK --set-mark 1 2>/dev/null; do :; done
+        while iptables -D FORWARD -i "$iface" -p "$proto" --dport 853 -j REJECT 2>/dev/null; do :; done
+    done
+    while iptables -t mangle -D PREROUTING -i "$iface" -m set --match-set phantom_proxy dst \
+        -j MARK --set-mark 1 2>/dev/null; do :; done
+    for ip in 1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 9.9.9.9 149.112.112.112 \
+              208.67.222.222 208.67.220.220 94.140.14.14 94.140.15.15 \
+              185.228.168.9 185.228.169.9 76.76.2.0 76.76.10.0; do
+        while iptables -D FORWARD -i "$iface" -d "$ip" -p tcp --dport 443 \
+            -j REJECT --reject-with tcp-reset 2>/dev/null; do :; done
+    done
+done
+while ip rule del fwmark 1 lookup 200 2>/dev/null; do :; done
+ipset destroy phantom_proxy 2>/dev/null
 
 if [ "${KS_MODE}" = "0" ]; then
     # 降级模式：清掉 /jffs/scripts 里的钩子行

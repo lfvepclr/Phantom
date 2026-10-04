@@ -29,6 +29,9 @@ Phantom 的第 5 个客户端形态：**华硕路由器上的 koolshare 软件�
 | 日志 | 页面 1.5 秒轮询，500 行 / 256KB 截断，一键清空（`/tmp/upload/phantom_log.txt`，页面读 `/_temp/phantom_log.txt`） |
 | nat-start 兜底 | `init.d/N98phantom.sh`：Asuswrt 重建 iptables 后，只在规则确实丢了时才重启补回 |
 | 皮肤 | ASUSWRT / ROG / TUF 三套，`/* W3C rogcss */`、`/* W3C asuscss */` 标记由 install.sh 切换 |
+| 分流模式 | 内核分流（ipset+fwmark，默认）/ 兼容模式（用户态 relay），页面可切换，缺 ipset 时自动回退 |
+| 加密 DNS 拦截 | 默认拦掉 LAN 侧 DoT(853) 与已知 DoH 解析器，保证域名分流的学习链不断 |
+| 性能采样 | `phantom_perf.sh` 每 5 分钟一行：CPU、连接数、fd、flow-cache 命中、直连/隧道字节、DNS/RTT/丢包、无线客户端数、口速率 |
 
 ## 2. 架构：控制面与运行面
 
@@ -108,6 +111,7 @@ client/koolshare/
 | `start_nat` | nat-start 兜底：规则被 iptables 重建冲掉时重启补回 |
 | `cron` | 按 dbus 幂等重注册定时任务 |
 | `diag` | 输出诊断报告 |
+| `_trim` | 内部入口：只裁剪日志（看门狗每 5 分钟调用） |
 | `ks <0\|1>` | 历史兼容入口（真实开机路径是 `init.d/S98phantom.sh start`） |
 
 **两套调用方式都要认**（这里是全插件最容易踩的坑）：
@@ -144,7 +148,9 @@ httpdb 先把 `fields` 写进 dbus，再执行 `/koolshare/scripts/<method> <id>
 | `phantom_whitelist` | 空 | 自定义域名，**逗号分隔单行** |
 | `phantom_cron_enable` / `phantom_cron_time` | `0` / `4:30` | 定时重启 |
 | `phantom_watchdog` | `1` | 看门狗 |
-| `phantom_log_level` | `info` | error / warn / info / debug |
+| `phantom_log_level` | `warn` | error / warn / info / debug（info 会为每条连接/路由打一行，夜里费 CPU 与 tmpfs） |
+| `phantom_gateway_mode` | `kernel-split` | `kernel-split`（只把白名单目标送进 TUN，直连走内核快路径）/ `relay`（全部进 TUN 用户态判定） |
+| `phantom_block_doh` | `1` | 拦截 LAN 侧加密 DNS（DoT/DoH），保证域名→IP 的学习链不断 |
 | `phantom_server_up_mbps` / `phantom_server_down_mbps` | `3` / `5` | 服务端带宽，用于解读测速结果 |
 | `phantom_last_act` / `phantom_speed_last` / `phantom_watchdog_fails` | — | 运行状态回显 |
 | `softcenter_module_phantom_{version,install,name,title,description}` | — | 软件中心要求 |
@@ -265,7 +271,8 @@ ssh -p <SSH端口> admin@<路由器IP> '/bin/sh /koolshare/scripts/phantom_confi
 ```
 
 采集：固件与内核、脱敏后的 dbus、进程与 CPU、`ip rule/route/link`、iptables 摘要、
-`/proc/net/dev`、两次 metrics 采样（间隔 3s）、最近 200 行日志、cru 条目、磁盘。
+`/proc/net/dev`、两次 metrics 采样（间隔 3s）、**分流模式与内核对象（ipset/mangle/fwmark/
+flow-cache 命中）**、**最近 20 行性能采样**、最近 200 行日志、cru 条目、磁盘。
 
 ### 6.5 无真机的防线
 
@@ -311,6 +318,94 @@ dbus 键（URI 已脱敏）。
 
 ## 7. 性能
 
+### 7.0 Broadcom 路由器的架构约束（先读这一段）
+
+这台机器（RT-AX86U Pro / BCM4912）有两条完全不同的转发路径：
+
+```
+直连快路径（硬件）：  br0 ─▶ 内核 FORWARD ─▶ Runner / Flow Cache ─▶ eth0     ~1 Gbps，几乎不占 CPU
+用户态慢路径（软件）：  br0 ─▶ TUN ─▶ phantom 用户态 TCP 栈 ─▶ 上游 socket    ~120 Mbps 封顶，吃 1+ 核
+```
+
+**只要一个包进了 TUN，它就必须由 CPU 处理**：内核把包交给用户态、phantom 终结这条
+TCP（自己维护窗口/ACK/重传）、再以另一个 socket 发出去，回程同样走一遍。
+Broadcom 的硬件加速（`/proc/fcache` 里的 Runner）**完全用不上** —— 实测数据：
+
+| 路径 | 实测 | 说明 |
+|---|---|---|
+| 路由器本机 8 路并行（内核路径） | **420 Mbps** | 硬件/内核的能力上限 |
+| LAN 经插件 4 路并行（全部进 TUN） | **114–140 Mbps** | 用户态 relay 的封顶，且吃掉约 1.2 核 |
+| `/proc/fcache/nflist` | 125 条流，`HW_Hits` 全 0 | 硬件加速一条都没命中 |
+
+所以"晚上人多就慢"的典型成因不是加密、也不是带宽不够，而是**所有流量（含直连）都
+挤在用户态 relay 这一条路上**。插件计数里 17593 条连接有 15263 条是"直连"，它们
+每一个都走了这条慢路径。
+
+### 7.0.1 两种分流模式
+
+| 模式 | 内核对象 | 谁进隧道 | 适用 |
+|---|---|---|---|
+| **内核分流**（默认） | ipset `phantom_proxy` + `iptables -t mangle ... MARK` + `ip rule fwmark` | 只有**白名单目标 IP** | 有 `ipset`/`xt_set` 的固件（本机实测可用）。直连流量不进 TUN，走硬件快路径 |
+| **兼容模式** | 仅 `ip rule iif br0 lookup 200` | **全部** LAN 转发流量 | 老固件没有 ipset 时自动回退；或需要兜住"自己解析域名/写死 IP"的被墙应用 |
+
+内核分流的判定链：
+
+```
+LAN 包 ──▶ mangle PREROUTING ──┬── dst 命中 ipset ──▶ MARK 0x1 ──▶ table 200 ──▶ phantom0（进隧道，加密）
+                               ├── udp/tcp:53      ──▶ MARK 0x1 ──▶ phantom0（DNS 走隧道，用于学习域名→IP）
+                               └── 其余           ──▶ main 表   ──▶ eth0（直连，硬件加速）
+```
+
+白名单 IP 从哪来（不预热，也不写死单个 IP）：
+
+1. **DNS 实时学习**：LAN 的 53 端口被劫持进隧道，白名单域名由 phantom 用隧道 DNS 解析，
+   A 记录一方面进反查缓存，另一方面批量写进 ipset（1 秒合并一次 `ipset restore`，
+   带 30 分钟超时）。
+2. **内置 CIDR**：`client/data/proxy_cidrs.txt` 里带着 Telegram 12 段 + **Google 官方
+   `goog.json` 的 130 段**（`142.250.0.0/15`、`172.217.0.0/16`、`74.125.0.0/16`、
+   `173.194.0.0/16`、`216.58.192.0/19` 等）。YouTube 播放常常直接对着 CDN IP 建连，
+   这些段保证它在"还没问到 DNS"时也进隧道；`cargo xtask rules update` 会随上游刷新。
+3. **加密 DNS 拦截**（页面开关，默认开）：客户端一旦用 DoH/DoT 绕过路由器解析，上面的
+   学习链就断了 —— 拦掉 LAN 侧 853 与已知 DoH 解析器，逼它回落系统 DNS。
+
+> why-not-预热：把内置 4.4k 域名全部预解析一遍既费时又要定期重跑；官方 IP 段 + 实时
+> 学习已经覆盖了实际会遇到的场景。
+
+**怎么自查（只读，随时可跑）**：
+
+```bash
+# 1) 现在是谁在转发：内核分流只标记白名单，兼容模式是通配 iif
+ssh -p <SSH端口> admin@<路由器IP> 'ip rule show | tail -3; iptables -t mangle -S PREROUTING | head'
+
+# 2) 硬件加速有没有生效（Fhw_idx=4294967295 / HW_Hits 0 = 完全没用上）
+ssh -p <SSH端口> admin@<路由器IP> 'awk "/HW_TotHits/{next} /^ *[0-9]+ /{t++; if (\$0 !~ /4294967295/) hw++} END {print \"hw=\"hw\" total=\"t}" /proc/fcache/nflist'
+
+# 3) 用户态 relay 的时刻账（夜间高峰再看一次）
+ssh -p <SSH端口> admin@<路由器IP> 'top -b -n 1 | grep -E "^CPU|phantom client"'
+
+# 4) 直连到底有没有被加密：direct 与 tunnel 是两套独立计数
+ssh -p <SSH端口> admin@<路由器IP> 'curl -s 127.0.0.1:9150/metrics | grep -E "direct_bytes|tunnel_bytes|ipset"'
+
+# 5) 反向路径校验：phantom0 必须是 0、all 必须不是 1（否则隧道回包被丢，DNS 全超时）
+ssh -p <SSH端口> admin@<路由器IP> 'for f in all br0 phantom0; do printf "%-9s %s\n" $f "$(cat /proc/sys/net/ipv4/conf/$f/rp_filter)"; done'
+```
+
+**怎么判定"直连没有加解密"**：直连走 `tcp_direct_relay_task → TcpStream::connect`，
+明文、不进服务端；只有 `RuleAction::Proxy` 才进隧道。三个可验证的证据：
+① 直连吞吐能到 114–420 Mbps，远超服务端 3 Mbps 上行上限；
+② `phantom_direct_bytes_*` 与 `phantom_tunnel_bytes_*` 两套计数互不重叠
+（内核分流下直连根本不进 TUN，所以 `direct_bytes` 恒为 0 —— 这本身就是"没经过用户态、
+更没经过加密"的证据）；
+③ 服务端侧流量只随 tunnel 计数增长。
+
+> **踩过的坑：`rp_filter` 会让隧道"看起来把 DNS 弄坏了"。**
+> TUN 注入的回包源地址是公网 IP（比如 8.8.8.8），严格反向路径校验（rp_filter=1）会
+> 认为它该从 WAN 出去而直接丢弃 —— 现象是客户端 DNS 全部超时、网页打不开，
+> 但隧道进程、路由、ipset 看起来全都正常。
+> 更坑的是本固件**没有 `sysctl` 二进制**：原来那句 `sysctl -w net.ipv4.conf.phantom0.rp_filter=0`
+> 一直静默失败。现在直接写 `/proc/sys`，并且同时设 `all=2`（内核按 `max(all, iface)` 判定，
+> 只清 iface 不够）；启动后还会回读校验，仍是 strict 就写一条 WARN 日志。
+
 ### 7.1 天花板（先看这个再判断快慢）
 
 服务端带宽 **上行 3 Mbps / 下行 5 Mbps**。方向是反的：
@@ -349,6 +444,26 @@ dbus 键（URI 已脱敏）。
 
 真机基线记录在 [`tests/PERF_ROUTER_REPORT.md`](../../tests/PERF_ROUTER_REPORT.md)。
 
+### 7.4 夜间采样与"到底谁慢"
+
+`phantom_perf.sh` 由 `cru` 每 5 分钟跑一次，往 `/tmp/upload/phantom_perf.log` 写一行：
+
+```
+ts,cpu_pct,conns,fd,fd_limit,ct,fc_hw,fc_sw,d_up,d_dn,t_up,t_dn,ipset,gw,dns_ms,rtt_ms,loss_pct,wifi,link
+```
+
+第二天直接看去掉了哪里：
+
+| 现象 | 结论 |
+|---|---|
+| `cpu_pct` 高、`fc_hw` 恒 0、`conns` 大 | 用户态 relay 被打满 → 切内核分流（或已切但没有 ipset） |
+| `fc_hw > 0` 且 `cpu_pct` 低，但对外仍慢 | 瓶颈不在路由器：看 `rtt_ms/loss_pct`（ISP 晚高峰）与 `wifi`（空口争用） |
+| `fd` 接近 `fd_limit` | 并发连接数顶到进程上限 → 现象是"新连接打不开" |
+| `gw=1` 且 `d_up/d_dn` 恒 0 | 正常：内核分流下直连根本不进 TUN（这正是"直连不加密、不过用户态"的证据） |
+| `t_up/t_dn` 涨得很快 | 隧道里流量大（受 3 Mbps 服务端上限约束，别和直连慢混为一谈） |
+| `dns_ms` 高 | 解析慢（上游 DNS/晚高峰），首包延迟跟着变差 |
+| `link` 里出现 `100Mb/s` | 那台设备插在百兆口上，与插件无关 |
+
 ## 8. 真机验收清单
 
 - [ ] 软件中心 → 离线安装成功（`.valid` 校验通过）
@@ -364,6 +479,12 @@ dbus 键（URI 已脱敏）。
 - [ ] 三皮肤主色正确
 - [ ] 路由器重启后自动拉起（`S98phantom.sh`）；`nat-start` 后规则被冲掉能自动补回（`N98phantom.sh`）
 - [ ] 卸载：文件、init.d 软链（S/N）、cru 条目、dbus 键、iptables 残留全部清理
+- [ ] **内核分流生效**：`ip rule show` 有 `fwmark 1 lookup 200`、**没有**通配 `iif br0 lookup 200`；`iptables -t mangle -S PREROUTING` 有 3 条 MARK；`ipset list phantom_proxy` 条目数 > 0 且随访问增长
+- [ ] **直连恢复快路径**：8 路并行直连下载聚合 ≥ 基线 3 倍、phantom 每 Mbps CPU 降 ≥ 50%、`/proc/fcache/nflist` 出现 `HW_Hits > 0`
+- [ ] 页面切「兼容模式」后行为与旧版本一致（可一键回退）
+- [ ] 加密 DNS 拦截打开时 YouTube/Google 仍正常；关掉开关后恢复
+- [ ] fd 上限已抬高（`/proc/<pid>/limits` 的 Max open files ≥ 16384），并发高时无 EMFILE
+- [ ] `phantom_perf.log` 有夜间数据，且能据此判断瓶颈
 
 ## 9. 已知约束
 
@@ -379,6 +500,13 @@ dbus 键（URI 已脱敏）。
   插件退化成读空配置，表现为「提交后永不启动」。因此所有外部命令都走 `cmd_path()`
   按绝对路径查找，关键命令（dbus/curl/wget/cru/setsid）的路径在安装时探测好写进
   `phantom.env`（`PHANTOM_DBUS` / `PHANTOM_CURL` / ...）。冒烟测试有静态检查拦这条。
+- **内核分流需要 `ipset` + `xt_set`**：本机实测都有（`ipset v7.6`、`iptables -m set` 可用）。
+  缺任意一个时 phantom 会**自动回退到兼容模式**并在日志/状态里标注（页面「分流模式」
+  会显示"兼容模式"），不会起不来。
+- **内核分流的已知代价**：判定依据是"目标 IP 是否在白名单里"，所以完全绕过路由器 DNS
+  的客户端（浏览器自定义 DoH、手机 Private DNS、App 写死 IP）可能直连失败。三层缓解：
+  内置 Google/Telegram CIDR、DNS 实时学习、以及默认开启的加密 DNS 拦截；仍然漏掉的
+  站点用页面上的「自定义域名」补，或临时切回兼容模式。
 - **httpd 不服务 docroot 下的 `.txt`**：`GET /phantom_status.txt` 与固件自带的
   `GET /Lang_Hdr.txt` 同为 404（`.asp`/`.js`/`.css`/`.png` 都正常），所以状态与日志
   只能走 httpdb 的 `/_temp/` 通道（物理目录 `/tmp/upload`）。别再尝试往

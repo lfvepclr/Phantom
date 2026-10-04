@@ -99,6 +99,10 @@ is_running() {
     [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null
 }
 
+# 每次巡检顺手裁剪日志：trim_log 原本只在页面点提交时跑，夜间高频连接能把
+# 日志写到几万行（tmpfs + 页面轮询一起遭殃）。
+"$SH" "$CONFIG" _trim >/dev/null 2>&1
+
 # 插件处于「关闭」状态时也要看一眼残留：
 # 进程僵死/崩溃后它装的 ip rule/iptables 不会自己消失，而规则指着 tun
 # 就等于把全屋流量丢进黑洞（表现为断网，且开关是关的所以没人管）。

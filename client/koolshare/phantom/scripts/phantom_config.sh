@@ -392,10 +392,14 @@ build_args() {
     table=$(get_cfg table);           [ -n "$table" ] || table="200"
     lan_if=$(get_cfg lan_if);         [ -n "$lan_if" ] || lan_if="br0"
     dns_hijack=$(get_cfg dns_hijack); [ -n "$dns_hijack" ] || dns_hijack="1"
+    case "$(get_cfg gateway_mode)" in
+        relay|tun-relay) gw_mode="relay" ;;
+        *)               gw_mode="kernel-split" ;;
+    esac
 
     set -- client -c "$CONF_FILE" --server "$1" \
         --tun --tun-name "$tun_name" --tun-addr "$tun_addr" \
-        --gateway --table "$table"
+        --gateway --table "$table" --gateway-mode "$gw_mode"
     for iface in $lan_if; do
         set -- "$@" --lan-interface "$iface"
     done
@@ -469,6 +473,56 @@ cleanup_rules() {
             while iptables -t nat -D PREROUTING -i "$iface" -p "$proto" --dport 53 \
                 -j DNAT --to-destination "${sentinel}:53" 2>/dev/null; do :; done
         done
+        # kernel-split 的内核侧对象：mangle 标记规则、fwmark 路由规则、ipset。
+        # 进程正常退出时由它自己回滚；被 SIGKILL / OOM 时不会，全部在这里兜底。
+        for proto in udp tcp; do
+            while iptables -t mangle -D PREROUTING -i "$iface" -p "$proto" --dport 53 \
+                -j MARK --set-mark "${PHANTOM_FWMARK:-1}" 2>/dev/null; do :; done
+        done
+        while iptables -t mangle -D PREROUTING -i "$iface" -m set \
+            --match-set "${PHANTOM_IPSET:-phantom_proxy}" dst \
+            -j MARK --set-mark "${PHANTOM_FWMARK:-1}" 2>/dev/null; do :; done
+    done
+    while ip rule del fwmark "${PHANTOM_FWMARK:-1}" lookup "$table" 2>/dev/null; do :; done
+    ipset destroy "${PHANTOM_IPSET:-phantom_proxy}" 2>/dev/null
+    return 0
+}
+
+# ---------------------------------------------------------------- DoH 拦截
+
+# 默认开启。域名分流的前提是"客户端真的来问路由器要 IP"；浏览器开了安全 DNS
+# （DoH）、手机开了 Private DNS（DoT）之后，解析绕开路由器，被墙域名的 IP 就
+# 永远进不了 ipset，那些站点会表现为"直连失败"。这里把已知的加密 DNS 端点拦掉，
+# 逼客户端回落到系统 DNS（也就是路由器）。代价：这些解析器的网页版(如 1.1.1.1)
+# 也打不开 —— 页面上的开关可以随时关掉恢复。
+DOH_RESOLVER_IPS="1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 9.9.9.9 149.112.112.112 \
+208.67.222.222 208.67.220.220 94.140.14.14 94.140.15.15 185.228.168.9 185.228.169.9 \
+76.76.2.0 76.76.10.0"
+
+apply_doh_block() {
+    lan_if=$(get_cfg lan_if); [ -n "$lan_if" ] || lan_if="br0"
+    for iface in $lan_if; do
+        # DoT（853）先拦：手机 Private DNS 走这条，命中即回落。
+        iptables -I FORWARD -i "$iface" -p tcp --dport 853 -j REJECT 2>/dev/null
+        iptables -I FORWARD -i "$iface" -p udp --dport 853 -j REJECT 2>/dev/null
+        for ip in $DOH_RESOLVER_IPS; do
+            # tcp-reset 让浏览器立刻失败并回落，而不是等超时。
+            iptables -I FORWARD -i "$iface" -d "$ip" -p tcp --dport 443 \
+                -j REJECT --reject-with tcp-reset 2>/dev/null
+        done
+    done
+    return 0
+}
+
+remove_doh_block() {
+    lan_if=$(get_cfg lan_if); [ -n "$lan_if" ] || lan_if="br0"
+    for iface in $lan_if; do
+        while iptables -D FORWARD -i "$iface" -p tcp --dport 853 -j REJECT 2>/dev/null; do :; done
+        while iptables -D FORWARD -i "$iface" -p udp --dport 853 -j REJECT 2>/dev/null; do :; done
+        for ip in $DOH_RESOLVER_IPS; do
+            while iptables -D FORWARD -i "$iface" -d "$ip" -p tcp --dport 443 \
+                -j REJECT --reject-with tcp-reset 2>/dev/null; do :; done
+        done
     done
     return 0
 }
@@ -484,6 +538,7 @@ stop_status_loop() {
 
 stop() {
     stop_status_loop
+    remove_doh_block
     if ! is_running; then
         rm -f "$PIDFILE"
         log_line "服务未运行"
@@ -592,7 +647,11 @@ start() {
     fi
 
     log_level=$(get_cfg log_level)
-    [ -n "$log_level" ] || log_level="info"
+    [ -n "$log_level" ] || log_level="warn"
+
+    # 每个活跃连接在用户态都要占一个上游 socket；固件默认软上限只有 1024，
+    # 晚上人多时会被 EMFILE 打满（表现：新连接莫名其妙打不开，白天又正常）。
+    ulimit -n 16384 2>/dev/null
 
     ARGS=$(build_args "$uri")
     RUST_LOG="$log_level" \
@@ -608,6 +667,10 @@ start() {
         set_cfg last_act "已启动 $(date '+%m-%d %H:%M:%S')"
         start_status_loop
         register_cron
+        if [ "$(get_cfg block_doh)" != "0" ]; then
+            apply_doh_block
+            log_line "已拦截 LAN 侧加密 DNS（DoT/DoH），保证域名分流可学习（可在页面关闭）"
+        fi
         return 0
     fi
 
@@ -709,6 +772,12 @@ apply() {
     PHANTOM_QUIET=1
     enable=$(get_cfg enable)
     if [ "$enable" = "1" ]; then
+        # 加密 DNS 拦截随开关即时生效（隧道已在跑时 start 会早退，不会重放）
+        if [ "$(get_cfg block_doh)" != "0" ]; then
+            apply_doh_block
+        else
+            remove_doh_block
+        fi
         set_cfg last_act "正在启动… $(date '+%m-%d %H:%M:%S')"
         log_line "配置已保存，后台启动隧道…"
         detach_run start
@@ -782,7 +851,7 @@ do_diag() {
 # 判据：$1 本身是已知 action 就当直接调用；否则只要 $2 是已知 action 就按
 # 软件中心调用解析；再不然，只要 $1 是纯数字（请求 id 的形态）也按软件中心
 # 调用处理——认不出 action 时同样先回包再报错，页面不会卡住。
-KNOWN_ACTIONS="1 2 3 start_nat start stop restart status ks cron diag _speedtest _health"
+KNOWN_ACTIONS="1 2 3 start_nat start stop restart status ks cron diag _speedtest _health _trim"
 
 is_known_action() {
     for _a in $KNOWN_ACTIONS; do
@@ -823,6 +892,14 @@ case "$ACTION" in
     # 内部入口：给看门狗用，判断进程是「真活着」还是「僵死」（只能输出一个词）
     _health)
         if is_healthy; then echo healthy; else echo unhealthy; fi
+        exit 0
+        ;;
+    # 内部入口：给看门狗用，只做日志裁剪。
+    # 状态采样/看门狗都会写日志，而 trim_log 原本只在用户点提交时跑 —— 实测
+    # 夜里能涨到 28k 行（约 3 MB），tmpfs 与页面轮询都被它拖累。
+    _trim)
+        PHANTOM_QUIET=1
+        trim_log
         exit 0
         ;;
     start)    start ;;

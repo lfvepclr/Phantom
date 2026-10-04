@@ -82,6 +82,25 @@
 |---|---|---|---|---|
 | 2026-09-13 | 控制面修复：软件中心 POST 契约（`$1=id`/回包 `/_resp`）、状态日志走 `/tmp/upload` + `/_temp/`、新增 `N98phantom.sh` nat-start 兜底 | 点提交「卡住 → 后台执行失败」，状态/日志页读不到 | 提交毫秒级返回、状态与日志正常、LAN 走隧道 | 控制面修复，不涉及数据面 |
 | 2026-09-13 | 测速改用带 SOCKS 的 `curl-fancyss` + 修正吞吐百分比单位（kbps vs KB/s） | 测速 000 全失败；复测打印「达到 786%」 | 359–380 KB/s，达上限 96–103% | 固件自带 curl 是 `--disable-proxy` 编译 |
+| 2026-10-04 | **内核分流**（ipset+fwmark，`--gateway-mode kernel-split`）+ rp_filter 直写 `/proc/sys` + 日志默认 warn + fd 上限 16384 | LAN 直连 4 路并行 **14.2 MB/s（114 Mbps）**，phantom CPU **27–31%** | LAN 直连 4 路并行 **48–50 MB/s（≈390 Mbps）**，同等负载下 phantom CPU **0.0–0.1%** | 直连从用户态 relay 移回内核路径：**聚合 3.4×，插件 CPU ≈ 1/300**；同机本机内核路径基线 420 Mbps，已基本持平 |
+
+### 4.1 内核分流 A/B 明细（2026-10-04，RT-AX86U Pro）
+
+| 项目 | 兼容模式（relay） | 内核分流（kernel-split） |
+|---|---|---|
+| LAN 直连 4 路并行聚合 | 14.2 MB/s ≈ 114 Mbps | **48–50 MB/s ≈ 390 Mbps** |
+| 同负载下 phantom CPU（`top`） | 27–31%（约 1.2 核） | **0.0–0.1%** |
+| 转发路径 | 全部进 TUN → 用户态 TCP 终结 | 直连不进 TUN，只标记白名单 |
+| `phantom_direct_bytes_*` | > 0（全部直连流量都被中转） | **恒 0**（直连根本不进 TUN） |
+| 隧道内站点 | 正常 | 正常（youtube 200 / google 204；日志 `-> Proxy (whitelist)`） |
+| ipset 条目 | 无 | 138（内置种子）→ 156（浏览后，DNS 学习生效） |
+| 未知非 SYN 流 | 静默丢弃 | 回 RST（动态标记下应用立刻重连） |
+
+> **本次最大的坑**：本固件**没有 `sysctl` 二进制**，内核分流一上线就"DNS 全超时、
+> 网页打不开"，但进程/路由/ipset 全都正常。根因是 `rp_filter`：TUN 注入的回包源地址
+> 是公网 IP，严格的 rp_filter=1 会把它当伪造包丢掉。改成直写
+> `/proc/sys/net/ipv4/conf/{phantom0,all}/rp_filter`（`all=2` 松散模式，内核按
+> `max(all, iface)` 判定）后立刻恢复。启动后会回读校验并 WARN。
 
 ## 5. 方法说明
 

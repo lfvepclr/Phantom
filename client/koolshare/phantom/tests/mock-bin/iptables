@@ -46,7 +46,11 @@ case "$OP" in
     -D|--delete)
         [ -n "$SPEC" ] || exit 1
         grep -q -- "^$KEY $SPEC\$" "$F" 2>/dev/null || exit 1
-        grep -v -- "^$KEY $SPEC\$" "$F" >"$F.tmp" 2>/dev/null && mv "$F.tmp" "$F"
+        # 注意别写 `grep -v ... && mv`：把最后一行删掉时 grep 输出为空、返回 1，
+        # mv 就不会执行，规则还在、下一次 -D 又「成功」→ 调用方的
+        # `while iptables -D ...; do :; done` 变成死循环（踩过一次）。
+        grep -v -- "^$KEY $SPEC\$" "$F" >"$F.tmp" 2>/dev/null
+        mv "$F.tmp" "$F" 2>/dev/null
         ;;
 esac
 exit 0

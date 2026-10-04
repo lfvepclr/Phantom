@@ -59,7 +59,7 @@
 <script>
 // 前端修订号：页面右上角会显示，用来确认浏览器加载的是哪一版
 // （改了 UI 就 +1，排查「改了没生效」时先看这个数字）
-var PHANTOM_UI_REV = '4';
+var PHANTOM_UI_REV = '5';
 var dbus = {};
 var _responseLen;
 var noChange = 0;
@@ -70,10 +70,10 @@ var _logTimer = null;
 // 不能放进这个数组——否则 conf2obj() 会访问 null 并中断整个初始化。
 var params_inp = ['phantom_uri', 'phantom_mode', 'phantom_protocol', 'phantom_lan_if',
                   'phantom_tun_name', 'phantom_tun_addr', 'phantom_table', 'phantom_whitelist',
-                  'phantom_log_level',
+                  'phantom_log_level', 'phantom_gateway_mode',
                   'phantom_server_up_mbps', 'phantom_server_down_mbps'];
 var params_chk = ['phantom_enable', 'phantom_dns_hijack', 'phantom_builtin_wl',
-                  'phantom_cron_enable', 'phantom_watchdog'];
+                  'phantom_cron_enable', 'phantom_watchdog', 'phantom_block_doh'];
 
 // 运行期文件的候选路径。
 //
@@ -275,6 +275,9 @@ function get_run_status() {
 				set_metric("m_direct", String(st.direct));
 				set_metric("m_proxy", String(st.proxy));
 				set_metric("m_cpu", st.cpu + " %");
+				set_metric("m_gw", gw_label(st.gw));
+				set_metric("m_ipset", String(st.ipset || 0));
+				set_metric("m_fd", (st.fd || 0) + " / " + (st.fdl || 0));
 			} else {
 				render_stopped();
 			}
@@ -296,6 +299,17 @@ function render_stopped() {
 	set_metric("m_direct", "0");
 	set_metric("m_proxy", "0");
 	set_metric("m_cpu", "0 %");
+	set_metric("m_gw", "-");
+	set_metric("m_ipset", "0");
+	set_metric("m_fd", "-");
+}
+
+// 生效的分流模式。内核分流 = 只有白名单目标进 TUN，直连走内核快路径；
+// 兼容模式 = 全部进 TUN 由用户态判定（老固件没有 ipset 时会自动回退到这里）。
+function gw_label(mode) {
+	if (mode === "kernel-split") { return "内核分流"; }
+	if (mode === "relay") { return "兼容模式"; }
+	return "-";
 }
 
 function get_last_act() {
@@ -678,8 +692,23 @@ function reload_Soft_Center() {
 																	<div class="phantom-metric-value" id="m_cpu">0 %</div>
 																</td>
 															</tr>
+															<tr>
+																<td class="phantom-metric">
+																	<div class="phantom-metric-label">分流模式</div>
+																	<div class="phantom-metric-value" id="m_gw">-</div>
+																</td>
+																<td class="phantom-metric">
+																	<div class="phantom-metric-label">白名单条目</div>
+																	<div class="phantom-metric-value" id="m_ipset">0</div>
+																</td>
+																<td class="phantom-metric">
+																	<div class="phantom-metric-label">fd 使用</div>
+																	<div class="phantom-metric-value" id="m_fd">-</div>
+																</td>
+																<td class="phantom-metric"></td>
+															</tr>
 														</table>
-														<div class="phantom-hint">每 2 秒自动刷新。累计值为本次启动以来的计数，重启隧道会归零。</div>
+														<div class="phantom-hint">每 2 秒自动刷新。累计值为本次启动以来的计数，重启隧道会归零。「内核分流」= 只有白名单目标进隧道，直连走内核快路径；「兼容模式」= 全部进隧道由用户态判定（老固件没有 ipset 时自动回退）。</div>
 													</td>
 												</tr>
 											</table>
@@ -719,6 +748,16 @@ function reload_Soft_Center() {
 													</td>
 												</tr>
 												<tr>
+													<th>分流模式</th>
+													<td>
+														<select id="phantom_gateway_mode" class="input_option">
+															<option value="kernel-split">内核分流（推荐：只有白名单进隧道，直连走硬件快路径）</option>
+															<option value="relay">兼容模式（全部进隧道，用户态判定，较慢）</option>
+														</select>
+														<div class="phantom-hint">内核分流靠 ipset + fwmark 在内核里就把直连流量摘出去，硬件 NAT 加速才用得上；少数「自己解析域名（DoH）或写死 IP」的被墙应用需要兼容模式才能兜住。</div>
+													</td>
+												</tr>
+												<tr>
 													<th>LAN 接口</th>
 													<td><input type="text" id="phantom_lan_if" value="br0" class="input_ss_table" style="width:160px;">
 														<span class="phantom-hint">空格分隔，访客网络加 br1</span></td>
@@ -742,12 +781,17 @@ function reload_Soft_Center() {
 														<span class="phantom-hint">把 LAN 的 53 端口导入隧道，域名类分流规则依赖它；关闭后本地主机名仍可解析，但域名规则失效</span></td>
 												</tr>
 												<tr>
+													<th>拦截加密 DNS</th>
+													<td><input type="checkbox" id="phantom_block_doh" class="input" style="vertical-align:middle;">
+														<span class="phantom-hint">拦掉 LAN 侧的 DoT(853) 与已知 DoH 解析器：客户端一旦绕过路由器做加密解析，被墙域名的 IP 就进不了白名单，那些站点会直连失败。代价是 <i>1.1.1.1</i> 这类解析器的网页版也打不开。</span></td>
+												</tr>
+												<tr>
 													<th>日志级别</th>
 													<td>
 														<select id="phantom_log_level" class="input_option">
-															<option value="info">info（默认）</option>
+															<option value="warn">warn（默认：只记关键事件）</option>
+															<option value="info">info（每条连接/路由一行，排障用）</option>
 															<option value="debug">debug（排障，CPU 占用更高）</option>
-															<option value="warn">warn</option>
 															<option value="error">error</option>
 														</select>
 													</td>

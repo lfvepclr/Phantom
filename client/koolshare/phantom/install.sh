@@ -397,8 +397,15 @@ set_defaults() {
     # 服务端带宽（Mbps），仅用于把测速结果翻译成「是否接近天花板」
     [ -n "$("$DBUS" get ${module}_server_up_mbps)" ]   || "$DBUS" set ${module}_server_up_mbps="3"
     [ -n "$("$DBUS" get ${module}_server_down_mbps)" ] || "$DBUS" set ${module}_server_down_mbps="5"
-    [ -n "$("$DBUS" get ${module}_log_level)" ]   || "$DBUS" set ${module}_log_level="info"
+    # 默认 warn：info 会为每条连接/每条路由打印一行，夜间高频连接时是实打实的
+    # CPU + tmpfs 写入开销。排障时页面里一键切回 info。
+    [ -n "$("$DBUS" get ${module}_log_level)" ]   || "$DBUS" set ${module}_log_level="warn"
     [ -n "$("$DBUS" get ${module}_table)" ]       || "$DBUS" set ${module}_table="200"
+    # 内核分流：只有白名单目标进 TUN，其余走内核快路径（硬件加速）。
+    # 老固件缺 ipset 时 phantom 自己会回退到 relay 并在状态里标注。
+    [ -n "$("$DBUS" get ${module}_gateway_mode)" ] || "$DBUS" set ${module}_gateway_mode="kernel-split"
+    # 拦掉 LAN 侧加密 DNS（DoT/DoH）：域名分流依赖客户端真的来问路由器。
+    [ -n "$("$DBUS" get ${module}_block_doh)" ]    || "$DBUS" set ${module}_block_doh="1"
     "$DBUS" set ${module}_last_act="安装完成 $(date '+%m-%d %H:%M:%S')"
 }
 
@@ -527,7 +534,12 @@ whitelist=''
 cron_enable='0'
 cron_time='4:30'
 watchdog='1'
-log_level='info'
+# info 会为每条连接/路由打一行日志，夜间高频连接时是实打实的 CPU + tmpfs 开销
+log_level='warn'
+# 内核分流：只有白名单目标进 TUN，直连走内核快路径（缺 ipset 时 phantom 自动回退 relay）
+gateway_mode='kernel-split'
+# 拦掉 LAN 侧加密 DNS（DoT/DoH），保证域名分流的学习链不断
+block_doh='1'
 server_up_mbps='3'
 server_down_mbps='5'
 CONF

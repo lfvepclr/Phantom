@@ -165,6 +165,20 @@ else
     crontab -l 2>/dev/null | grep phantom || echo "(无 phantom 定时任务)"
 fi
 
+section "分流模式与内核对象"
+echo "ipset    : $(ipset list -n 2>/dev/null | tr '\n' ' ')"
+echo "ipset 条目: $(ipset list phantom_proxy 2>/dev/null | grep -c '^[0-9]')"
+echo "mangle   : $(iptables -t mangle -S PREROUTING 2>/dev/null | grep -c MARK) 条 MARK 规则"
+echo "fwmark   : $(ip rule show 2>/dev/null | grep -c 'fwmark') 条"
+if [ -f /proc/fcache/nflist ]; then
+    awk '/HW_TotHits/ {next} /^ *[0-9]+ / {t++; if ($0 !~ /4294967295/) hw++} END {printf "flowcache: 硬件加速 %d / 共 %d 条流\n", hw+0, t+0}' /proc/fcache/nflist 2>/dev/null
+fi
+echo "fd 使用  : $(ls /proc/"$(cat "$PIDFILE" 2>/dev/null)"/fd 2>/dev/null | wc -l | tr -d ' ')"
+echo "fd 上限  : $(awk '/Max open files/ {print $4}' /proc/"$(cat "$PIDFILE" 2>/dev/null)"/limits 2>/dev/null)"
+
+section "性能采样（最近 20 行，夜间问题看这里）"
+tail -n 20 /tmp/upload/phantom_perf.log 2>/dev/null || echo "(还没有采样数据)"
+
 section "磁盘"
 df -h /koolshare /jffs /tmp 2>/dev/null
 

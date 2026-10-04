@@ -1,7 +1,7 @@
 use phantom_core::{ClientConfig, FailoverConfig, PhantomError, Result, ServerEntry};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::watch;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -60,6 +60,14 @@ pub struct FailoverManager {
     /// Epoch bumped on every active-server switch when graceful migration is
     /// disabled; relays subscribe and abort their tunnel on the next bump.
     migration_tx: watch::Sender<u64>,
+    /// Invoked once when the active server is declared down and the pool has
+    /// no alternative to switch to.
+    ///
+    /// Failover can only migrate between servers; a single-server deployment
+    /// used to sit on a dead path until the kernel noticed. The owner of the
+    /// session pools installs this hook to drop them and invalidate in-flight
+    /// flows, which turns "silently stuck" into "the app reconnects now".
+    datapath_reset: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl FailoverManager {
@@ -72,7 +80,29 @@ impl FailoverManager {
             tuning: RwLock::new(config.failover.clone()),
             graceful_migration: AtomicBool::new(config.failover.graceful_migration),
             migration_tx: watch::channel(0u64).0,
+            datapath_reset: Mutex::new(None),
         })
+    }
+
+    /// Install the "the active server is down and there is nowhere to fail
+    /// over to" callback. Called at most once per outage (on the transition
+    /// into `Down`).
+    pub fn set_datapath_reset_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .datapath_reset
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(hook);
+    }
+
+    fn fire_datapath_reset(&self) {
+        let hook = self
+            .datapath_reset
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
     }
 
     fn read_pool(&self) -> std::sync::RwLockReadGuard<'_, Pool> {
@@ -309,6 +339,10 @@ impl FailoverManager {
             return;
         }
 
+        // Only the transition into `Down` is an event: while the server stays
+        // down every further failed probe would otherwise fire the datapath
+        // reset again on each tick.
+        let was_down = pool.states[idx].status == ServerStatus::Down;
         pool.states[idx].status = ServerStatus::Down;
         if pool.current == idx && pool.servers.len() > 1 {
             let next = (idx + 1) % pool.servers.len();
@@ -319,6 +353,17 @@ impl FailoverManager {
             );
             pool.current = next;
             self.bump_migration_epoch();
+        } else if pool.current == idx && !was_down {
+            // Single-server (or all-servers-down) case: there is nothing to
+            // migrate to, so the only useful action is to tell the datapath
+            // that the path it is holding is dead.
+            drop(pool);
+            tracing::warn!(
+                "Failover: '{}' is down and there is no alternative; \
+                 resetting the datapath",
+                server.name
+            );
+            self.fire_datapath_reset();
         }
     }
 }
@@ -459,6 +504,54 @@ mod tests {
         let mgr = FailoverManager::new(&config(vec![entry("a", 1)])).unwrap();
         mgr.report_failure("a");
         assert_eq!(mgr.select_server().unwrap().name, "a");
+    }
+
+    /// A single-server deployment has nothing to migrate to, so the only useful
+    /// reaction to a confirmed outage is to tell the datapath to start over —
+    /// and to do it exactly once per outage, not on every failing probe.
+    #[test]
+    fn single_server_outage_fires_the_datapath_reset_once() {
+        let mgr = FailoverManager::new(&config(vec![entry("a", 1)])).unwrap();
+        let fired = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter = Arc::clone(&fired);
+        mgr.set_datapath_reset_hook(Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        let a = entry("a", 1);
+
+        mgr.record_probe(0, &a, false, 2);
+        assert_eq!(fired.load(Ordering::SeqCst), 0, "one failure is not an outage");
+        mgr.record_probe(0, &a, false, 2);
+        assert_eq!(fired.load(Ordering::SeqCst), 1, "threshold reached");
+        mgr.record_probe(0, &a, false, 2);
+        mgr.record_probe(0, &a, false, 2);
+        assert_eq!(
+            fired.load(Ordering::SeqCst),
+            1,
+            "an already-down server must not reset the datapath on every probe"
+        );
+
+        // It recovers, then fails again: that is a new outage and a new reset.
+        mgr.record_probe(0, &a, true, 2);
+        mgr.record_probe(0, &a, false, 2);
+        mgr.record_probe(0, &a, false, 2);
+        assert_eq!(fired.load(Ordering::SeqCst), 2);
+    }
+
+    /// With a real alternative, failover migrates instead of resetting: the
+    /// flows are meant to survive on the backup.
+    #[test]
+    fn multi_server_outage_migrates_without_a_datapath_reset() {
+        let mgr = FailoverManager::new(&config(vec![entry("a", 1), entry("b", 2)])).unwrap();
+        let fired = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let counter = Arc::clone(&fired);
+        mgr.set_datapath_reset_hook(Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }));
+        let a = entry("a", 1);
+        mgr.record_probe(0, &a, false, 1);
+        assert_eq!(mgr.select_server().unwrap().name, "b");
+        assert_eq!(fired.load(Ordering::SeqCst), 0);
     }
 
     fn hard_config(servers: Vec<ServerEntry>) -> ClientConfig {

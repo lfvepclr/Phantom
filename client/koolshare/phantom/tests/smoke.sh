@@ -158,10 +158,11 @@ export MOCK_DBUS_FILE="${ROOT:-/tmp}/mock-dbus.txt"
 export MOCK_CRON_FILE="${ROOT:-/tmp}/mock-cron.txt"
 export MOCK_IP_FILE="${ROOT:-/tmp}/mock-ip.txt"
 export MOCK_IPTABLES_FILE="${ROOT:-/tmp}/mock-iptables.txt"
+export MOCK_IPSET_FILE="${ROOT:-/tmp}/mock-ipset.txt"
 # 脚本回包（/_resp/<id>）会被 mock curl 记到这里，用来断言软件中心契约
 export PHANTOM_ACK_CAPTURE="${ROOT:-/tmp}/mock-ack.txt"
 rm -f "$MOCK_DBUS_FILE" "$MOCK_CRON_FILE" "$MOCK_IP_FILE" "$MOCK_IPTABLES_FILE" \
-      "$PHANTOM_ACK_CAPTURE" "${ROOT:-/tmp}/mock-metrics-n"
+      "$MOCK_IPSET_FILE" "$PHANTOM_ACK_CAPTURE" "${ROOT:-/tmp}/mock-metrics-n"
 
 # 组装待安装的离线包（含 mock 二进制）
 PKG="$(dirname "$INST_DIR")/pkg_phantom"
@@ -225,6 +226,22 @@ for key in enable mode lan_if tun_addr dns_hijack builtin_wl cron_enable cron_ti
 done
 [ "$(getcfg mode)" = "smart" ] && ok "默认模式为 smart" || bad "默认模式不是 smart"
 [ "$(getcfg lan_if)" = "br0" ] && ok "默认 LAN 接口为 br0" || bad "默认 LAN 接口不是 br0"
+
+step "内核分流相关默认值"
+[ "$(getcfg gateway_mode)" = "kernel-split" ] \
+    && ok "默认分流模式为 kernel-split（只有白名单进 TUN）" \
+    || bad "默认分流模式不是 kernel-split（当前：$(getcfg gateway_mode)）"
+[ "$(getcfg block_doh)" = "1" ] && ok "默认拦截加密 DNS（DoH/DoT）" || bad "DoH 拦截默认值不对"
+[ "$(getcfg log_level)" = "warn" ] \
+    && ok "默认日志级别为 warn（info 会为每条连接打一行）" \
+    || bad "默认日志级别不是 warn（当前：$(getcfg log_level)）"
+CFG_EARLY="$SCRIPTS_DIR_T/phantom_config.sh"
+grep -q "ulimit -n" "$CFG_EARLY" 2>/dev/null \
+    && ok "启动前抬高 fd 上限（并发连接多时不会被 EMFILE 打满）" \
+    || bad "缺少 ulimit -n：夜间高并发可能 EMFILE"
+grep -q -- "--gateway-mode" "$CFG_EARLY" 2>/dev/null \
+    && ok "build_args 传递 --gateway-mode" \
+    || bad "build_args 未传递 --gateway-mode"
 
 step "页面自检"
 ASP="$INST_DIR/webs/Module_phantom.asp"
@@ -493,6 +510,8 @@ grep -q -- "--lan-interface br0" "$LOG" && ok "启动参数含 --lan-interface b
 grep -q "1.2.3.4:443" "$LOG" && ok "服务端地址正确传递" || bad "服务端地址未传递"
 grep -q "PHANTOM_PROXY_DOMAINS=$RUNTIME_T" "$LOG" && ok "PHANTOM_PROXY_DOMAINS 已注入" || bad "PHANTOM_PROXY_DOMAINS 未注入"
 grep -q "NO_COLOR=1" "$LOG" && ok "NO_COLOR=1 已注入（日志无 ANSI）" || bad "NO_COLOR 未注入"
+grep -q -- "--gateway-mode kernel-split" "$LOG" && ok "启动参数含 --gateway-mode kernel-split" \
+    || bad "启动参数缺少 --gateway-mode kernel-split"
 # mock 二进制会把收到的参数原样打印（真实二进制不会），所以只检查
 # phantom 自己写的那行日志是否脱敏
 if grep "启动 Phantom（" "$LOG" | grep -q "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA@"; then
@@ -661,6 +680,30 @@ step "看门狗"
 "$SH" "$SCRIPTS_DIR_T/phantom_watchdog.sh" >/dev/null 2>&1
 ps -o pid= -p "$(cat "$RUN_PID" 2>/dev/null)" >/dev/null 2>&1 && ok "看门狗执行后进程仍在" || bad "进程丢失"
 
+step "性能采样器（夜间问题取证）"
+PERF_S="$SCRIPTS_DIR_T/phantom_perf.sh"
+if [ -f "$PERF_S" ]; then
+    "$SH" "$PERF_S" >/dev/null 2>&1
+    PERF_LOG="$RUN_TMP/upload/phantom_perf.log"
+    [ -f "$PERF_LOG" ] && ok "采样文件已生成：$PERF_LOG" || bad "采样文件缺失"
+    head -n 1 "$PERF_LOG" 2>/dev/null | grep -q "cpu_pct,conns,fd" \
+        && ok "采样表头含 CPU/连接数/fd 字段" || bad "采样表头不对"
+    [ "$(wc -l <"$PERF_LOG" 2>/dev/null | tr -d ' ')" -ge 2 ] 2>/dev/null \
+        && ok "已写入至少一行采样" || bad "没有采样数据行"
+else
+    bad "phantom_perf.sh 未安装"
+fi
+
+step "状态文件新字段（CPU/分流模式/ipset/fd）"
+if [ -f "$RUN_STATUS" ]; then
+    for f in '"cpu"' '"gw"' '"ipset"' '"fd"' '"fdl"'; do
+        grep -q "$f" "$RUN_STATUS" && ok "状态含 $f 字段" || bad "状态缺 $f 字段"
+    done
+    grep -q '"gw":"kernel-split"' "$RUN_STATUS" \
+        && ok "状态报告内核分流生效" \
+        || echo "  (提示：mock 环境下 metrics 的 kernel_split 由隧道决定，不判定)"
+fi
+
 step "status 与 stop"
 "$SH" "$CONF_SH" status >"${ROOT:-/tmp}/status.txt" 2>&1
 grep -q "running" "${ROOT:-/tmp}/status.txt" && ok "status 报告运行中" || bad "status 未报告运行中"
@@ -683,6 +726,11 @@ fi
 [ -f "$CONF_SH" ] && bad "卸载后 config.sh 仍存在" || ok "config.sh 已删除"
 [ -f "$INST_DIR/bin/phantom" ] && bad "卸载后二进制仍存在" || ok "二进制已删除"
 [ -f "$INST_DIR/webs/Module_phantom.asp" ] && bad "卸载后 ASP 仍存在" || ok "ASP 已删除"
+if [ -f "$MOCK_IPSET_FILE" ] && grep -q "ipset destroy phantom_proxy" "$MOCK_IPSET_FILE" 2>/dev/null; then
+    ok "卸载清理了内核 ipset（phantom_proxy）"
+else
+    bad "卸载没有销毁 ipset：内核对象会残留到下次启动"
+fi
 if [ "$KS_MODE" = "ks" ]; then
     [ -L "$KS_DIR/init.d/S98phantom.sh" ] && bad "卸载后 init.d 软链仍存在" || ok "init.d 软链已删除"
     [ -n "$(getcfg enable)" ] && bad "卸载后 dbus 键仍存在" || ok "dbus 键已清理"
