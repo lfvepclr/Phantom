@@ -996,3 +996,85 @@ QUIC（同一端口 UDP/443）监听并更新连接串，顺带消除 TCP-over-T
 窗口缩放协商：当前 SYN-ACK 不带 wscale、手机窗口被限在 64 KB。按 40 ms RTT 计算
 64 KB/0.04 s ≈ 1.6 MB/s，远高于本节点的 375 KB/s 上限，所以只有在复测出现
 「inflight 长期顶在 64 KB 且 App 每 2 段不足一次 ACK」时才值得做。
+
+---
+
+## 13.8 弱网（地铁 / 蜂窝）与传输换挡（2026-10-04）
+
+### 症状
+
+地铁里用蜂窝开 VPN，外网"特别慢、加载不出来"。用户的第一直觉是"重传太多"——方向对，
+但五个缺陷里只有两个真的在重传路径上。
+
+### 根因（按影响排序）
+
+| 编号 | 缺陷 | 为什么在地铁里致命 |
+|---|---|---|
+| W5 | VPN 只接管 IPv4（`isIPv6Accepted` 未开） | 家庭 Wi-Fi 没有 IPv6，蜂窝有；App 拿到 AAAA 后直连物理链路，被墙地址黑洞化 → "Wi-Fi 行、手机网络不行" |
+| W5b | 隧道出口没有 IPv6，App 反复重试不可达的 AAAA、不回落 IPv4 | 只把 IPv6"关进隧道"是不够的：地址依旧不可用，页面永远打不开 |
+| W3 | 鸿蒙侧任何 `netCapabilitiesChange` 都重置数据面 | 车厢里信号/带宽估计不停变化，等于每隔几秒把所有流 RST 一次 |
+| W4 | 多条 App 流复用同一条到 VPS 的 TCP | 一次丢包阻塞该连接上的全部流（队头阻塞 + 共享拥塞窗口） |
+| W1 | 外层 socket 静默死亡最长 ~90 s 才发现 | 过隧道失联后，App 抱着死 socket 转圈一分半 |
+| W2 | 内层流 6 s 无进展就被静默丢弃（不发 RST、不释放 relay） | 短暂抖动被当成死流，且 App 不知道要重连，任务与 socket 还泄漏 |
+
+### 修复
+
+| 编号 | 改动 |
+|---|---|
+| W5 | `VpnConfig` 增加 `fd00:8:8::2/64` + `::/0` + `isIPv6Accepted`；`DnsCache` 键改为 `IpAddr`；`build_dns_response_packet` 支持 IPv6 |
+| W5b | 隧道内域名（Proxy 路由）的 AAAA 查询直接回 `NOERROR/NODATA`（`client.dns_ipv6_via_tunnel`，默认 false），逼 App 用 A 记录；直连域名的 AAAA 照常转发。服务器真有 IPv6 出口时可打开该开关 |
+| W3 | 只认「默认 netId 变化 / 当前默认网络 netLost」，同一网络的能力变化不再重置；重建带 3 s 冷却，日志写触发原因 |
+| W4 | 设置面板加 TCP/QUIC 开关（默认 TCP），VPS 并跑 QUIC 实例，用数据决定是否换默认 |
+| W1 | Linux/Android/OHOS 设 `TCP_USER_TIMEOUT=15s` + 尽力启用 BBR；macOS 无该选项，收紧 keepalive 到 30 s/5 s×3；单服务器被判死时清空会话池并提升网络 epoch |
+| W2 | 放弃条件改为「30 s 无 ACK 进展且 ≥3 轮重传」，放弃时发 RST + 通知 relay 停止 + 计 `flow_stall_drops` |
+
+### 怎么复测（先测后修，用同一套脚本）
+
+```bash
+# Mac 台架：手机连到 Mac（pf rdr + NAT），dummynet 塑形
+sudo scripts/weaknet-mac.sh setup w2 --vps <VPS_IP>   # w1/w2/w3
+scripts/harmony-bench.sh --label "w2 youtube" --seconds 60 --out tests/PERF_WEAKNET_REPORT.md
+sudo scripts/weaknet-mac.sh teardown                  # 必做
+```
+
+| 档位 | 单向时延 | 丢包 | 限速 | 额外 |
+|---|---|---|---|---|
+| `W1` | 40 ms | 1% | 10 Mbit/s | — |
+| `W2` | 100 ms | 3% | 2 Mbit/s | — |
+| `W3` | 75 ms | 5% | 4 Mbit/s | 每 40 s 断流 8 s |
+
+`scripts/harmony-bench.sh` 现在同时采**外层内核重传**（`/proc/net/tcp{,6}` 的 `retrnsmt`
+按本 App uid 求和）：以前只能看到用户态 TUN 栈的重传，链路层的重传是盲区，而"重传太多"
+这个判断恰恰要靠它。桌面侧用 `phantom client --tun --tun-trace <path>` 跑同一套分析器。
+
+### 验收阈值
+
+- 鸿蒙 TUN 平均下行 ≥ 同档 SOCKS5 传输参照的 60%，且 ≥ 同档 Mac 桌面 TUN 参照的 80%；
+- 内层重传 ≤ 5 次/分钟、重复注入 ≤ 1.2× 有效字节；外层重传首轮只报告（W1/W2 ≤3%、W3 ≤8%，基线后校准）；
+- `W3` 断流结束后 5 s 内恢复到断流前的 ≥50%，全程 `flow_stall_drops = 0`、`vpn-tun` TX dropped 增量 0；
+- QUIC 与 TCP 同档对比（平均下行、首字节时间）写进 `tests/PERF_WEAKNET_REPORT.md`。
+
+### 新增可观测面
+
+| 位置 | 新增 |
+|---|---|
+| stats JSON / Prometheus | `net_epoch_bumps`、`flow_stall_drops`、`tunnel_connects`、`tunnel_connect_failures` |
+| TUN trace | `epoch <n>: network change…`、`tunnel connect <addr> ok\|fail <proto> <ms>`、`tunnel closed <target> reason=…`、流结束原因 `stall` |
+| 应用日志 | `Connecting to server <name> (<addr>, tcp\|quic)`、`net change: default A -> B (原因)` |
+
+### 证据与坑
+
+- 真机实测（蜂窝）：修复前 `2404:6800:4005:827::200e`（ipv6.google.com）两条 `SYN_SENT`
+  挂在运营商地址上 25 s+，应用日志里 `ipv6` 出现 0 次；修复后同样的连接源地址变成
+  `fd00:8:8::2` —— 但**只做到这一步时 google.com 仍打不开**：日志显示 App 反复重试同一个
+  IPv6 地址（一秒一轮）而不用刚拿到的 IPv4。加上 W5b 之后复测：google.com 与
+  m.youtube.com 都完整加载，`googlevideo.com` 走隧道，会话 `tunnel_connect_failures = 0`，
+  `2404:6800` / `Tunnel failed` 出现 0 次。
+- **教训**："隧道建立成功"不等于"页面能打开"。验收必须看页面/字节数，不能拿日志里的
+  `Tunnel established` 当结论。
+- 服务端实测已跑 BBR + fq，且**没有 IPv6 出口**：隧道内 IPv6 目标只能快速失败回落，
+  真 IPv6 出海属于独立事项。
+- 内层是**无损本机路径**（App ↔ 用户态 TCP 栈），给它加拥塞控制没有意义；能改善的是
+  "别乱重传、别丢流、别静默重置"。外层 TCP 尽力 BBR，QUIC 用 quinn 的 BBR（已是默认）。
+- 不要用"地铁现场"作为唯一验收环境：不可重复、不可回归。台架复现的是路径劣化
+  （时延/丢包/限速/断流），射频层行为（RRC 迁移、上行调度）仍需真机观察。

@@ -129,10 +129,60 @@ export function linkTitle(link: ServerLink): string {
 
 /// One-line description of where traffic goes, e.g. `203.0.113.10:443 · TCP · AES-256`.
 export function linkSummary(link: ServerLink): string {
+  return linkSummaryWithTransport(link, link.proto);
+}
+
+/// [`linkSummary`] with the transport the client will actually dial.
+///
+/// The settings switch can override what the imported link asked for, and the
+/// card has to describe the connection that is about to be made rather than
+/// the one that was pasted in.
+export function linkSummaryWithTransport(link: ServerLink, proto: string): string {
   if (!link.valid) {
     return '尚未填写连接串';
   }
-  return link.host + ':' + link.port + ' · ' + link.proto.toUpperCase() + ' · ' + cipherLabel(link.cipher);
+  return link.host + ':' + link.port + ' · ' + proto.toUpperCase() + ' · ' + cipherLabel(link.cipher);
+}
+
+/// Rewrite a quick link to dial `proto`, leaving everything else untouched.
+///
+/// Used by the transport switch: the stored link keeps whatever the server
+/// published (so a QR code pasted back into the sheet is unchanged), while the
+/// string handed to the VPN extension carries the user's choice.
+export function withTransport(uri: string, proto: string): string {
+  const trimmed = uri.trim();
+  if (!trimmed.startsWith('phantom://') || (proto !== 'tcp' && proto !== 'quic')) {
+    return trimmed;
+  }
+
+  // Split off the fragment first: it is not part of the query string.
+  let head = trimmed;
+  let fragment = '';
+  const hash = head.indexOf('#');
+  if (hash >= 0) {
+    fragment = head.substring(hash);
+    head = head.substring(0, hash);
+  }
+
+  const question = head.indexOf('?');
+  const base = question >= 0 ? head.substring(0, question) : head;
+  const query = question >= 0 ? head.substring(question + 1) : '';
+  const kept: string[] = [];
+  if (query.length > 0) {
+    for (const pair of query.split('&')) {
+      if (pair.length === 0) {
+        continue;
+      }
+      const eq = pair.indexOf('=');
+      const key = eq < 0 ? pair : pair.substring(0, eq);
+      if (key === 'proto') {
+        continue;
+      }
+      kept.push(pair);
+    }
+  }
+  kept.push('proto=' + proto);
+  return base + '?' + kept.join('&') + fragment;
 }
 
 export function cipherLabel(cipher: string): string {

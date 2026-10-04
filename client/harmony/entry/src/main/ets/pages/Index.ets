@@ -30,17 +30,19 @@ import {
   ServerLink,
   cipherLabel,
   emptyLink,
-  linkSummary,
+  linkSummaryWithTransport,
   parseHistory,
   parseServerUri,
   relativeTime,
   serializeHistory,
   shortFingerprint,
   upsertHistory,
+  withTransport,
 } from '../common/ServerLink';
 import { LatencyResult, SpeedResult, probeLatency, runSpeedTest } from '../common/TunnelProbe';
 import { ServerPage } from './ServerPage';
 import { Theme, ThemeMode, applyThemeMode } from '../common/Theme';
+import { readSigningExpiry } from '../common/SigningInfo';
 
 /// One entry of the routing-mode segment control.
 interface ModeOption {
@@ -54,6 +56,16 @@ const MODES: ModeOption[] = [
   { key: 'smart', label: '智能', hint: '仅白名单域名走服务器' },
   { key: 'direct', label: '直连', hint: '全部直连（相当于关闭分流）' },
 ];
+
+/// Transport choices for the settings switch.
+///
+/// TCP stays the default: it is what the quick link asks for, and the QUIC
+/// path is a per-server option (the server has to be listening on UDP).
+const TRANSPORTS: string[] = ['tcp', 'quic'];
+
+function transportLabel(proto: string): string {
+  return proto === 'quic' ? 'QUIC' : 'TCP';
+}
 
 /// `versionName` of this app, or "" when the bundle query is unavailable.
 ///
@@ -515,6 +527,12 @@ struct Index {
   @State inputExpanded: boolean = false;
   @State history: ServerHistoryEntry[] = [];
   @State tunTrace: boolean = false;
+  /// Transport the next session will dial (`tcp` | `quic`).
+  ///
+  /// Kept next to the mode rather than inside the link: the stored quick link
+  /// stays exactly as the server published it, and the choice is applied when
+  /// the start request is written.
+  @State transport: string = 'tcp';
   /// Transient "the radio changed, reconnecting" banner.
   @State showNetBanner: boolean = false;
   /// Non-zero while an automatic restart is scheduled; shown to the user.
@@ -556,6 +574,9 @@ struct Index {
   @State ruleRangeFrom: string = '';
   @State ruleRangeTo: string = '';
   @State ruleRangeError: string = '';
+  @State signingNotAfter: string = '';
+  @State signingDaysLeft: number = 0;
+  @State signingWarn: boolean = false;
 
   aboutToAppear(): void {
     const ctx = getContext(this) as common.UIAbilityContext;
@@ -567,6 +588,7 @@ struct Index {
       const savedMode = prefs.getSync('proxyMode', 'smart') as string;
       const savedShowDirect = prefs.getSync('showDirectLogs', false) as boolean;
       const savedTrace = prefs.getSync('tunTrace', false) as boolean;
+      const savedTransport = prefs.getSync('transport', 'tcp') as string;
       const savedHistory = prefs.getSync('serverHistory', '') as string;
       const savedTheme = prefs.getSync('themeMode', ThemeMode.SYSTEM) as string;
       const savedRules = prefs.getSync('userRules', '') as string;
@@ -578,6 +600,7 @@ struct Index {
       }
       this.showDirectLogs = savedShowDirect;
       this.tunTrace = savedTrace;
+      this.transport = savedTransport === 'quic' ? 'quic' : 'tcp';
       this.themeMode = ThemeMode.OPTIONS.includes(savedTheme) ? savedTheme : ThemeMode.SYSTEM;
       this.userRules = savedRules;
       // Apply before the first frame is laid out, otherwise a user on dark mode
@@ -600,6 +623,20 @@ struct Index {
     // extension may still be publishing while we were backgrounded.
     this.refresh();
     this.startPolling();
+    this.refreshSigningExpiry();
+  }
+
+  /// Warn before the HarmonyOS signing certificate expires: once it does, the
+  /// system blocks the app with `10106105` and the user only sees AppGallery's
+  /// "App unavailable / Uninstall" dialog.
+  private async refreshSigningExpiry(): Promise<void> {
+    const info = await readSigningExpiry();
+    if (info === null) {
+      return;
+    }
+    this.signingNotAfter = info.notAfterText;
+    this.signingDaysLeft = info.daysLeft;
+    this.signingWarn = info.daysLeft <= 30;
   }
 
   /// Runs when this page becomes visible again — returning from the scanner or
@@ -676,6 +713,7 @@ struct Index {
       prefs.putSync('proxyMode', this.proxyMode);
       prefs.putSync('showDirectLogs', this.showDirectLogs);
       prefs.putSync('tunTrace', this.tunTrace);
+      prefs.putSync('transport', this.transport);
       prefs.putSync('themeMode', this.themeMode);
       prefs.putSync('serverHistory', serializeHistory(this.history));
       prefs.putSync('userRules', this.userRules);
@@ -703,7 +741,12 @@ struct Index {
   /// take effect on the next start, because routing state is built once per
   /// connection — hence the note shown under the editor.
   private setUserRules(rows: string[]): void {
-    this.userRules = rows.join('\n');
+    this.setUserRulesText(rows.join('\n'));
+  }
+
+  /// Set the whitelist from already-joined wire text (single rule / range add).
+  private setUserRulesText(text: string): void {
+    this.userRules = text;
     this.savePreferences();
     if (this.filesDir.length > 0) {
       publishUserRules(this.filesDir, this.userRules);
@@ -727,7 +770,7 @@ struct Index {
       this.ruleError = '';
       return;
     }
-    this.setUserRules(this.userRules.length > 0 ? this.userRules + '\n' + parsed.wire : parsed.wire);
+    this.setUserRulesText(this.userRules.length > 0 ? this.userRules + '\n' + parsed.wire : parsed.wire);
     this.ruleDraft = '';
     this.ruleError = '';
   }
@@ -740,7 +783,7 @@ struct Index {
     }
     this.ruleRangeError = '';
     const existing = this.userRules.length > 0 ? this.userRules + '\n' : '';
-    this.setUserRules(existing + cidrs.join('\n'));
+    this.setUserRulesText(existing + cidrs.join('\n'));
     this.ruleRangeFrom = '';
     this.ruleRangeTo = '';
   }
@@ -1096,7 +1139,14 @@ struct Index {
     }
     this.desiredRunning = true;
     this.reconnectExhausted = false;
-    publishStart(this.filesDir, this.serverUri.trim(), this.proxyMode, this.tunTrace);
+    // The transport switch overrides whatever the pasted link asked for; the
+    // stored URI itself is left alone so sharing/QR keeps the server's word.
+    publishStart(
+      this.filesDir,
+      withTransport(this.serverUri, this.transport),
+      this.proxyMode,
+      this.tunTrace,
+    );
     if (!reconnect) {
       // Optimistic "connecting" until the extension process reports back.
       publishStatus(this.filesDir, VpnStatus.Starting, '');
@@ -1295,6 +1345,20 @@ struct Index {
     });
   }
 
+  /// Choose the transport for the next session.
+  ///
+  /// Not applied to a live tunnel on purpose: switching transports mid-session
+  /// would have to tear down every flow anyway, and the same "restart to
+  /// apply" contract as the trace switch is easier to reason about.
+  private setTransport(proto: string): void {
+    if (this.transport === proto) {
+      return;
+    }
+    this.transport = proto;
+    this.savePreferences();
+    promptAction.showToast({ message: '传输协议改为 ' + transportLabel(proto) + '，重启隧道后生效' });
+  }
+
   /// Three-way appearance choice: system (the default), light, or dark.
   ///
   /// Applied through the ability's colour mode rather than a second palette, so
@@ -1448,7 +1512,7 @@ struct Index {
       .width('100%')
 
       if (this.link.valid) {
-        Text(linkSummary(this.link))
+        Text(linkSummaryWithTransport(this.link, this.transport))
           .fontSize(12)
           .fontColor(Theme.textSecondary)
           .width('100%')
@@ -1659,7 +1723,8 @@ struct Index {
       statusColor: this.statusColor(),
       host: this.link.host,
       port: this.link.port,
-      proto: this.link.proto,
+      // The effective transport, not the one the pasted link asked for.
+      proto: this.transport,
       cipher: this.link.cipher,
       serverKey: this.link.key,
       psk: this.link.psk,
@@ -1715,6 +1780,33 @@ struct Index {
               .borderRadius(Theme.radiusChip)
               .onClick(() => { this.setThemeMode(option); })
           }, (option: string) => option)
+        }
+        .width('100%')
+
+        Divider().color(Theme.divider)
+
+        Text('传输协议')
+          .fontSize(14)
+          .fontColor(Theme.textPrimary)
+          .width('100%')
+        Text('弱网（地铁、弱信号）下 QUIC 不会因为一次丢包阻塞同一条连接上的其它 flow；' +
+          '需要服务端同时监听 UDP，改完重启隧道生效。')
+          .fontSize(11)
+          .fontColor(Theme.textTertiary)
+          .width('100%')
+        Row({ space: 8 }) {
+          ForEach(TRANSPORTS, (proto: string) => {
+            Text(transportLabel(proto))
+              .layoutWeight(1)
+              .height(34)
+              .textAlign(TextAlign.Center)
+              .fontSize(13)
+              .fontWeight(this.transport === proto ? FontWeight.Medium : FontWeight.Normal)
+              .fontColor(this.transport === proto ? Theme.onBrand : Theme.textSecondary)
+              .backgroundColor(this.transport === proto ? Theme.brand : Theme.surfaceAlt)
+              .borderRadius(Theme.radiusChip)
+              .onClick(() => { this.setTransport(proto); })
+          }, (proto: string) => proto)
         }
         .width('100%')
 
@@ -1923,6 +2015,11 @@ struct Index {
         }
         this.settingsRow('隧道核心', 'Noise IK · AES-GCM / ChaCha20 / Ascon')
         this.settingsRow('分流', '内置白名单（FST）+ 用户规则')
+        if (this.signingNotAfter.length > 0) {
+          this.settingsRow('签名到期', this.signingDaysLeft >= 0
+            ? this.signingNotAfter + '（剩余 ' + this.signingDaysLeft.toString() + ' 天）'
+            : this.signingNotAfter + '（已到期）')
+        }
       }
       .width('100%')
       .padding(Theme.pagePadding)
@@ -2006,6 +2103,42 @@ struct Index {
     }
     .width('100%')
     .padding({ left: Theme.pagePadding, right: Theme.pagePadding, top: 6, bottom: 6 })
+  }
+
+  /// Non-blocking banner shown during the last 30 days of the signing validity.
+  /// Re-signing and reinstalling makes it disappear automatically.
+  @Builder
+  signingBanner() {
+    Row({ space: 10 }) {
+      Text('!')
+        .fontSize(14)
+        .fontWeight(FontWeight.Bold)
+        .fontColor(Theme.onBrand)
+        .width(20)
+        .height(20)
+        .textAlign(TextAlign.Center)
+        .backgroundColor(Theme.warning)
+        .borderRadius(10)
+      Column({ space: 2 }) {
+        Text(this.signingDaysLeft >= 0
+          ? '应用签名将在 ' + this.signingDaysLeft.toString() + ' 天后到期'
+          : '应用签名已到期')
+          .fontSize(13)
+          .fontWeight(FontWeight.Medium)
+          .fontColor(Theme.textPrimary)
+        Text('到期后鸿蒙会提示「应用不可用」、无法启动，请在 ' + this.signingNotAfter +
+          ' 前重新签名安装。')
+          .fontSize(11)
+          .fontColor(Theme.textSecondary)
+      }
+      .alignItems(HorizontalAlign.Start)
+      .layoutWeight(1)
+    }
+    .width('100%')
+    .padding(12)
+    .backgroundColor(Theme.warningSoft)
+    .borderRadius(Theme.radiusChip)
+    .margin({ left: Theme.pagePadding, right: Theme.pagePadding, top: 8 })
   }
 
   @Builder
@@ -2130,6 +2263,10 @@ struct Index {
     Stack() {
       Column() {
         this.topBar()
+
+        if (this.signingWarn) {
+          this.signingBanner()
+        }
 
         if (this.showServer) {
           ServerPage()

@@ -77,4 +77,20 @@ else
 fi
 
 echo "[build-harmony] Copied libphantom_harmony.so to ${OUTPUT_DIR}"
+
+# 签名材料预检：只警告，不阻断纯 .so 构建。DevEco 自动签名只有约 14 天，
+# 过期后真机安装/启动会被 AppGallery 判为「应用不可用」（10106105）。
+SIGN_CHECK="${PROJECT_ROOT}/scripts/check-harmony-signing.sh"
+if [[ -x "$SIGN_CHECK" ]]; then
+  if ! "$SIGN_CHECK"; then
+    cat >&2 <<'MSG'
+[build-harmony] WARNING: HarmonyOS 签名材料已过期或缺失。
+[build-harmony]   用过期材料打出的 HAP 在 HarmonyOS 6.x/7.x 真机上会报
+[build-harmony]   aa start 10106105「应用不可用」，AppGallery 只提示卸载。
+[build-harmony]   修复：DevEco -> File -> Project Structure -> Signing Configs ->
+[build-harmony]   Automatically generate signature 重新签发，然后重新打包安装。
+MSG
+  fi
+fi
+
 echo "[build-harmony] Next: open ${HARMONY_DIR} in DevEco Studio and run."

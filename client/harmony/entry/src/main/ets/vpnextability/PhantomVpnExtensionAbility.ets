@@ -28,6 +28,16 @@ import {
 // Status/logs flow back to the UI through sandbox files, because the two run
 // in separate processes and the Rust-side global state cannot be read from the
 // UI process.
+
+/**
+ * Quiet period after a datapath rebuild.
+ *
+ * A radio switch fires several events within a few hundred milliseconds, and a
+ * rebuild that is already under way must not be restarted by them. Three
+ * seconds also covers the "netLost → netAvailable" pair of a handover.
+ */
+const NET_REBUILD_COOLDOWN_MS: number = 3000;
+
 export default class PhantomVpnExtensionAbility extends VpnExtensionAbility {
   private vpnConn: vpnExtension.VpnConnection | null = null;
   private bridgeTimer: number = -1;
@@ -37,6 +47,15 @@ export default class PhantomVpnExtensionAbility extends VpnExtensionAbility {
   private destroyed: boolean = false;
   /// De-bounce: one radio switch fires several events within a few hundred ms.
   private netChangeTimer: number = -1;
+  /// `netId` of the default network the tunnel's sockets are using.
+  ///
+  /// Only a change of *this* invalidates the datapath. Reacting to every
+  /// capability event (bandwidth estimate, signal level, …) used to reset every
+  /// flow on the platform's schedule rather than on the network's: in a subway
+  /// that is a page that restarts forever.
+  private currentDefaultNetId: number = -1;
+  /// `Date.now()` of the last rebuild, for [`NET_REBUILD_COOLDOWN_MS`].
+  private lastRebuildAt: number = 0;
 
   onCreate(): void {
     console.info('[Phantom] VpnExtensionAbility onCreate');
@@ -65,13 +84,28 @@ export default class PhantomVpnExtensionAbility extends VpnExtensionAbility {
       console.warn('[Phantom] protectProcessNet call failed: ' + JSON.stringify(e));
     }
 
-    const routes: vpnExtension.RouteInfo[] = [{
-      interface: 'tun0',
-      destination: { address: { address: '0.0.0.0', family: 1 }, prefixLength: 0 },
-      gateway: { address: '10.8.0.1', family: 1 },
-      hasGateway: true,
-      isDefaultRoute: true,
-    }];
+    const routes: vpnExtension.RouteInfo[] = [
+      {
+        interface: 'tun0',
+        destination: { address: { address: '0.0.0.0', family: 1 }, prefixLength: 0 },
+        gateway: { address: '10.8.0.1', family: 1 },
+        hasGateway: true,
+        isDefaultRoute: true,
+      },
+      // IPv6 has to be owned by the tunnel as well. Leaving it out does not
+      // make the app use IPv4 — on a cellular network (which is dual-stack,
+      // unlike most home Wi-Fi) the app simply takes the AAAA record it was
+      // given and connects over the physical link, straight past the tunnel.
+      // The destination is then whatever the carrier does with it, which for a
+      // censored address means a SYN that is never answered.
+      {
+        interface: 'tun0',
+        destination: { address: { address: '::', family: 2 }, prefixLength: 0 },
+        gateway: { address: 'fd00:8:8::1', family: 2 },
+        hasGateway: true,
+        isDefaultRoute: true,
+      },
+    ];
     // Belt and braces: exclude the tunnel server itself from VPN routing.
     // Only dotted-quad literals are accepted here — a hostname would make the
     // whole config invalid.
@@ -103,7 +137,10 @@ export default class PhantomVpnExtensionAbility extends VpnExtensionAbility {
     }
 
     const config: vpnExtension.VpnConfig = {
-      addresses: [{ address: { address: '10.8.0.2', family: 1 }, prefixLength: 24 }],
+      addresses: [
+        { address: { address: '10.8.0.2', family: 1 }, prefixLength: 24 },
+        { address: { address: 'fd00:8:8::2', family: 2 }, prefixLength: 64 },
+      ],
       routes: routes,
       // Every query apps make lands in the TUN, where the client decides
       // tunnel-vs-direct per domain; advertising one resolver keeps that path
@@ -111,6 +148,7 @@ export default class PhantomVpnExtensionAbility extends VpnExtensionAbility {
       dnsAddresses: [TUNNEL_DNS_SERVER],
       mtu: 1500,
       isIPv4Accepted: true,
+      isIPv6Accepted: true,
     };
 
     this.vpnConn.create(config).then((tunFd: number) => {
@@ -213,8 +251,14 @@ export default class PhantomVpnExtensionAbility extends VpnExtensionAbility {
   /// flows were opened from an address that no longer exists, and the DNS and
   /// QUIC connections along with them. Without this the tunnel looked connected
   /// but nothing moved until the app was restarted by hand.
+  ///
+  /// The trigger is deliberately narrow: only the *default* network changing
+  /// (or being lost) rebuilds anything. Capability updates on the network we
+  /// are already using — a new bandwidth estimate, a signal-level change, a
+  /// cell handover — are reported by the platform constantly and say nothing
+  /// about whether the sockets still work.
   private watchNetworks(): void {
-    const onChange = () => {
+    const onChange = (reason: string, netId: number, force: boolean) => {
       if (this.destroyed) {
         return;
       }
@@ -225,9 +269,13 @@ export default class PhantomVpnExtensionAbility extends VpnExtensionAbility {
       }
       this.netChangeTimer = setTimeout(() => {
         this.netChangeTimer = -1;
-        this.onNetworkChanged();
+        this.onNetworkChanged(reason, netId, force);
       }, 1000);
     };
+
+    // Seed with the network we are bound to, so the first capability event of
+    // the session is not mistaken for a switch.
+    this.currentDefaultNetId = PhantomVpnExtensionAbility.readDefaultNetId();
 
     try {
       // `on` lives on a NetConnection handle, not the module: an unqualified
@@ -235,23 +283,52 @@ export default class PhantomVpnExtensionAbility extends VpnExtensionAbility {
       const watcher: connection.NetConnection = connection.createNetConnection();
       watcher.on('netAvailable', (handle: connection.NetHandle) => {
         console.info(`[Phantom] netAvailable: ${handle.netId}`);
-        onChange();
+        onChange('netAvailable', handle.netId, false);
       });
       watcher.on('netLost', (handle: connection.NetHandle) => {
         console.info(`[Phantom] netLost: ${handle.netId}`);
-        onChange();
+        // Losing the network the tunnel is using is a switch even if the
+        // default handle has not been updated yet.
+        const isCurrent = handle.netId === this.currentDefaultNetId;
+        onChange('netLost', handle.netId, isCurrent);
       });
       watcher.on('netCapabilitiesChange', (info: connection.NetCapabilityInfo) => {
         console.info(`[Phantom] netCapabilitiesChange: ${info.netHandle.netId}`);
-        onChange();
+        onChange('netCapabilitiesChange', info.netHandle.netId, false);
       });
     } catch (e) {
       console.warn('[Phantom] network watch unavailable: ' + JSON.stringify(e));
     }
   }
 
-  private onNetworkChanged(): void {
-    console.info('[Phantom] network changed: rebuilding datapath');
+  /// `netId` of the current default network, or -1 when the platform will not
+  /// say (old builds).
+  private static readDefaultNetId(): number {
+    try {
+      return connection.getDefaultNetSync().netId;
+    } catch (e) {
+      return -1;
+    }
+  }
+
+  private onNetworkChanged(reason: string, netId: number, force: boolean): void {
+    const current = PhantomVpnExtensionAbility.readDefaultNetId();
+    if (!force && current >= 0 && current === this.currentDefaultNetId) {
+      console.info(
+        `[Phantom] network event (${reason}, net ${netId}) ignored: default is still ${current}`,
+      );
+      return;
+    }
+    const now = Date.now();
+    if (now - this.lastRebuildAt < NET_REBUILD_COOLDOWN_MS) {
+      console.info(`[Phantom] network event (${reason}) folded into the rebuild in progress`);
+      return;
+    }
+    const previous = this.currentDefaultNetId;
+    this.currentDefaultNetId = current;
+    this.lastRebuildAt = now;
+
+    console.info(`[Phantom] network changed (${reason}): rebuilding datapath`);
     publishNetworkChange(this.filesDir);
     // Re-protect after the switch: the exemption is per process and a new
     // default network can otherwise capture the tunnel's own sockets.
@@ -267,7 +344,8 @@ export default class PhantomVpnExtensionAbility extends VpnExtensionAbility {
     try {
       const epoch: number = phantomLib.phantomHarmonyOnNetworkChange();
       appendLog(this.filesDir, [
-        `network changed: tunnel flows reset (epoch ${epoch})`,
+        `net change: default ${previous} -> ${current}` +
+          ` (${reason}); tunnel flows reset (epoch ${epoch})`,
       ]);
     } catch (e) {
       console.error('[Phantom] network change notify failed: ' + JSON.stringify(e));

@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # 鸿蒙 HAP 调试签名：重建材料 + 手动签名。
 #
+# ⚠️ 仅适用于 OpenHarmony / 模拟器：本脚本用 OpenHarmony 自带测试 CA 自签，
+#    HarmonyOS 6.x/7.x 真机校验华为 CA 且受 AppGallery 管控，不接受这套材料。
+#    真机请用 DevEco 自动签名或 AGC 发布证书，见
+#    client/harmony/docs/SIGNING_AND_STARTUP_TROUBLESHOOTING.md。
+#
 # 背景：hvigor 的 signingConfigs 要求 storePassword/keyPassword 为加密格式
 #（长度 >= 32），命令行无法直接喂明文密码；因此流程拆成两步——hvigor 产出
 # unsigned HAP，再由 SDK 自带 hap-sign-tool.jar 手动签名。

@@ -97,6 +97,38 @@ readStatus()/readLog()             ◀──    （1 Hz 把 Rust 状态写成文
 | `phantom_vpn_status.txt` | 扩展 | `status\nupdatedAt\nerror` |
 | `phantom_vpn.log` | 扩展 | Rust 日志（磁盘保留最后 400 行） |
 
+### TUN 配置：IPv4 与 IPv6 都由隧道接管
+
+`VpnConfig` 同时声明两族：`10.8.0.2/24` + `0.0.0.0/0` 与 `fd00:8:8::2/64` + `::/0`
+（`isIPv4Accepted` / `isIPv6Accepted` 均为 true）。
+
+只接管 IPv4 会留下一个很隐蔽的漏洞：**家庭 Wi-Fi 通常没有 IPv6，蜂窝却几乎一定有**。
+在双栈蜂窝下，App 拿到 AAAA 记录后按 RFC 6724 优先走 IPv6，而那条流量根本进不了
+vpn-tun —— 被墙地址（Google/YouTube 的 IPv6）在物理链路上是黑洞，App 就一直转圈。
+现象因此表现为"Wi-Fi 正常、手机网络不行"。修好之后：
+
+- AAAA 也进隧道，`DnsCache` 以 `IpAddr` 为键把 IPv6 地址映射回域名，白名单照常命中；
+- **但把 IPv6 关进隧道还不够**：出口（服务端）没有 IPv6 时，App 会反复重试一个永不可达的
+  AAAA 地址而**不回落 IPv4**，页面永远打不开（实测：一秒一轮，日志刷 `Tunnel failed →
+  [2404:…]:443`）。所以隧道内域名（Proxy 路由）的 AAAA 查询由劫持直接回
+  `NOERROR/NODATA`（`client.dns_ipv6_via_tunnel`，默认 false），App 只能用 A 记录；
+  **直连**域名（国内站点）的 AAAA 照常转发，那条 IPv6 是真能用的。服务器真有 IPv6 出口时
+  把开关打开即可；
+- 真机核对方法：蜂窝下 `cat /proc/net/tcp6` 里指向被墙地址的连接，源地址应当是
+  `fd00:8:8::2`（隧道地址）而不是运营商地址。
+
+### 传输协议：TCP / QUIC 开关
+
+设置面板提供「传输协议」两态开关，持久化在 `phantom_ui.transport`（默认 `tcp`）。
+它只改写**启动请求里**的 URI（`withTransport()`），导入的链接保持服务端发布的原样，
+所以分享/二维码不会带上下一次实验的选择；和其它开关一样**重启隧道后生效**。详情页与卡片
+显示的是**生效值**。
+
+弱网下 QUIC 的价值不在单流重传，而在多流互不阻塞：TCP 路径是 `pooled session`（多条 App
+流复用同一条到服务端的连接），一次丢包会卡住这条连接上的全部流；QUIC 每条流独立恢复。
+注意服务端需要同时监听 UDP（`deploy/alpine/enable-quic.sh` 起一个并跑实例，TCP 443 与
+UDP 443 不冲突）。
+
 ### TUN 数据面
 
 **TCP 终结**：TUN 里的应用把客户端当作对端，所以 `tun.rs` 必须实现一个够用的
@@ -189,7 +221,12 @@ Wi-Fi ⇄ 移动数据切换会让隧道里所有 socket 失效（源地址变�
 但什么都不通」。现在：
 
 - `PhantomVpnExtensionAbility` 通过 `connection.createNetConnection()` 订阅
-  `netAvailable` / `netLost` / `netCapabilitiesChange`，1 s 去抖后重新
+  `netAvailable` / `netLost` / `netCapabilitiesChange`，1 s 去抖。
+- **只有「默认网络 netId 变化」或「当前默认网络 netLost」才重建数据面**：平台在地铁/弱信号
+  下会不停上报同一张网络的能力变化（带宽估计、信号等级、小区切换），把那些也当成切换，
+  等于每隔几秒把所有连接 RST 一次——页面永远重新开始加载。重建后还有 3 s 冷却，
+  日志写明触发原因：`net change: default 100 -> 101 (netLost)`。
+- 重建时重新
   `protectProcessNet()` 并调用 NAPI `phantomHarmonyOnNetworkChange()`。
 - Rust 侧 `android_notify_network_change()` 递增网络 epoch：epoch 过期的 TCP 流会被**立即
   RST**（让 App 尽快重连，而不是等自己的超时）、共享的 DNS-over-tunnel 流被丢弃（下次查询
@@ -426,6 +463,16 @@ cp ../../target/aarch64-unknown-linux-ohos/release/libphantom_harmony.so \
 
 ## 打包与签名
 
+> ⚠️ **签名有效期**：DevEco「自动签名」的调试 Profile 只有约 14 天有效期。
+> AGC 调试证书已实名最长 1 年、未实名只有 14 天；发布证书最长 3 年。
+> 自己用 `hdc` 安装的上限是 **1 年调试证书 + 调试 Profile**；3 年发布证书
+> 只授权 AppGallery 分发，不能本地安装。
+> 过期后应用在 HarmonyOS 6.x/7.x 真机上会被判为「应用不可用」（`aa start`
+> 报 10106105），AppGallery 只会提示卸载。打包前先跑
+> `scripts/check-harmony-signing.sh`；完整排查步骤与「最长签名（AGC 发布证书
+> 3 年 + 发布 Profile）」方案见
+> [docs/SIGNING_AND_STARTUP_TROUBLESHOOTING.md](docs/SIGNING_AND_STARTUP_TROUBLESHOOTING.md)。
+
 > 推荐做法：在 DevEco Studio 里打开 `client/harmony`，连接真机后勾选
 > **File → Project Structure → Signing Configs → Automatically generate signature**
 > （需登录华为开发者账号；IDE 会自动生成 p12/cer/p7b 并把设备 UDID 写进调试
@@ -505,10 +552,10 @@ cargo test -p phantom-client
 hdc install client/harmony/build/outputs/default/harmony-default-signed.app
 
 # 卸载
-hdc uninstall com.phantom.harmony
+hdc uninstall co.phantom.harmony
 
 # 启动应用
-hdc shell am start -a ohos.want.action.home -b com.phantom.harmony -m EntryAbility
+hdc shell aa start -a EntryAbility -b co.phantom.harmony
 
 # 查看日志
 hdc hilog | grep -i phantom
