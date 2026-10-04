@@ -126,8 +126,20 @@ run_loopback() {
     SERVER_PID=$!
     local uri=""
     for _ in $(seq 1 30); do
-        uri="$(sed -n 's|^#[[:space:]]*\(phantom://.*\)$|\1|p' "$dir/server.toml" 2>/dev/null | head -1)"
-        [[ -n "$uri" ]] && break
+        # `|| true` and the file check are what make this survive the first
+        # seconds: `sed` on a not-yet-written server.toml (and `head` closing the
+        # pipe early) returns non-zero, which `set -e`/`pipefail` turn into a
+        # script exit before the retry even happens.
+        if [[ -f "$dir/server.toml" ]]; then
+            uri="$(sed -n 's|^#[[:space:]]*\(phantom://.*\)$|\1|p' "$dir/server.toml" | head -1 || true)"
+        fi
+        # `if` rather than `[[ ]] && break`: the bare `&&` list is the last
+        # command of the loop body, so a first-attempt miss (the server has not
+        # written server.toml yet) makes the whole body exit non-zero and
+        # `set -e` kills the script before it can retry.
+        if [[ -n "$uri" ]]; then
+            break
+        fi
         sleep 1
     done
     [[ -n "$uri" ]] || { echo "ERROR: local server never bootstrapped"; tail -20 "$dir/server.log"; exit 1; }

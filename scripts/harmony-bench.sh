@@ -67,24 +67,60 @@ read_stats() {
     shell "cat $SANDBOX/phantom_vpn_stats.txt" | tr -d '\r' | grep -m1 '{' || true
 }
 
+# Uid that owns the client's sandbox: the tunnel sockets in /proc/net/tcp are
+# attributed to it, and so are the kernel's per-socket retransmit counters.
+APP_UID="$(shell "ls -l $SANDBOX/phantom_vpn_stats.txt" | awk '{print $3}' | tr -d '\r')"
+[[ -n "$APP_UID" ]] || APP_UID=0
+
+# The outer tunnel's retransmissions, summed over the client's own sockets.
+#
+# This is the half of the picture the userspace counters cannot see: our TUN
+# stack may be perfectly disciplined while the kernel's TCP to the server is
+# re-sending every other segment because the radio link is bad.
+read_kernel_retrans() {
+    local total=0 per_file value
+    for path in /proc/net/tcp /proc/net/tcp6; do
+        value="$(shell "cat $path" | tr -d '\r' \
+            | awk -v uid="$APP_UID" 'NR > 1 && $8 == uid { sum += $7 } END { print sum + 0 }')"
+        total=$(( total + ${value:-0} ))
+    done
+    echo "$total"
+}
+
+# Radio byte counters (only while the interface exists and is up).
+read_radio_counters() {
+    local iface rx=0 tx=0
+    for iface in rmnet0 wlan0; do
+        read -r r t <<< "$(shell "ifconfig $iface" | tr -d '\r' | awk '
+            /RX bytes/ { for (i = 1; i <= NF; i++) if ($i == "RX") { r = substr($(i+1), 7); break } }
+            /TX bytes/ { for (i = 1; i <= NF; i++) if ($i == "TX") { t = substr($(i+1), 7); break } }
+            END { printf "%d %d\n", r, t }')"
+        if [[ "$iface" == "rmnet0" ]]; then rx=$((rx + ${r:-0})); tx=$((tx + ${t:-0}));
+        else rx=$((rx + ${r:-0})); tx=$((tx + ${t:-0})); fi
+    done
+    echo "$rx $tx"
+}
+
 echo "▶ Phantom HarmonyOS bench — $LABEL (${SECONDS_TO_RUN}s)"
 echo "  trace is truncated on every tunnel restart; restart it now if you have not."
 
 BEFORE_TUN="$(read_tun_counters)"
 BEFORE_STATS="$(read_stats)"
+BEFORE_RETRANS="$(read_kernel_retrans)"
 echo "$BEFORE_STATS" > "$WORK/stats.jsonl"
 
 echo "  sampling vpn-tun once a second … (drive the phone now)"
 SAMPLES="$WORK/tun.csv"
-echo "second,rx_bytes,tx_bytes,rx_dropped,tx_dropped" > "$SAMPLES"
+echo "second,rx_bytes,tx_bytes,rx_dropped,tx_dropped,kernel_retrans" > "$SAMPLES"
 for ((i = 1; i <= SECONDS_TO_RUN; i++)); do
     read -r rx tx rx_drop tx_drop <<< "$(read_tun_counters)"
-    echo "$i,$rx,$tx,$rx_drop,$tx_drop" >> "$SAMPLES"
+    echo "$i,$rx,$tx,$rx_drop,$tx_drop,$(read_kernel_retrans)" >> "$SAMPLES"
     sleep 1
 done
 
 AFTER_TUN="$(read_tun_counters)"
 AFTER_STATS="$(read_stats)"
+AFTER_RETRANS="$(read_kernel_retrans)"
 echo "$AFTER_STATS" >> "$WORK/stats.jsonl"
 
 # --- pull the trace and analyse -----------------------------------------
@@ -106,6 +142,10 @@ RX_DROP_DELTA=$(( (a_rx_drop - b_rx_drop) ))
 TX_DROP_DELTA=$(( (a_tx_drop - b_tx_drop) ))
 DOWN_RATE=$(( DOWN_BYTES / SECONDS_TO_RUN ))
 UP_RATE=$(( UP_BYTES / SECONDS_TO_RUN ))
+
+RETRANS_DELTA=$(( AFTER_RETRANS - BEFORE_RETRANS ))
+RETRANS_PER_MIN="$(python3 -c "print(round($RETRANS_DELTA * 60 / $SECONDS_TO_RUN, 2))")"
+RETRANS_PER_MB="$(python3 -c "print(round($RETRANS_DELTA / ($DOWN_BYTES / 1e6), 2) if $DOWN_BYTES > 0 else 0)")"
 
 # Median of the per-second deltas is a better estimate than the mean when the
 # first second includes connection setup.
@@ -131,6 +171,8 @@ printf '  vpn-tun down : %s bytes (%.1f KB/s avg, %.1f KB/s median)\n' \
 printf '  vpn-tun up   : %s bytes (%.1f KB/s avg)\n' "$UP_BYTES" "$(echo "$UP_RATE" | awk '{print $1/1024}')"
 printf '  RX/TX dropped: +%s / +%s\n' "$RX_DROP_DELTA" "$TX_DROP_DELTA"
 printf '  trace        : %s retransmits/min, %s MB duplicate vs %s MB unique\n' "$RETX_RATE" "$DUP_MB" "$UNIQUE_MB"
+printf '  outer retrans: +%s kernel retransmits (%s/min, %s per MB down)\n' \
+    "$RETRANS_DELTA" "$RETRANS_PER_MIN" "$RETRANS_PER_MB"
 printf '  verdict      : %s\n' "$VERDICT"
 echo "  artifacts    : $WORK (report.json, tun.csv, phantom_tun_trace.log)"
 

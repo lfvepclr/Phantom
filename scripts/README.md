@@ -7,17 +7,58 @@ the table below and, if it has prerequisites, a section.
 |---|---|
 | `build-android.sh` | Build `phantom-android` + the Android APK (see `client/android/README.md`). |
 | `build-harmony.sh` | Build the HarmonyOS HAP. |
+| `check-harmony-signing.sh` | Preflight HarmonyOS cert/Profile expiry (DevEco auto-sign is only ~14 days; expired material causes `aa start` 10106105 on HarmonyOS 6.x/7.x). |
+| `sign-harmony-personal.sh` | Sign the built unsigned HAP with AGC personal materials (`phantom-debug.*`, 1-year) and optionally install it. `--release` is only for AppGallery distribution tests. |
 | `build-mac.sh` | Build the macOS client. |
 | `sign-harmony-hap.sh` | Sign a HarmonyOS HAP for a real device. |
 | `deploy-server.sh` | Deploy the server container. |
-| `harmony-bench.sh` | Throughput benchmark against the HarmonyOS client. |
+| `harmony-bench.sh` | Throughput benchmark against the HarmonyOS client, including the kernel's own retransmit counters (`/proc/net/tcp{,6}` `retrnsmt`) for the outer tunnel. |
+| `weaknet-mac.sh` | Weak-network harness: make this Mac the phone's relay and degrade that path with pf + dummynet (`setup` / `status` / `teardown`). |
 | `mac-sysproxy.sh` | Turn the macOS system proxy on and off. |
 | `measure-android.sh` | Four-dimension measurement (CPU / memory / network / power) of the Android client over `adb`. |
 | `measure-harmony.sh` | Same four dimensions for the HarmonyOS client over `hdc` (HiDumper, optionally HiPerf / HiTrace). |
 | `measurements/` | JSON output of the two scripts above; one file per run, git-ignored. |
 
+`check-harmony-signing.sh` reads the local signing config from
+`client/harmony/build-profile.json5` (that block is `skip-worktree` and never
+committed). A clean checkout reports `skipped` and exits 0; exit 1 means the
+Profile has expired and the next HAP will be rejected by HarmonyOS 6.x/7.x.
+
 The two measurement scripts are invoked through `bash` (`bash
 scripts/measure-android.sh …`) so they do not depend on the executable bit.
+
+## Weak-network measurements
+
+`scripts/weaknet-mac.sh` exists because "the subway is slow" has to be
+reproducible on demand. The phone is pointed at this Mac (same Wi-Fi, replace
+the `host:port` of the quick link, keep the key and psk); the Mac forwards the
+packets to the real server with `pf rdr` + NAT and shapes them with `dnctl`, so
+the tunnel still terminates on the real server and the loss is seen by the
+phone's own TCP stack — a user-space proxy that terminates TCP would hide it.
+
+```bash
+sudo scripts/weaknet-mac.sh setup w2 --vps <VPS_IP>   # w1 | w2 | w3
+sudo scripts/weaknet-mac.sh status
+sudo scripts/weaknet-mac.sh teardown                  # always do this
+```
+
+Profiles, thresholds and the results land in
+[`tests/PERF_WEAKNET_REPORT.md`](../tests/PERF_WEAKNET_REPORT.md). Notes:
+
+* macOS dummynet has no jitter parameter; the profiles approximate it with a
+  fixed per-direction delay.
+* The phone must be on the same LAN, and the script needs sudo (it restores the
+  previous pf ruleset, forwarding setting and pipes on teardown).
+* If this Mac runs another proxy/VPN, `status` first; the fallbacks (VPS-side
+  `tc netem`, in-repo `lossy_proxy`) are listed in that report.
+
+The desktop half of the same measurement uses the client's own trace:
+
+```bash
+phantom client --server "<URI>" --tun --tun-trace /tmp/mac-tun-trace.log
+python3 scripts/tun-trace-report.py /tmp/mac-tun-trace.log
+# or: PHANTOM_TUN_TRACE=/tmp/mac-tun-trace.log phantom client …
+```
 
 ## Why the measurement scripts exist
 

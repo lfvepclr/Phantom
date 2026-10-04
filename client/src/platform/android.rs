@@ -290,6 +290,8 @@ fn build_config_from_uri(uri: &str, mode: &str) -> Result<ClientConfig, i32> {
             // direct resolver at the `ClientSettings` default (domestic).
             dns: "8.8.8.8:53".to_string(),
             dns_direct: phantom_core::ClientSettings::default().dns_direct,
+            // The exit's IPv6 reachability is unknown; see the field's docs.
+            dns_ipv6_via_tunnel: false,
             mode: proxy_mode,
             cipher: Default::default(),
             metrics_listen: "127.0.0.1:9150".to_string(),
@@ -803,13 +805,15 @@ fn start_with_config(fd: RawFd, config: ClientConfig) -> i32 {
             if let (Some(tunnel_dns), Some(direct_dns)) = (tunnel_dns, direct_dns) {
                 match crate::dns::DnsProxy::new(tunnel_dns, direct_dns).await {
                     Ok(dns) => {
+                        dns.set_suppress_tunnel_aaaa(!config_tun.client.dns_ipv6_via_tunnel);
                         let dns = std::sync::Arc::new(dns);
                         *SHARED_DNS.lock().unwrap_or_else(|e| e.into_inner()) = Some(dns.clone());
                         proxy = proxy.with_dns(dns);
                         tracing::info!(
-                            "DNS hijack enabled, tunnel resolver = {}, direct resolver = {}",
+                            "DNS hijack enabled, tunnel resolver = {}, direct resolver = {}, tunnel AAAA = {}",
                             tunnel_dns,
-                            direct_dns
+                            direct_dns,
+                            if config_tun.client.dns_ipv6_via_tunnel { "forwarded" } else { "suppressed" }
                         );
                     }
                     Err(e) => {

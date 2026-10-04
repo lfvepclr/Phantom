@@ -154,6 +154,11 @@ sudo systemctl restart phantom
 | `--proto <p>` | tcp | tcp / quic |
 | `-i` / `--interactive` | 关闭 | 启用交互式向导（需要 TTY） |
 
+> 想在同一台服务器上同时提供 TCP 与 QUIC（弱网 A/B 用），不需要改协议默认值：
+> Alpine/OpenRC 上用 `deploy/alpine/enable-quic.sh` 再起一个 `phantom-quic` 实例
+> （UDP 与 TCP 同端口互不冲突，共用同一份密钥），详见 `deploy/alpine/README.md`
+> 与 `tests/PERF_WEAKNET_REPORT.md`。
+
 ---
 
 ## 2. 高级 TOML 部署（load 模式）

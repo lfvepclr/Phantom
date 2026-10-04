@@ -159,6 +159,8 @@ pub unsafe extern "C" fn phantom_macos_start_with_uri(input: *const u8, input_le
             // direct resolver at the `ClientSettings` default (domestic).
             dns: "8.8.8.8:53".to_string(),
             dns_direct: phantom_core::ClientSettings::default().dns_direct,
+            // The exit's IPv6 reachability is unknown; see the field's docs.
+            dns_ipv6_via_tunnel: false,
             mode,
             cipher: Default::default(),
             metrics_listen: "127.0.0.1:9150".to_string(),
@@ -454,11 +456,13 @@ fn start_with_config(config: ClientConfig) -> i32 {
             if let (Some(tunnel_dns), Some(direct_dns)) = (tunnel_dns, direct_dns) {
                 match crate::dns::DnsProxy::new(tunnel_dns, direct_dns).await {
                     Ok(dns) => {
+                        dns.set_suppress_tunnel_aaaa(!config.client.dns_ipv6_via_tunnel);
                         proxy = proxy.with_dns(std::sync::Arc::new(dns));
                         tracing::info!(
-                            "DNS hijack enabled, tunnel resolver = {}, direct resolver = {}",
+                            "DNS hijack enabled, tunnel resolver = {}, direct resolver = {}, tunnel AAAA = {}",
                             tunnel_dns,
-                            direct_dns
+                            direct_dns,
+                            if config.client.dns_ipv6_via_tunnel { "forwarded" } else { "suppressed" }
                         );
                     }
                     Err(e) => {

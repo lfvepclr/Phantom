@@ -85,6 +85,20 @@ pub struct ClientSettings {
     /// local node; never polluted by the tunnel's egress country.
     #[serde(default = "default_dns_direct")]
     pub dns_direct: String,
+    /// Forward AAAA answers for domains that are routed **through the tunnel**.
+    ///
+    /// Default `false`, and that default is deliberate. The tunnel exit is one
+    /// server whose IPv6 reachability we cannot assume; when it has none, the
+    /// AAAA we hand out points at an address that will never answer, and the
+    /// app retries that address instead of falling back to IPv4 (observed on
+    /// HarmonyOS: the browser reconnected the same IPv6 address every second
+    /// and never loaded the page). Suppressing the answer makes the app use the
+    /// A record, which the tunnel can actually carry.
+    ///
+    /// Set `true` only when the server really does have IPv6 egress; domains
+    /// routed *directly* keep their AAAA either way.
+    #[serde(default)]
+    pub dns_ipv6_via_tunnel: bool,
     #[serde(default = "default_proxy_mode")]
     pub mode: ProxyMode,
     #[serde(default)]
@@ -135,6 +149,7 @@ impl Default for ClientSettings {
             listen: default_listen(),
             dns: default_dns(),
             dns_direct: default_dns_direct(),
+            dns_ipv6_via_tunnel: false,
             mode: default_proxy_mode(),
             cipher: CipherPreference::Auto,
             metrics_listen: default_metrics_listen(),
@@ -601,6 +616,27 @@ public_key = "dGVzdA=="
         assert_eq!(config.client.listen, "127.0.0.1:1080");
         assert_eq!(config.client.dns, "8.8.8.8:53");
         assert_eq!(config.client.dns_direct, "223.5.5.5:53");
+        assert!(
+            !config.client.dns_ipv6_via_tunnel,
+            "an AAAA for a tunnel-routed name is an address the exit may not be able to use"
+        );
+    }
+
+    /// Only a server that really has IPv6 egress should ask for AAAA to be
+    /// forwarded through the tunnel.
+    #[test]
+    fn tunnel_ipv6_is_opt_in() {
+        let toml = r#"
+[[servers]]
+name = "primary"
+address = "example.com:443"
+public_key = "dGVzdA=="
+
+[client]
+dns_ipv6_via_tunnel = true
+"#;
+        let config: ClientConfig = toml::from_str(toml).unwrap();
+        assert!(config.client.dns_ipv6_via_tunnel);
     }
 
     #[test]

@@ -14,6 +14,59 @@ use crate::transport::traits::{Transport, TransportListener};
 /// requesting more is harmless on constrained hosts.
 pub const DEFAULT_SOCKET_BUFFER: usize = 4 * 1024 * 1024;
 
+/// How long the kernel keeps retrying unacknowledged data on a tunnel socket
+/// before it gives up and reports the connection dead.
+///
+/// Without this, a tunnel whose path disappeared (a subway tunnel, a cell
+/// handover, a radio that lost its PDP context) stays "established" until the
+/// kernel's own retransmission budget runs out — minutes, during which the app
+/// sits on a socket that will never move a byte. The option only fires while
+/// data is unacknowledged, so an idle tunnel pays nothing for it (unlike
+/// tightening keepalive, which probes the radio forever).
+///
+/// 15 s is chosen to be shorter than what apps tolerate before showing their
+/// own network error (20–30 s) and longer than any plausible RTO back-off on a
+/// cellular link, so a fade that recovers is not punished.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const TUNNEL_USER_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Congestion control requested for tunnel sockets, best effort.
+///
+/// BBR is the right default for a proxy: the loss it sees is overwhelmingly
+/// not congestion, and a loss-based controller (cubic) halves its window for
+/// every dropped segment. The kernel falls back silently when the algorithm
+/// is unavailable, which is why the failure is only logged at debug level.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const TUNNEL_CONGESTION: &[u8] = b"bbr";
+
+/// Request [`TUNNEL_CONGESTION`] on a socket, ignoring kernels that do not
+/// have the algorithm compiled in.
+///
+/// Written against `libc` rather than the socket2 helper because socket2 only
+/// exposes `set_tcp_congestion` for a subset of the Linux family; the raw
+/// option is the same on Linux, Android and HarmonyOS.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn request_tunnel_congestion(socket: &Socket) {
+    use std::os::unix::io::AsRawFd;
+    let rc = unsafe {
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::IPPROTO_TCP,
+            libc::TCP_CONGESTION,
+            TUNNEL_CONGESTION.as_ptr() as *const libc::c_void,
+            TUNNEL_CONGESTION.len() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        tracing::debug!(
+            "congestion control `{}` unavailable on tunnel socket ({err}); \
+             keeping the kernel default",
+            String::from_utf8_lossy(TUNNEL_CONGESTION)
+        );
+    }
+}
+
 pub struct TcpTransport {
     connect_timeout: Duration,
     nodelay: bool,
@@ -56,19 +109,30 @@ impl Transport for TcpTransport {
         // Buffer failures are non-fatal: the kernel clamps over-large requests.
         let _ = socket.set_send_buffer_size(self.send_buffer);
         let _ = socket.set_recv_buffer_size(self.recv_buffer);
-        // Keep the tunnel socket honest across network changes. Without
-        // keepalive a socket whose path disappeared (Wi-Fi ⇄ cellular) stays
-        // "established" until the OS TCP retransmission timeout — minutes in
-        // which the client believes it is connected but nothing moves.
+        // Dead-path detection, in two layers.
         //
-        // 60 s idle + 3 probes at 10 s fails such a socket in about 90 s. That
-        // is slower than the 15 s this used to be, on purpose: every probe is a
-        // radio wake-up on a phone, and a tunnel left connected but unused would
-        // otherwise be probed four times a minute per socket. The fast path for
-        // a real link change is the platform's own network callback
-        // (`notifyNetworkChange` / `protectProcessNet`), which resets the
-        // datapath immediately; keepalive is only the backstop for a path that
-        // died silently.
+        // The primary layer is `TCP_USER_TIMEOUT` where the kernel has it: it
+        // bounds how long unacknowledged data may sit in the retransmission
+        // queue, so a path that vanished is reported as an error in seconds
+        // instead of minutes. It costs nothing while the tunnel is idle.
+        //
+        // Keepalive stays as the backstop for a path that dies *between*
+        // writes; on a phone every probe is a radio wake-up, so the idle time
+        // is deliberately long there. macOS has no user timeout, so it pays
+        // for a tighter keepalive instead (it is a desktop: no radio to keep
+        // asleep).
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            if let Err(e) = socket.set_tcp_user_timeout(Some(TUNNEL_USER_TIMEOUT)) {
+                tracing::debug!("TCP_USER_TIMEOUT not set on tunnel socket: {e}");
+            }
+            request_tunnel_congestion(&socket);
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
+        let keepalive = socket2::TcpKeepalive::new()
+            .with_time(Duration::from_secs(30))
+            .with_interval(Duration::from_secs(5));
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         let keepalive = socket2::TcpKeepalive::new()
             .with_time(Duration::from_secs(60))
             .with_interval(Duration::from_secs(10));

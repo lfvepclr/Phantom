@@ -400,6 +400,7 @@ public_key = "服务端公钥Base64"
 listen = "127.0.0.1:1080"             # SOCKS5+HTTP 同端口（首字节嗅探）；0.0.0.0 即局域网共享
 dns = "8.8.8.8:53"                    # 走隧道的解析器（被墙域名 / proxy 模式）
 dns_direct = "223.5.5.5:53"           # 直连解析器（smart 模式下未命中白名单的域名）
+# dns_ipv6_via_tunnel = true          # 仅当服务器真有 IPv6 出口时才打开；默认 false
 mode = "smart"
 cipher = "auto"
 # metrics_listen = "127.0.0.1:9150"   # Prometheus /metrics 端点
@@ -496,6 +497,7 @@ macOS 客户端菜单栏提供 Global / Auto / Direct 三种模式切换，实�
 | `[[rules]]` / `rules.final_action` | 重建规则引擎；新规则集解析失败时保留旧规则并告警 |
 | `client.mode` | smart ↔ proxy ↔ direct 切换 |
 | `client.dns` / `client.dns_direct` | 重定向隧道/直连两个解析器；隧道侧会丢弃旧 UDP 流并在下次查询时重建，飞行中的查询不丢 |
+| `client.dns_ipv6_via_tunnel` | 默认 `false`：隧道内域名不下发 AAAA（出口能不能用 IPv6 是未知数，下发就等于把 App 送去死循环重试），直连域名不受影响；服务器真有 IPv6 出口时可打开 |
 | `[[servers]]` | 替换服务器池；**当前活跃服务器若仍在新列表中则保持不动**，避免无必要的切换 |
 | `[failover]` | 健康检查间隔 / 超时 / 阀值即时生效 |
 

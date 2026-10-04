@@ -253,6 +253,16 @@ graph LR
 | 计数器 | `AtomicU64` 无锁 |
 | 导出 | Prometheus exposition format via 127.0.0.1:9150 |
 | 指标 | tcp_bytes_up/down, udp_bytes_up/down, tcp_connections, udp_datagrams |
+| TUN 健康度 | `tcp_dup`, `dup_acks`, `tun_wq_ms/max`, `tun_txq_peak`, `retx_suppressed`, `retx_budget_rst`, `route_direct_failed` |
+| 弱网 / 断线 | `net_epoch_bumps`（网络切换导致的重置次数）、`flow_stall_drops`（无 ACK 进展被放弃的流）、`tunnel_connects` / `tunnel_connect_failures`（外层建连与失败） |
+
+外层 TCP 的 socket 参数（`core/src/transport/tcp.rs`）：Linux / Android / HarmonyOS
+尽力设 `TCP_CONGESTION=bbr` 与 `TCP_USER_TIMEOUT=15s`（后者只在有未确认数据时生效，
+不增加空闲唤醒）；macOS 没有 user timeout，改用 30 s/5 s×3 的 keepalive。
+单服务器被判死时由 `failover` 的 datapath 钩子清空 TCP/QUIC 会话池并提升网络 epoch。
+
+调试用的 TUN 追踪在 CLI 上通过 `--tun-trace <path>` 或 `PHANTOM_TUN_TRACE` 打开，
+产物可直接交给 `scripts/tun-trace-report.py`。
 
 ## 使用的技术框架
 

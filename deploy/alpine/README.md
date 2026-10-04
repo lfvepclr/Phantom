@@ -12,6 +12,7 @@
 | `phantom.initd` | OpenRC 服务脚本（`start-stop-daemon`/`supervise-daemon` + `cap_net_bind_service`） |
 | `phantom.confd` | 服务默认参数（端口 / 协议 / 公网 host / 加密 / 运行用户） |
 | `phantom.service` | systemd 单元，供非 Alpine 主机复用同一个包 |
+| `enable-quic.sh` | 在同一端口上再起一个 QUIC 实例（UDP），供 TCP/QUIC 弱网 A/B；不随安装器执行 |
 | `SHA256SUMS` | 包内文件校验和 |
 
 ## 一键部署（推荐，从开发机执行）
@@ -36,6 +37,23 @@ ssh root@HOST
   cd /tmp/phantom-pkg
   PHANTOM_PORT=443 PHANTOM_PROTO=tcp PHANTOM_PUBLIC_HOST=1.2.3.4 sh install.sh
 ```
+
+## TCP 与 QUIC 并行（弱网 A/B）
+
+服务端一次只跑一种传输（`[quic] enable`），但 TCP 443 与 UDP 443 互不冲突，
+所以用同一个 init 脚本再开一个实例即可；两个实例共用 `/var/lib/phantom` 里的
+密钥与 PSK，因此**同一条 `phantom://` URI 只要改 `proto=` 就能在同一条链路上对比**：
+
+```bash
+# 在服务器上（root）
+sh enable-quic.sh              # 建立 /etc/init.d/phantom-quic + /etc/conf.d/phantom-quic 并启动
+netstat -lun | awk '$4 ~ /:443$/'    # 应看到 0.0.0.0:443（UDP）
+rc-service phantom-quic status
+sh enable-quic.sh --disable    # 停掉并移出 runlevel
+```
+
+客户端侧：鸿蒙端设置里的「传输协议」开关，或直接把链接改成 `?…&proto=quic`。
+测量方法与阈值见 `tests/PERF_WEAKNET_REPORT.md`。
 
 ## 安装器做了什么
 

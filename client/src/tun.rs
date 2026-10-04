@@ -20,9 +20,9 @@ use tokio::net::TcpStream;
 use tokio::sync::{Mutex, Notify};
 
 use crate::dns::{
-    DnsCache, DnsProxy, DnsQueryContext, DnsRoute, build_dns_response_packet,
-    build_refused_response, extract_a_records, extract_addr_records, extract_query_domain,
-    parse_dns_addr,
+    DNS_TYPE_AAAA, DnsCache, DnsProxy, DnsQueryContext, DnsRoute, build_dns_response_packet,
+    build_nodata_response, build_refused_response, dns_query_type, extract_a_records,
+    extract_addr_records, extract_query_domain, parse_dns_addr,
 };
 use crate::failover::FailoverManager;
 use crate::rules::RuleEngine;
@@ -199,6 +199,15 @@ const DIRECT_FAILURE_TTL: std::time::Duration = std::time::Duration::from_secs(6
 
 /// Upper bound on remembered failures, so a scanning app cannot grow it.
 const DIRECT_FAILURE_MAX: usize = 512;
+
+/// Whether an AAAA answer must be withheld from the app.
+///
+/// Only tunnel-routed names are affected: a directly resolved name keeps its
+/// IPv6 answer because that path does have IPv6. Pulled out of the DNS handler
+/// so the policy is testable without a live resolver.
+fn should_suppress_tunnel_aaaa(route: DnsRoute, qtype: Option<u16>, suppress: bool) -> bool {
+    suppress && route == DnsRoute::Tunnel && qtype == Some(DNS_TYPE_AAAA)
+}
 
 /// Bumped whenever the OS tells us the underlying network changed.
 ///
@@ -1249,6 +1258,26 @@ impl<D: TunIo> TunProxy<D> {
             dst_ip,
             dst_port,
         };
+
+        // A tunnel-routed name must not be advertised with an address the
+        // tunnel cannot reach. When the exit has no IPv6 egress, handing out
+        // the AAAA does not make the app fall back — it makes it retry a dead
+        // address forever (observed: the HarmonyOS browser reconnecting
+        // `2404:6800:…::200e` once a second and never loading the page).
+        // NOERROR/NODATA is what a real resolver answers for an IPv4-only host,
+        // so the app simply uses the A record.
+        if should_suppress_tunnel_aaaa(route, dns_query_type(data), dns.suppresses_tunnel_aaaa()) {
+            if let Some(empty) = build_nodata_response(data) {
+                let pkt = build_dns_response_packet(&empty, &ctx)?;
+                self.writer.send(pkt).await;
+                tracing::debug!(
+                    "dns AAAA suppressed for tunnel-routed {}",
+                    domain.as_deref().unwrap_or("<unknown>")
+                );
+            }
+            return Ok(());
+        }
+
         let id = dns.register(data, ctx, route).await?;
 
         if route == DnsRoute::Tunnel {
@@ -3586,6 +3615,27 @@ mod tests {
     // -----------------------------------------------------------------------
     // Retransmission discipline
     // -----------------------------------------------------------------------
+
+    /// AAAA answers are withheld for tunnel-routed names only.
+    ///
+    /// This is the difference between "the app falls back to IPv4" and "the
+    /// app retries an IPv6 address the tunnel exit cannot reach, forever" — the
+    /// failure the operator reported as "google.com 打不开".
+    #[test]
+    fn aaaa_is_only_suppressed_for_tunnel_routed_queries() {
+        let aaaa = Some(DNS_TYPE_AAAA);
+        let a = Some(1u16);
+
+        assert!(should_suppress_tunnel_aaaa(DnsRoute::Tunnel, aaaa, true));
+        // Directly resolved names keep their IPv6: that path really has it.
+        assert!(!should_suppress_tunnel_aaaa(DnsRoute::Local, aaaa, true));
+        // A/other types always pass through.
+        assert!(!should_suppress_tunnel_aaaa(DnsRoute::Tunnel, a, true));
+        // And the policy can be turned off for a server with IPv6 egress.
+        assert!(!should_suppress_tunnel_aaaa(DnsRoute::Tunnel, aaaa, false));
+        // A malformed question (no QTYPE) must not be swallowed silently.
+        assert!(!should_suppress_tunnel_aaaa(DnsRoute::Tunnel, None, true));
+    }
 
     /// A stalled flow must be given a weak-link-sized grace window, and when
     /// it *is* finally torn down the app has to hear about it (RST) and the

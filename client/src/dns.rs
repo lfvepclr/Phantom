@@ -146,15 +146,22 @@ impl DnsRoute {
     }
 }
 
-/// Build a REFUSED answer for a query, used when a rule rejects port 53.
-pub fn build_refused_response(query: &[u8]) -> Option<Vec<u8>> {
+/// DNS record type for an IPv6 address.
+pub const DNS_TYPE_AAAA: u16 = 28;
+
+/// Build a response that mirrors the question and carries `rcode`.
+///
+/// Shared by the two synthetic answers the hijack can produce: REFUSED when a
+/// rule rejects the query, and NOERROR/NODATA when the answer would be a dead
+/// end for the app (see [`build_nodata_response`]).
+fn build_status_response(query: &[u8], rcode: u16) -> Option<Vec<u8>> {
     let header = DnsHeader::decode(query)?;
     let (_, question_end) = extract_query_domain(query)?;
     let mut out = Vec::with_capacity(question_end);
     out.extend_from_slice(&query[..question_end]);
-    // QR=1, RD copied from the query, RA=1, RCODE=5 (REFUSED).
+    // QR=1, RD copied from the query, RA=1, RCODE as requested.
     let mut flags = header.flags | 0x8080;
-    flags = (flags & !0x000F) | 0x0005;
+    flags = (flags & !0x000F) | (rcode & 0x000F);
     out[2..4].copy_from_slice(&flags.to_be_bytes());
     // No answers / authority / additional records.
     out[6..8].copy_from_slice(&0u16.to_be_bytes());
@@ -163,6 +170,32 @@ pub fn build_refused_response(query: &[u8]) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// Build a REFUSED answer for a query, used when a rule rejects port 53.
+pub fn build_refused_response(query: &[u8]) -> Option<Vec<u8>> {
+    build_status_response(query, 5)
+}
+
+/// Build a NOERROR/NODATA answer: the name exists, it simply has no record of
+/// this type.
+///
+/// This is how the client declines to advertise an IPv6 address the tunnel
+/// cannot reach, without lying in a way resolvers treat as a failure. The app
+/// sees "no AAAA for this name" and uses the A record — which is what a
+/// resolver would answer for an IPv4-only host.
+pub fn build_nodata_response(query: &[u8]) -> Option<Vec<u8>> {
+    build_status_response(query, 0)
+}
+
+/// QTYPE of the first question, or `None` when the packet is not parseable.
+pub fn dns_query_type(buf: &[u8]) -> Option<u16> {
+    let (_, question_end) = extract_query_domain(buf)?;
+    // `question_end` points past QTYPE+QCLASS, so QTYPE is four bytes back.
+    let qtype_at = question_end.checked_sub(4)?;
+    if qtype_at + 2 > buf.len() {
+        return None;
+    }
+    Some(u16::from_be_bytes([buf[qtype_at], buf[qtype_at + 1]]))
+}
 /// Shared DNS proxy state.
 pub struct DnsProxy {
     /// Locally bound socket used for the direct path. Its local port doubles as
@@ -181,6 +214,11 @@ pub struct DnsProxy {
     query_domains: Arc<Mutex<std::collections::HashMap<u16, String>>>,
     /// Transport each in-flight transaction is using.
     query_routes: Arc<Mutex<std::collections::HashMap<u16, DnsRoute>>>,
+    /// Answer AAAA queries for tunnel-routed domains with an empty NOERROR.
+    ///
+    /// Set from `client.dns_ipv6_via_tunnel` (default `false`). See that field
+    /// for why the safe default is to *not* advertise IPv6 through the tunnel.
+    suppress_tunnel_aaaa: std::sync::atomic::AtomicBool,
 }
 
 impl DnsProxy {
@@ -213,7 +251,20 @@ impl DnsProxy {
             pending: Arc::new(Mutex::new(std::collections::HashMap::new())),
             query_domains: Arc::new(Mutex::new(std::collections::HashMap::new())),
             query_routes: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            suppress_tunnel_aaaa: std::sync::atomic::AtomicBool::new(true),
         })
+    }
+
+    /// Configure whether AAAA answers are withheld from tunnel-routed lookups.
+    pub fn set_suppress_tunnel_aaaa(&self, suppress: bool) {
+        self.suppress_tunnel_aaaa
+            .store(suppress, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether AAAA answers are withheld from tunnel-routed lookups.
+    pub fn suppresses_tunnel_aaaa(&self) -> bool {
+        self.suppress_tunnel_aaaa
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Local port of the direct-path socket (loop guard for `handle_udp`).
@@ -797,6 +848,47 @@ mod tests {
             IpAddr::V6("2404:6800:4005:827::200e".parse().unwrap())
         );
         assert!(extract_a_records(&response).is_empty());
+    }
+
+    /// QTYPE extraction has to account for the question's name length, and it
+    /// is what lets the hijack tell an AAAA query apart from everything else.
+    #[test]
+    fn query_type_reads_the_question() {
+        let response = aaaa_response("ipv6.google.com", "2404:6800:4005:827::200e");
+        assert_eq!(extract_query_domain(&response).map(|(d, _)| d).as_deref(), Some("ipv6.google.com"));
+
+        // The built packet ends with the AAAA rdata; its QTYPE is four bytes
+        // before the question's end offset.
+        let (_, question_end) = extract_query_domain(&response).expect("question");
+        assert_eq!(dns_query_type(&response), Some(DNS_TYPE_AAAA));
+
+        let mut as_a = response.clone();
+        as_a[question_end - 4..question_end - 2].copy_from_slice(&1u16.to_be_bytes());
+        assert_eq!(dns_query_type(&as_a), Some(1));
+    }
+
+    /// A withheld AAAA is NOERROR with no answers, not an error.
+    ///
+    /// Resolvers and apps treat NODATA as "this name has no such record" and go
+    /// on to use the A record; an error code makes some of them give up on the
+    /// name entirely.
+    #[test]
+    fn nodata_response_mirrors_the_question_without_answers() {
+        let query = aaaa_response("ipv6.google.com", "2404:6800:4005:827::200e");
+        let reply = build_nodata_response(&query).expect("nodata reply");
+        let header = DnsHeader::decode(&reply).expect("header");
+        let question_len = extract_query_domain(&query).expect("question").1;
+
+        assert_eq!(header.answer_rrs, 0, "NODATA carries no answers");
+        assert_eq!(header.flags & 0x8000, 0x8000, "QR set");
+        assert_eq!(header.flags & 0x000F, 0, "RCODE = NOERROR");
+        // The header itself is meant to differ (QR/RA set, ANCOUNT cleared);
+        // the question section has to come through untouched.
+        assert_eq!(
+            &reply[12..question_len],
+            &query[12..question_len],
+            "question section echoed"
+        );
     }
 
     /// A DNS answer that came in over IPv6 is answered over IPv6.

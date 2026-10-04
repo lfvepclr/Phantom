@@ -259,11 +259,16 @@ impl PhantomClient {
         if let (Some(tunnel_dns), Some(direct_dns)) = (tunnel_dns, direct_dns) {
             match crate::dns::DnsProxy::new(tunnel_dns, direct_dns).await {
                 Ok(dns) => {
+                    // See `ClientSettings::dns_ipv6_via_tunnel`: the tunnel exit
+                    // is one server, so by default an AAAA for a tunnelled name
+                    // is an address the app cannot use.
+                    dns.set_suppress_tunnel_aaaa(!self.config.client.dns_ipv6_via_tunnel);
                     proxy = proxy.with_dns(std::sync::Arc::new(dns));
                     tracing::info!(
-                        "DNS hijack enabled, tunnel resolver = {}, direct resolver = {}",
+                        "DNS hijack enabled, tunnel resolver = {}, direct resolver = {}, tunnel AAAA = {}",
                         tunnel_dns,
-                        direct_dns
+                        direct_dns,
+                        if self.config.client.dns_ipv6_via_tunnel { "forwarded" } else { "suppressed" }
                     );
                 }
                 Err(e) => tracing::warn!("DNS proxy init failed: {}", e),
