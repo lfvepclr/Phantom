@@ -176,6 +176,15 @@
 - live-check.sh 增：开关真相（enable vs 进程 vs ip rule vs cron）、S98/N98 钩子、双频无线计数器、
   以太口 drop/err 增量、perf 日志新鲜度、国内 DNS 池探测。
 
+实施时踩到并修掉的两个坑（都值得记下来）：
+
+- **live-check.sh 的远程块不能写 `case`**：整段被外面的 `OUT=$(ssh … <<'REMOTE')` 捕获，
+  bash 会按**括号配对**扫描命令替换的内容，`case` 的 `1)` 会提前闭合命令替换，报出与
+  被改行毫不相干的 `syntax error near unexpected token ;;`。两处 `case` 已改成 `if/elif`，
+  并在 heredoc 顶部留了警告注释。
+- **冒烟测试里变量后紧跟全角字符必须写 `${var}`**：`set -u` + `LC_ALL=C` 时，
+  `"$_sec」"` 的字节会被当成变量名的一部分 → `unbound variable`。
+
 ### 2.7 Rust 与依赖
 
 - rustup update 到 1.99.x + cargo update 落 patch/minor（不跨大版本）；修新工具链引入的 lint/编译问题；

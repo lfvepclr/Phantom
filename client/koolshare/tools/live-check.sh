@@ -56,6 +56,11 @@ OUT=$(ssh -p "$PORT" \
     -o StrictHostKeyChecking=accept-new \
     -o BatchMode=yes \
     "${USER}@${HOST}" '/bin/sh -s' <<'REMOTE' 2>&1
+# ⚠️ 这段远程脚本整体被外面的 `OUT=$(ssh …)` 捕获，bash **按括号配对扫描**命令替换的
+# 内容：body 里出现不成对的 `)`（最典型的是 `case` 的 `1)`）就会提前闭合命令替换，
+# 报出与被改行毫不相干的 "syntax error near unexpected token ;;"。
+# 所以这里**只能用 if/elif**，不要写 case；真要写就跟 `)` 配对的 `(` 一起写。
+# （踩过两次：5.5 的 case 与 5.7 的 case。）
 module=phantom
 
 find_exe() {
@@ -118,7 +123,9 @@ echo "########## 3.5 httpd 健康（失效会话会把它打崩） ##########"
 # 插件侧已改成「.asp 会话预检 + 失效即停」：探针页不经过 httpdb，会话没了
 # 就停掉全部轮询，不再反复把 httpd 打崩。这里用来确认现场状态。
 echo "http_autologout : $(nvram get http_autologout 2>/dev/null) 分钟（ASUS 无操作自动登出）"
-echo "会话探针页      : $([ -f /koolshare/webs/phantom_ping.asp ] && echo /koolshare/webs/phantom_ping.asp || echo '(缺失 —— 旧版页面没有会话预检，失效会话会打崩 httpd)')"
+# 探针页名字必须是 Module_* —— httpd 只把 /Module_* 路由到 /koolshare/webs，
+# 早期叫 phantom_ping.asp 的那个恒 404。
+echo "会话探针页      : $([ -f /koolshare/webs/Module_phantom_ping.asp ] && echo /koolshare/webs/Module_phantom_ping.asp || echo '(缺失 —— 旧版页面没有会话预检，失效会话会打崩 httpd)')"
 if [ -f /tmp/syslog.log ]; then
     crashes=$(grep -c 'Comm: httpd' /tmp/syslog.log 2>/dev/null)
     echo "httpd 崩溃次数  : ${crashes:-0}"
@@ -160,6 +167,111 @@ if [ -n "$CRU" ]; then
 else
     echo "(没有 cru，插件会回退 crontab)"
 fi
+
+echo ""
+echo "########## 5.5 开关真相（期望 vs 实际，关就是关） ##########"
+# 真机上出现过「关掉插件 → 重启路由器 → 自己又开了」，而页面完全看不出来。
+# 三条路径：开机钩子 start / cron 的 restart / 页面只显示开关值。插件侧已修，
+# 这里用来核对现场：期望（dbus）与实际（进程 + 路由规则 + cron）必须一致。
+DBUS0=$(find_exe dbus)
+enable=$("$DBUS0" get phantom_enable 2>/dev/null)
+trigger=$("$DBUS0" get phantom_run_trigger 2>/dev/null)
+echo "phantom_enable  : ${enable:-（空）}"
+echo "run_trigger     : ${trigger:-（空 —— 旧版本或从未启动）}"
+if [ -f /tmp/phantom.pid ] && kill -0 "$(cat /tmp/phantom.pid 2>/dev/null)" 2>/dev/null; then
+    proc_state="running"
+else
+    proc_state="stopped"
+fi
+echo "进程实际        : $proc_state"
+if ip rule show 2>/dev/null | grep -qE "lookup[[:space:]]+200([[:space:]]|$)"; then
+    rules_state="规则在位"
+else
+    rules_state="无规则"
+fi
+echo "规则实际        : $rules_state"
+# 注意：这段远程脚本整体被外面的 `OUT=$(ssh …)` 捕获，bash 会按**括号配对**扫描
+# 命令替换的内容 —— 所以这里不能出现不成对的 `)`（`case 1)` 就会提前闭合命令替换，
+# 报出莫名其妙的 "syntax error near unexpected token ;;"）。用 if/elif 代替 case。
+if [ "${enable:-0}" = "1" ]; then
+    if [ "$proc_state" = "running" ]; then
+        echo "结论            : 期望开、实际开 —— 一致"
+    else
+        echo "结论            : 期望开、但进程没起来（看日志最后一条动作）"
+    fi
+elif [ "$proc_state" = "running" ] || [ "$rules_state" = "规则在位" ]; then
+    echo "结论            : **期望关、但仍有残留** —— 页面点「一键修复」或"
+    echo "                  /bin/sh /koolshare/scripts/phantom_config.sh cleanup"
+else
+    echo "结论            : 期望关、实际关 —— 一致"
+fi
+if [ -n "$CRU" ] && [ "${enable:-0}" != "1" ] && "$CRU" l 2>/dev/null | grep -q "phantom_restart"; then
+    echo "定时重启        : **插件已关闭却还挂着 phantom_restart**（明天到点会自己开回来）"
+fi
+
+echo ""
+echo "########## 5.6 国内解析器池 / 分流内核侧 ##########"
+echo "dns_direct      : $("$DBUS0" get phantom_dns_direct 2>/dev/null)"
+echo "--- mangle PREROUTING（connmark = 只标记新连接）---"
+iptables -t mangle -S PREROUTING 2>/dev/null | head -n 8 || echo "(读不到)"
+if iptables -t mangle -S PREROUTING 2>/dev/null | grep -q "CONNMARK --restore-mark"; then
+    echo "connmark        : 已启用（在途连接不会被中途入集的地址打断）"
+else
+    echo "connmark        : 未启用（逐包标记：地址中途入集时在途连接会被 RST）"
+fi
+echo "--- ipset ---"
+ipset list phantom_proxy 2>/dev/null | head -n 8 || echo "(无 phantom_proxy)"
+echo "--- 逐台实测（走物理网卡，不经隧道）---"
+NS=$(find_exe nslookup)
+PG=$(find_exe ping)
+POOL=$("$DBUS0" get phantom_dns_direct 2>/dev/null)
+[ -n "$POOL" ] || echo "  (dbus 无 phantom_dns_direct —— 这是升级前的旧版本；装上带解析器池的版本后这里会逐台实测)"
+for ip in $(echo "$POOL" | tr ',' ' '); do
+    host=${ip%%:*}
+    [ -n "$host" ] || continue
+    rtt=""
+    [ -n "$PG" ] && rtt=$("$PG" -c 2 -W 2 "$host" 2>/dev/null | tail -3 | sed -n 's#.*= [0-9.]*/\([0-9.]*\)/.*#\1#p' | head -n 1)
+    res=""
+    if [ -n "$NS" ]; then
+        "$NS" www.baidu.com "$host" >/dev/null 2>&1 && res="解析正常" || res="解析失败"
+    fi
+    echo "  $ip  rtt=${rtt:-?}ms  $res"
+done
+
+echo ""
+echo "########## 5.7 性能采样（v2 表头）与无线/以太口 ##########"
+if [ -f /tmp/upload/phantom_perf.log ]; then
+    echo "表头  : $(head -n 1 /tmp/upload/phantom_perf.log)"
+    echo "行数  : $(wc -l < /tmp/upload/phantom_perf.log | tr -d ' ')"
+    echo "最近 3 行:"
+    tail -n 3 /tmp/upload/phantom_perf.log
+    # busybox 的 stat 不一定支持 -c：取不到就别报新鲜度，别用 0 算出天文数字。
+    # 同样不能用 case —— 见上面「不能出现不成对右括号」的说明。
+    mtime=$(stat -c %Y /tmp/upload/phantom_perf.log 2>/dev/null)
+    if [ -n "$mtime" ] && [ "$mtime" -gt 0 ] 2>/dev/null; then
+        echo "新鲜度: $(( $(date +%s) - mtime ))s 前更新（cron 每 5 分钟一次；明显更久说明采样任务没在跑）"
+    else
+        echo "新鲜度: (本机 stat 取不到 mtime，按上一行时间戳自行判断)"
+    fi
+else
+    echo "(无 phantom_perf.log —— 旧版本或 cron 未注册)"
+fi
+echo "--- 无线空口（2.4G=eth6 / 5G=eth7）---"
+WL=$(find_exe wl)
+if [ -n "$WL" ]; then
+    for i in eth6 eth7; do
+        n=$("$WL" -i "$i" assoclist 2>/dev/null | wc -l | tr -d ' ')
+        c=$("$WL" -i "$i" counters 2>/dev/null | grep -E "^(txframe|txretrans|rxcrc) ")
+        echo "  $i  客户端=${n}"
+        printf '%s\n' "$c" | sed 's/^/    /'
+    done
+else
+    echo "(无 wl)"
+fi
+echo "--- 以太口 drop/err（eth0=WAN，eth2 真机上只到 100Mb/s）---"
+# /proc/net/dev 的列：$1=face:  $2..$9=RX(bytes packets errs drop fifo frame compressed multicast)
+#                       $10..$17=TX(bytes packets errs drop fifo colls carrier compressed)
+cat /proc/net/dev 2>/dev/null | grep -E "eth0|eth2|eth7" | awk '{printf "  %-6s rx_err=%s rx_drop=%s tx_err=%s tx_drop=%s\n", $1, $4, $5, $11, $12}'
 
 echo ""
 echo "########## 6. 脚本语法自检 ##########"

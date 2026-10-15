@@ -110,6 +110,9 @@ client/koolshare/
 | `2` | 清空日志 |
 | `3` | 测速 |
 | `start` / `stop` / `restart` / `status` | 生命周期 |
+| `start_force` | 无视总开关强制启动（唯一例外：安装脚本与 SSH 排障用） |
+| `cleanup` | 清理残留（进程 / ip rule / iptables / 定时任务），页面「一键修复」用它 |
+| `health` | 一键网络体检（结果写 `/tmp/upload/phantom_health.txt`） |
 | `start_nat` | nat-start 兜底：规则被 iptables 重建冲掉时重启补回 |
 | `cron` | 按 dbus 幂等重注册定时任务 |
 | `diag` | 输出诊断报告 |
@@ -146,6 +149,7 @@ httpdb 先把 `fields` 写进 dbus，再执行 `/koolshare/scripts/<method> <id>
 | `phantom_tun_name` / `phantom_tun_addr` | `phantom0` / `10.7.0.1/24` | TUN（地址不得与 LAN 网段重叠） |
 | `phantom_table` | `200` | 策略路由表 |
 | `phantom_dns_hijack` | `1` | LAN 53 端口导入隧道 |
+| `phantom_dns_direct` | `223.5.5.5:53,119.29.29.29:53,180.76.76.76:53` | 国内解析器池（逗号分隔、按优先级）；不在白名单里的域名用它解析 |
 | `phantom_builtin_wl` | `1` | 内置被墙域名表 |
 | `phantom_whitelist` | 空 | 自定义域名，**逗号分隔单行**（dbus 存不了多行：页面把多行/空格折成逗号分隔，脚本侧再把字面 `\n`、空白一并当分隔符兜底） |
 | `phantom_cron_enable` / `phantom_cron_time` | `0` / `4:30` | 定时重启 |
@@ -155,6 +159,7 @@ httpdb 先把 `fields` 写进 dbus，再执行 `/koolshare/scripts/<method> <id>
 | `phantom_block_doh` | `1` | 拦截 LAN 侧加密 DNS（DoT/DoH），保证域名→IP 的学习链不断 |
 | `phantom_server_up_mbps` / `phantom_server_down_mbps` | `3` / `5` | 服务端带宽，用于解读测速结果 |
 | `phantom_last_act` / `phantom_speed_last` / `phantom_watchdog_fails` | — | 运行状态回显 |
+| `phantom_run_trigger` | — | 当前实例由谁拉起：`boot` / `cron` / `nat` / `watchdog` / `user` / `install` |
 | `softcenter_module_phantom_{version,install,name,title,description}` | — | 软件中心要求 |
 
 ### 4.3 前端 API（koolshare 1.5 代）
@@ -490,6 +495,9 @@ ts,cpu_pct,conns,fd,fd_limit,ct,fc_hw,fc_sw,d_up,d_dn,t_up,t_dn,ipset,gw,dns_ms,
 - [ ] 双架构：按 `uname -m` 选中正确二进制并启动
 - [ ] **页面点「提交」毫秒级返回**，不再转圈、不弹「后台执行失败」，`上次动作` 变「已启动」
 - [ ] 开关：开→LAN 客户端能走隧道；关→进程与 ip rule / iptables 完全回退
+- [ ] **关就是关**：关掉后重启路由器，插件仍是关；`cru l` 里没有 `#phantom_restart#`
+- [ ] **提交即生效**：隧道健康时改一条配置点提交，进程 pid 会变（否则新配置不会生效）
+- [ ] 页面「状态核对」显示「期望/实际」，与真实进程/规则一致；不一致时能一键修复
 - [ ] 状态卡 2s 刷新（`/_temp/phantom_status.txt` 可读），速率与累计流量和 `/metrics` 对得上
 - [ ] 白名单：加一条域名后该域名走隧道，其余仍直连
 - [ ] 定时重启：`cru l` 有条目且到点生效；关闭后条目消失
@@ -503,7 +511,12 @@ ts,cpu_pct,conns,fd,fd_limit,ct,fc_hw,fc_sw,d_up,d_dn,t_up,t_dn,ipset,gw,dns_ms,
 - [ ] 页面切「兼容模式」后行为与旧版本一致（可一键回退）
 - [ ] 加密 DNS 拦截打开时 YouTube/Google 仍正常；关掉开关后恢复
 - [ ] fd 上限已抬高（`/proc/<pid>/limits` 的 Max open files ≥ 16384），并发高时无 EMFILE
-- [ ] `phantom_perf.log` 有夜间数据，且能据此判断瓶颈
+- [ ] `phantom_perf.log` 有夜间数据（v2 表头，含 `new_conns`/`unknown_rst`/`wifi24_*` 等），且能据此判断瓶颈
+- [ ] **一键网络体检**能出报告，`/tmp/upload/phantom_health.txt` 可读，七节结论齐全
+- [ ] **国内解析器池**：三台逐台可达；把首选改成不可达地址后自动切换、普通域名解析不中断
+- [ ] **connmark 生效**：`iptables -t mangle -S PREROUTING` 有 `--ctstate NEW … CONNMARK --save-mark` 与 `--ctstate ESTABLISHED,RELATED … --restore-mark`；metrics 里 `phantom_gateway_connmark 1`
+- [ ] 首次打开白名单站点不再「顿一下」：`phantom_tun_unknown_flow_rst_total` 稳定不涨，
+      首连接冷/暖耗时差距明显收敛（见 §10.2）
 
 ## 9. 已知约束
 
@@ -583,3 +596,128 @@ ts,cpu_pct,conns,fd,fd_limit,ct,fc_hw,fc_sw,d_up,d_dn,t_up,t_dn,ipset,gw,dns_ms,
 - 状态与日志在 `/tmp/upload`（tmpfs），**重启路由器后清空**；日志截断 500 行 / 256KB。
 - 路由器的 shell 是 BusyBox ash：脚本必须 POSIX，`sed -i` 要写成「临时文件 + mv」；
   heredoc 里不要写反引号（会被命令替换求值）。
+
+## 10. 开关真相 / 首连接 / DNS 池 / 泄漏自查 / 性能自查
+
+这一节回答的是「感觉不对但说不出哪里不对」的四类问题。每条都给出**怎么测**与
+**怎么解读**，而不是只给结论。
+
+### 10.1 开关到底关没关（「关就是关」）
+
+真机上曾经出现「关掉插件 → 重启路由器 → 自己又开了」，而且页面完全看不出来。
+三条路径都堵上了：
+
+| 路径 | 过去 | 现在 |
+|---|---|---|
+| 开机钩子 | `ks-wan-start.sh` 执行 `init.d/S98phantom.sh start`，而 `start` 不读总开关 | `start` 读 `phantom_enable`，≠1 时只记一行「已关闭，忽略 start」 |
+| 定时重启 | `cru` 里的 `phantom_config.sh restart` 只受 `cron_enable` 控制；`stop()` 也不删它 | 注册条件是 `enable=1 且 cron_enable=1`；`stop()` 结束即同步（关闭时自动摘除） |
+| 页面 | 开关是本地控件、必须点提交才落库；开关关着时页面**根本不查真实状态** | 任何时候都查状态文件，并并排显示「期望：开/关」「实际：运行中/已停止/残留」 |
+
+自查（纯只读）：
+
+```sh
+ssh -p <SSH端口> admin@<路由器IP> '
+  echo "enable=$(dbus get phantom_enable)  trigger=$(dbus get phantom_run_trigger)";
+  echo "--- 进程 ---"; ps w | grep "[p]hantom client" | head -3
+  echo "--- 规则 ---"; ip rule show | grep -E "lookup 200|lookup (main|default)"
+  echo "--- 定时任务 ---"; cru l | grep phantom
+'
+```
+
+- `enable=0` 却能看到 `phantom client` 进程或 `lookup 200` → 点页面「一键修复」
+  （或 `phantom_config.sh cleanup`）。
+- 想知道这次是谁开起来的：`phantom_run_trigger` 与日志里的 `[boot|cron|nat|watchdog|user|install]`。
+- **提交即生效**：过去隧道健康时点提交只会 `start`，而 `start` 遇到「在跑且健康」会直接
+  早退 —— `client.toml` / `proxy_domains.txt` 都不重写，用户看到「提交成功」但隧道用
+  的还是旧配置。现在已经在跑就 `restart`（干净回滚 → 用新配置起来），页面仍是毫秒级返回。
+
+### 10.2 为什么「第一次打开某个站点会顿一下」
+
+两条独立成因，都有对应的指标：
+
+1. **ipset 发布竞态（已修）**：DNS 应答一出就回给应用，而白名单地址过去只入队列、
+   要等 1 秒的批量 flush 才落内核 → 应用拿到的首个 SYN 走直连（被墙目标在这里被 RST），
+   重试才进隧道。现在 DNS 应答在写回之前会**同步完成 ipset 写入**；
+   等待时间本身也暴露出来：`phantom_ipset_publish_wait_max_ms`。
+2. **冷连接代价**：第一次要现建隧道会话（TCP + Noise），第 2、3 次可以用池子里的备用会话。
+   真机实测首次 TTFB 635ms（TLS 547ms）、第 2/3 次 223/228ms。
+   池子的命中情况现在可观测：`phantom_pool_reused_total`（>0 才说明池子真替人省了握手）、
+   `phantom_pool_created_total`、`phantom_pool_idle`。
+3. **在途连接被 RST（已修）**：白名单地址是会话中途学到的，逐包标记会把一条本来走直连的
+   连接拽进 TUN，用户态只见过它的 ACK，只能回 RST。现在只标记新建连接
+   （`--ctstate NEW` + `CONNMARK --save-mark`，已建立连接 `--restore-mark` 走回原路），
+   `phantom_tun_unknown_flow_rst_total` 应停止增长；`phantom_gateway_connmark=0`
+   表示这台固件缺 `xt_conntrack`/`CONNMARK`，退回了逐包标记。
+
+自查：
+
+```sh
+ssh -p <SSH端口> admin@<路由器IP> 'curl -s 127.0.0.1:9150/metrics | grep -E \
+ "unknown_flow_rst|ipset_publish|pool_(created|reused|idle)|gateway_connmark"'
+```
+
+### 10.3 国内 DNS 备选池（避免单点）
+
+`phantom_dns_direct` 是**按优先级排列的列表**（页面「服务端配置 → 国内解析器池」）：
+
+- 不在白名单里的域名（也就是绝大多数国内站点）用这里的解析器**走物理网卡**解析；
+  白名单域名走隧道、由远端解析（默认 `8.8.8.8`，见 `client.dns`）。
+- 某台 900ms 没应答 → 自动换下一台重发同一个查询（同 id，谁先答就用谁）；
+  连续 3 次超时的那台**冷却 60 秒**后排到最后，冷却结束自动回到队首；
+  已应答的那台会重置计数并重新获得优先。
+- 只填一台是单点故障：那家抽风/被劫持时，整屋的普通域名都解析不出来。
+  默认三家：阿里 `223.5.5.5`、腾讯 `119.29.29.29`、百度 `180.76.76.76`
+  （也可换 114DNS `114.114.114.114`、字节 `180.184.1.1`）。
+- 指标：`phantom_dns_direct_active`（当前优先第几台，0 起）、
+  `phantom_dns_direct_failovers_total`、`phantom_dns_direct_timeouts_total`。
+- `client.dns`（隧道侧）**故意保持单地址**：它经隧道由服务端网络解析，扩成池会牵动
+  隧道内那条共享 UDP 流；换解析器用配置热更即可。
+
+验证切换是否真的有效（把首选临时改成不可达地址）：
+
+```sh
+# 1) 体检页确认三台可达（也可 SSH 直接看）
+ssh -p <SSH端口> admin@<路由器IP> 'nslookup www.baidu.com 223.5.5.5; nslookup www.baidu.com 119.29.29.29'
+# 2) 把池子改成 203.0.113.1,119.29.29.29 → 提交 → 普通域名仍应正常解析，
+#    phantom_dns_direct_failovers_total 开始增长
+```
+
+### 10.4 泄漏自查（browserleaks 三项的口径）
+
+先说结论：**这三项在「默认直连 + 白名单进隧道」的分流模型下都有确定的预期结果**，
+看到大陆国旗或家宽 IP 不等于配置错了。
+
+| 测试 | 预期结果 | 为什么 |
+|---|---|---|
+| `browserleaks.com/dns` | 测试域名（不在白名单）经 `phantom_dns_direct` 的国内解析器 → 显示**大陆国旗** | 未匹配域名本来就该用国内解析器，这样国内 CDN 才会给就近节点；只有白名单域名的解析才经隧道出口 |
+| `browserleaks.com/ip`（IPv6） | 只出现 IPv4 | 本机固件 IPv6 关闭（`nvram get ipv6_service`）；另外隧道域名默认**不下发 AAAA**（`dns_ipv6_via_tunnel=false`），避免应用去死磕出口不可达的 IPv6 |
+| `browserleaks.com/webrtc` | 会看到**家宽公网 IP** | WebRTC 用 STUN(UDP 3478/19302) 打洞，不在白名单 → 走直连。要隐藏就在浏览器里禁用 WebRTC |
+
+真正需要警惕的是这三条里**唯一会"漏"进隧道的方向**：如果路由器开了 IPv6，而隧道只承载
+IPv4，客户端会优先用 IPv6 直连，被墙站点表现为"打不开/转圈"。体检页第五节会直接报出来。
+
+想验证「白名单域名的 DNS 确实走了隧道」：把测试用的域名加进白名单后重测，或在页面把
+日志级别临时改成 `info`，日志里会出现 `dns route`/`route` 行（一眼看出域名走了哪条解析）。
+
+### 10.5 性能与卡顿自查表
+
+用页面运维页的 **「一键网络体检」**（`/tmp/upload/phantom_health.txt`）一次看全；
+需要逐项深挖时按下表：
+
+| 现象 | 看什么 | 正常范围 / 处置 |
+|---|---|---|
+| 全屋变慢 | `phantom_perf.log` 的 `cpu_pct`、`fd`、`ct` | CPU 0–5%；fd 远小于上限；`ct` 逼近 conntrack 上限才需要处理 |
+| 直连也慢 | `fc_hw/（fc_hw+fc_sw）`（v2 修好了，以前恒为 0）、`eth*_rx_drop_d` | 硬件加速命中应占多数；eth0/eth2 的 drop/err 增量持续 > 0 要看线材/端口（真机上 eth2 只协商到 100Mb/s） |
+| 无线卡顿 | `wifi24_txretrans`、`wifi24_rxcrc`、`wifi5_*` | 2.4G 真机实测 txretrans ≈29.6%、rxcrc 86 万（5G 16.8%）→ 优先把设备挪到 5G 或换信道 |
+| 隧道慢/卡 | `tun_wait_max_ms`、`txq_peak`、`dup_acks`、`stall_drops`、`tunnel_conn_fail` | 偶发几十毫秒没事；`tun_wait_max_ms` 上百且频繁 → 用户态 relay 堵了（看 CPU 与队列） |
+| 看着看着断一下 | `unknown_rst` 的增量 | 不再增长说明 connmark 生效；持续增长就要看规则是否在位（§10.2） |
+| 首次打开慢 | `ipset_publish_wait_ms`、`pool_reused`、体检第六节 | 冷/暖差距应在几百毫秒内收敛；`pool_reused` 长期为 0 说明池子没起作用 |
+| 晚上才慢 | 隔天看 v2 的 `new_conns`（本周期新增连接数，不再是被误读的累计值） | 与 `cpu_pct`/`ct`/`dup_acks` 对齐，判断是人多、还是 ISP 侧（`rtt_ms`/`loss_pct`） |
+| 是不是 ISP | `rtt_ms`、`loss_pct`（对 223.5.5.5） | 真机白天 4ms / 0%；晚高峰同步升高就是 ISP |
+
+日志侧：`phantom_perf.sh` 每 5 分钟一行（v2 表头，41 列，分析请按列名取值）；
+`phantom_health.sh` 是「现在这一刻」的快照；`phantom_log.txt` 是事件流（截断 500 行 / 256KB）。
+
+> 开机阶段日志里会出现 `【2018-05-05 …】` 这种时间戳（NTP 还没同步），
+> 现在每次启动都会先写一行 `—— 启动环境：date=… uptime=… trigger=… ——`，
+> 一眼就能看出那几条是"时钟还没校准"而不是出了问题。

@@ -145,7 +145,8 @@ exit_install() {
 verify_package() {
     local missing=""
     for item in install.sh uninstall.sh version scripts/phantom_config.sh \
-                scripts/phantom_status.sh webs/Module_phantom.asp res/phantom.css \
+                scripts/phantom_status.sh scripts/phantom_health.sh \
+                webs/Module_phantom.asp res/phantom.css \
                 res/icon-phantom.png bin/phantom-aarch64 bin/phantom-armv7; do
         [ -e "${DIR}/${item}" ] || missing="${missing} ${item}"
     done

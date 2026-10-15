@@ -14,6 +14,7 @@
 #   ks <0|1>     兼容入口（真实固件的开机路径是 init.d/S98phantom.sh start）
 #   start_force  无视总开关强制启动（唯一例外，供安装脚本/SSH 排障）
 #   cleanup      关闭状态下清理残留进程/规则/定时任务（页面「一键修复」）
+#   health       一键网络体检（结果写 /tmp/upload/phantom_health.txt）
 #   cron         重注册定时重启与看门狗
 #   diag         输出诊断信息
 #
@@ -758,6 +759,12 @@ start() {
     # 晚上人多时会被 EMFILE 打满（表现：新连接莫名其妙打不开，白天又正常）。
     ulimit -n 16384 2>/dev/null
 
+    # 启动前环境快照。开机阶段 NTP 往往还没同步，插件日志里会出现
+    # 【2018-05-05 …】这种时间戳并与后面的正常时间交错，很容易被误读成
+    # "日志乱序/时间穿越"。这一行把当时的真实 date 与 uptime 固定下来，
+    # 事后一眼就能看出那几条是"时钟还没校准"而不是出了问题。
+    log_line "—— 启动环境：date=$(date '+%Y-%m-%d %H:%M:%S') uptime=$(cut -d' ' -f1 /proc/uptime 2>/dev/null)s trigger=${TRIGGER} enable=$(get_cfg enable) ——"
+
     ARGS=$(build_args "$uri")
     RUST_LOG="$log_level" \
     PHANTOM_PROXY_DOMAINS="$DOMAINS_FILE" \
@@ -921,6 +928,27 @@ apply() {
     return 0
 }
 
+# 一键网络体检：由 POST 同步调用，必须尽快返回 —— 真正干活的是
+# phantom_health.sh（它要 ping 三个解析器 + 打两次 SOCKS5 请求，十几秒起步），
+# 所以和测速一样后台派发。
+run_health_complete() {
+    PHANTOM_QUIET=1
+    if [ ! -f "${SCRIPTS_DIR}/${module}_health.sh" ]; then
+        log_line "错误：缺少 phantom_health.sh"
+        return 1
+    fi
+    log_act "开始网络体检（结果在「运维」页，也可读 /_temp/phantom_health.txt）"
+    detach_run _health_check
+    return 0
+}
+
+# 后台真正执行体检（由 detach_run 调用）
+run_health_now() {
+    PHANTOM_QUIET=1
+    "$SH" "${SCRIPTS_DIR}/${module}_health.sh" >>"$LOG" 2>&1
+    return 0
+}
+
 # 页面「一键修复」：期望是关、但实际还有残留（进程/ip rule/iptables/cron）时用。
 # 插件已经被关掉的前提下，这里不会有任何「顺手把隧道开起来」的副作用。
 cleanup_residue() {
@@ -998,7 +1026,7 @@ do_diag() {
 # 判据：$1 本身是已知 action 就当直接调用；否则只要 $2 是已知 action 就按
 # 软件中心调用解析；再不然，只要 $1 是纯数字（请求 id 的形态）也按软件中心
 # 调用处理——认不出 action 时同样先回包再报错，页面不会卡住。
-KNOWN_ACTIONS="1 2 3 start_nat start start_force stop restart status ks cron diag cleanup _speedtest _health _trim"
+KNOWN_ACTIONS="1 2 3 start_nat start start_force stop restart status ks cron diag cleanup health _speedtest _health _health_check _trim"
 
 is_known_action() {
     for _a in $KNOWN_ACTIONS; do
@@ -1036,6 +1064,8 @@ case "$ACTION" in
     3)        run_speedtest ;;
     # 内部入口：由 detach_run 在后台调用，不要直接执行
     _speedtest) run_speedtest_now ;;
+    # 内部入口：后台体检（health 的派发目标）
+    _health_check) run_health_now ;;
     # 内部入口：给看门狗用，判断进程是「真活着」还是「僵死」（只能输出一个词）
     _health)
         if is_healthy; then echo healthy; else echo unhealthy; fi
@@ -1061,6 +1091,7 @@ case "$ACTION" in
     status)   status ;;
     start_nat) start_nat ;;
     cleanup)  cleanup_residue ;;
+    health)   run_health_complete ;;
     cron)     register_cron ;;
     diag)     do_diag ;;
     ks)

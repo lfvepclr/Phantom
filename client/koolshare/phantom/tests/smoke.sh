@@ -921,13 +921,69 @@ if [ -f "$PERF_S" ]; then
     "$SH" "$PERF_S" >/dev/null 2>&1
     PERF_LOG="$RUN_TMP/upload/phantom_perf.log"
     [ -f "$PERF_LOG" ] && ok "采样文件已生成：$PERF_LOG" || bad "采样文件缺失"
-    head -n 1 "$PERF_LOG" 2>/dev/null | grep -q "cpu_pct,conns,fd" \
-        && ok "采样表头含 CPU/连接数/fd 字段" || bad "采样表头不对"
+    _hdr=$(head -n 1 "$PERF_LOG" 2>/dev/null)
+    case "$_hdr" in
+        ts,ver,*) ok "采样表头是 v2（带版本列，便于兼容旧行）" ;;
+        *) bad "采样表头不是 v2：$_hdr" ;;
+    esac
+    # v2 必须把「累计连接数被当成活跃连接」这个坑填上，并带上隧道/无线/以太口增量
+    for _col in new_conns conns_total dup_acks unknown_rst stall_drops pool_reused \
+                wifi24_txretrans wifi5_rxcrc eth0_rx_drop_d; do
+        printf '%s' "$_hdr" | grep -q ",${_col}," -o 2>/dev/null || printf '%s' "$_hdr" | grep -q ",${_col}$" \
+            && ok "采样表头含 $_col" || bad "采样表头缺 $_col"
+    done
+    # flow-cache 统计过去恒为 0（分类正则只匹配到软件流那半边）：
+    # 用固定样例文本断言「表头之外的行数 − 哨兵行数 = HW 命中数」
+    _fc_sample="/tmp/phantom-fcache-sample.$$"
+    {
+        echo "Broadcom Packet Flow Cache v4.0"
+        echo "Flow   U/M M/C idle:+swhit SW_TotHits:  ...  HW_TotHits ..."
+        echo "    28   U   -   94:     0       1130:  105839 0xffffffff 4294967295          0          0"
+        echo "    44   U   -    0:     4      55974: 18901338 0x00000001          7          9"
+    } >"$_fc_sample"
+    _tot=$(wc -l <"$_fc_sample" | tr -d ' ')
+    _tot=$((_tot - 2))
+    _sw=$(grep -c 4294967295 "$_fc_sample" | tr -d ' ')
+    _hw=$((_tot - _sw))
+    rm -f "$_fc_sample"
+    if [ "$_hw" = "1" ] && [ "$_tot" = "2" ]; then
+        ok "flow-cache 判定正确（2 条流里 1 条走硬件加速，不再恒为 0）"
+    else
+        bad "flow-cache 判定错误（hw=$_hw total=$_tot，期望 hw=1 total=2）"
+    fi
     [ "$(wc -l <"$PERF_LOG" 2>/dev/null | tr -d ' ')" -ge 2 ] 2>/dev/null \
         && ok "已写入至少一行采样" || bad "没有采样数据行"
 else
     bad "phantom_perf.sh 未安装"
 fi
+
+step "一键网络体检"
+HEALTH_S="$SCRIPTS_DIR_T/phantom_health.sh"
+if [ -f "$HEALTH_S" ]; then
+    ok "phantom_health.sh 已安装"
+    "$SH" "$HEALTH_S" >/dev/null 2>&1
+    HEALTH_OUT="$RUN_TMP/upload/phantom_health.txt"
+    if [ -f "$HEALTH_OUT" ]; then
+        ok "体检报告已生成：$HEALTH_OUT"
+        # 报告必须给出结构化结论，而不是一堆原始数字
+        for _sec in "一、插件状态" "二、分流实况" "三、国内解析器池" "四、分流学习链" \
+                    "五、泄漏面" "六、首连接耗时" "七、性能快照"; do
+            # 末尾的「是中文全角括号：变量必须写成 ${_sec}，否则 LC_ALL=C 的
+            # shell 会把它的字节当成变量名的一部分（set -u 下直接报 unbound）
+            grep -q "$_sec" "$HEALTH_OUT" && ok "体检报告含「${_sec}」" || bad "体检报告缺「${_sec}」"
+        done
+        grep -qE "\[OK\]|\[!!\]|\[XX\]" "$HEALTH_OUT" \
+            && ok "体检报告带 ✅/⚠️/❌ 结论标记" || bad "体检报告没有结论标记"
+    else
+        bad "体检报告缺失"
+    fi
+else
+    bad "phantom_health.sh 未安装"
+fi
+grep -q "function run_health" "$ASP" && grep -q "id=\"health_out\"" "$ASP" \
+    && ok "页面有「一键网络体检」按钮与结果区" || bad "页面缺少体检入口"
+grep -qE '^ *health\)' "$SCRIPTS_DIR_T/phantom_config.sh" \
+    && ok "config.sh 注册了 health action" || bad "config.sh 没有 health action"
 
 step "状态文件新字段（CPU/分流模式/ipset/fd）"
 if [ -f "$RUN_STATUS" ]; then

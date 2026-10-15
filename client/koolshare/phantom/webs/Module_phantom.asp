@@ -59,7 +59,7 @@
 <script>
 // 前端修订号：页面右上角会显示，用来确认浏览器加载的是哪一版
 // （改了 UI 就 +1，排查「改了没生效」时先看这个数字）
-var PHANTOM_UI_REV = '10';
+var PHANTOM_UI_REV = '11';
 var dbus = {};
 // 「期望」= 服务端已经保存的开关值（不是开关控件当前的值：控件改了但没点提交
 // 属于「尚未生效」）。页面把它和状态文件里的「实际」并排显示，用户才能一眼
@@ -978,6 +978,57 @@ function speedtest() {
 	}, "测速中…（下载 5MB 样本，约 10 秒，期间页面可正常操作）");
 }
 
+// 一键网络体检：走轻提交（不带表单字段，体检不该顺带把未提交的编辑写进 dbus），
+// 脚本后台跑十几秒（ping 三台解析器 + 两次 SOCKS5 请求），页面轮询结果文件。
+var _healthTimer = null;
+var _healthLeft = 0;
+function run_health() {
+	if (SESSION_LOST) { return; }
+	post_action("health", function() {
+		gid("health_result").innerHTML = "体检中…（十几秒）";
+		gid("health_out").style.display = "none";
+		poll_health(40);
+	}, "正在体检…", 1, true);
+}
+
+function poll_health(maxSec) {
+	if (_healthTimer) { clearTimeout(_healthTimer); _healthTimer = null; }
+	_healthLeft = maxSec;
+	step_health();
+}
+
+function step_health() {
+	_healthTimer = null;
+	if (SESSION_LOST) { return; }
+	if (_healthLeft-- <= 0) {
+		gid("health_result").innerHTML = "体检超时（也可能刚被会话过期打断），请稍后重试";
+		return;
+	}
+	probe_then(function() {
+		$.ajax({
+			url: "/_temp/phantom_health.txt",
+			type: "GET",
+			dataType: "text",
+			cache: false,
+			success: function(text) {
+				// 体检报告含「体检时间」行：拿到非空内容就显示，并继续刷新几轮
+				if (text && text.length > 40) {
+					gid("health_out").textContent = text;
+					gid("health_out").style.display = "";
+					gid("health_result").innerHTML = "体检完成（见下方报告）";
+					// 报告是后台脚本写的，可能还在追加：再刷新一次就停
+					if (_healthLeft > 30) {
+						_healthTimer = setTimeout(step_health, 3000);
+					}
+					return;
+				}
+				_healthTimer = setTimeout(step_health, 2000);
+			},
+			error: function() { _healthTimer = setTimeout(step_health, 2000); }
+		});
+	});
+}
+
 function clear_log() {
 	if (SESSION_LOST) { return; }
 	post_action(2, function() { get_log(); }, "正在清空日志…");
@@ -1357,6 +1408,15 @@ function reload_Soft_Center() {
 														<a id="speed_btn" type="button" class="ks_btn" style="width:auto;padding:5px 14px;" onclick="speedtest();">开始测速</a>
 														<span id="speed_result" class="phantom-hint" style="margin-left:10px;"></span>
 														<div class="phantom-hint">经 SOCKS5 127.0.0.1:1080 下载测速（默认 5MB 样本），得到的是 phantom 用户态转发吞吐上限；不含 LAN→TUN 的 NAT 转发路径，因此不等于客户端实测网速。日志里会给出「达到服务端带宽上限的百分之多少」的结论。</div>
+													</td>
+												</tr>
+												<tr>
+													<th>网络体检</th>
+													<td>
+														<a id="health_btn" type="button" class="ks_btn" style="width:auto;padding:5px 14px;" onclick="run_health();">一键网络体检</a>
+														<span id="health_result" class="phantom-hint" style="margin-left:10px;"></span>
+														<div class="phantom-hint">逐条核对：分流实况（规则/connmark/ipset）→ 国内解析器池（逐台可达与解析）→ 学习链 → IPv6/WebIP 泄漏面 → 冷/暖首连接耗时 → 性能快照。结果写入 <i>/_temp/phantom_health.txt</i>，十几秒后自动出现在下面。</div>
+														<pre id="health_out" class="phantom-log" style="display:none;margin-top:8px;max-height:340px;overflow:auto;"></pre>
 													</td>
 												</tr>
 											</table>

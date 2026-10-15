@@ -76,7 +76,8 @@ rm -f "${SCRIPTS_DIR}/${module}_config.sh" \
       "${SCRIPTS_DIR}/${module}_cron.sh" \
       "${SCRIPTS_DIR}/${module}_diag.sh" \
       "${SCRIPTS_DIR}/${module}_watchdog.sh" \
-      "${SCRIPTS_DIR}/${module}_perf.sh" >/dev/null 2>&1
+      "${SCRIPTS_DIR}/${module}_perf.sh" \
+      "${SCRIPTS_DIR}/${module}_health.sh" >/dev/null 2>&1
 rm -f "${BIN_DIR}/phantom" >/dev/null 2>&1
 rm -f /koolshare/webs/Module_${module}.asp >/dev/null 2>&1
 # 会话探针页（页面每次访问 httpdb 前的 .asp 预检；失效会话的 httpdb 请求
@@ -89,7 +90,7 @@ rm -f /koolshare/init.d/S98${module}.sh /koolshare/init.d/N98${module}.sh >/dev/
 # 运行期文件在 tmpfs（/tmp/upload 是页面的文本通道）；顺带清历史版本留下的
 # /tmp 直放文件与 docroot / /www/_temp 死软链
 rm -f /tmp/upload/phantom_log.txt /tmp/upload/phantom_status.txt >/dev/null 2>&1
-rm -f /tmp/upload/phantom_perf.log /tmp/phantom_perf.state >/dev/null 2>&1
+rm -f /tmp/upload/phantom_perf.log /tmp/upload/phantom_health.txt /tmp/phantom_perf.state >/dev/null 2>&1
 rm -f /tmp/phantom_log.txt /tmp/phantom_status.txt /tmp/phantom.pid /tmp/phantom_status.pid >/dev/null 2>&1
 rm -f "/koolshare/webs/phantom_status.txt" "/koolshare/webs/phantom_log.txt" >/dev/null 2>&1
 rm -f /www/_temp/phantom_log.txt /www/_temp/phantom_status.txt >/dev/null 2>&1
