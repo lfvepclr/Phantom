@@ -47,6 +47,15 @@ pub struct IpsetPublisher {
     /// Set entries observed in the kernel (approximate: what we pushed minus
     /// what has expired locally).
     pushed: AtomicU64,
+    /// Serialises `take_batch` + `push`: a concurrent drainer must not steal
+    /// the batch `publish_now` is about to write (see that method).
+    flush_lock: tokio::sync::Mutex<()>,
+    /// Worst wait a synchronous publish has cost, in ms.
+    publish_wait_ms: AtomicU64,
+    /// Tests only: skip the `ipset` fork and pretend the restore succeeded, so
+    /// the publish/ordering logic can be exercised without a kernel.
+    #[cfg(test)]
+    dry_run: bool,
 }
 
 impl IpsetPublisher {
@@ -59,6 +68,10 @@ impl IpsetPublisher {
             state: Mutex::new(State::default()),
             entries: AtomicU64::new(0),
             pushed: AtomicU64::new(0),
+            flush_lock: tokio::sync::Mutex::new(()),
+            publish_wait_ms: AtomicU64::new(0),
+            #[cfg(test)]
+            dry_run: false,
         });
         let task = Arc::clone(&publisher);
         tokio::spawn(async move { task.flush_loop().await });
@@ -73,6 +86,11 @@ impl IpsetPublisher {
     /// Total entries pushed since start (monotonic; handy for "is it learning?").
     pub fn pushed_total(&self) -> u64 {
         self.pushed.load(Ordering::Relaxed)
+    }
+
+    /// Worst synchronous publish wait seen so far, in milliseconds.
+    pub fn publish_wait_max_ms(&self) -> u64 {
+        self.publish_wait_ms.load(Ordering::Relaxed)
     }
 
     /// Queue destination addresses learned from a whitelisted DNS answer.
@@ -95,46 +113,97 @@ impl IpsetPublisher {
         }
     }
 
+    /// Publish now, and do not return until the kernel set contains these
+    /// addresses.
+    ///
+    /// **Why this exists.** `add_ips` only queues; the queue is drained once a
+    /// second by [`Self::flush_loop`]. The app receives the DNS answer
+    /// immediately, so on the very first connection of a session its SYN could
+    /// arrive while the kernel still had no entry for that address — the packet
+    /// took the direct path (and, for a censored destination, was reset there),
+    /// and only the app's retry landed in the tunnel. That is the "first time I
+    /// open Google it hiccups, then it is fine" report, and it is measurable:
+    /// non-SYN packets arriving for flows the TUN never saw are counted as
+    /// `phantom_tun_unknown_flow_rst_total`.
+    ///
+    /// Ordering guarantee: `flush_lock` is held across take-batch + push, so if
+    /// a background flush happens to be in flight, this call waits for it and
+    /// returns knowing the addresses are in the kernel (they were in the batch
+    /// that flush drained, or in ours). Already-known addresses are filtered by
+    /// [`Self::add_ips`], so the common repeat-query case costs no fork.
+    pub async fn publish_now(&self, ips: &[Ipv4Addr]) {
+        self.add_ips(ips);
+        let started = Instant::now();
+        {
+            let _guard = self.flush_lock.lock().await;
+            let batch = self.take_batch();
+            if !batch.is_empty() {
+                match self.push(&batch).await {
+                    Ok(()) => self.mark_pushed(&batch),
+                    Err(e) => {
+                        // Never fail the DNS answer over this: the background
+                        // loop retries, and a lookup that cannot be published
+                        // still resolves (its connection just goes direct).
+                        tracing::warn!("ipset {}: immediate publish failed: {}", self.name, e);
+                        self.requeue(&batch);
+                    }
+                }
+            }
+        }
+        self.publish_wait_ms
+            .fetch_max(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
     async fn flush_loop(&self) {
         let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
+            // Same lock as publish_now: whoever drains the queue is responsible
+            // for pushing it, so a concurrent publish_now can safely return
+            // once it has acquired this lock and found nothing left to do.
+            let _guard = self.flush_lock.lock().await;
             let batch = self.take_batch();
             if batch.is_empty() {
                 continue;
             }
             match self.push(&batch).await {
-                Ok(()) => {
-                    let now = Instant::now();
-                    let mut state = match self.state.lock() {
-                        Ok(s) => s,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    for ip in &batch {
-                        state.known.insert(*ip, now);
-                    }
-                    state
-                        .known
-                        .retain(|_, stamp| now.duration_since(*stamp) < self.ttl);
-                    self.entries
-                        .store(state.known.len() as u64, Ordering::Relaxed);
-                    self.pushed
-                        .fetch_add(batch.len() as u64, Ordering::Relaxed);
-                }
+                Ok(()) => self.mark_pushed(&batch),
                 Err(e) => {
                     // Put them back: the next tick retries, and a set that is
                     // missing entries must not look like a successful flush.
                     tracing::warn!("ipset {}: restore failed: {}", self.name, e);
-                    let mut state = match self.state.lock() {
-                        Ok(s) => s,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
-                    for ip in &batch {
-                        state.pending.insert(*ip);
-                    }
+                    self.requeue(&batch);
                 }
             }
+        }
+    }
+
+    /// Mark a pushed batch as armed and refresh the published set size.
+    fn mark_pushed(&self, batch: &[Ipv4Addr]) {
+        let now = Instant::now();
+        let mut state = match self.state.lock() {
+            Ok(s) => s,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for ip in batch {
+            state.known.insert(*ip, now);
+        }
+        state
+            .known
+            .retain(|_, stamp| now.duration_since(*stamp) < self.ttl);
+        self.entries
+            .store(state.known.len() as u64, Ordering::Relaxed);
+    }
+
+    /// Put a failed batch back so the background loop retries it.
+    fn requeue(&self, batch: &[Ipv4Addr]) {
+        let mut state = match self.state.lock() {
+            Ok(s) => s,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for ip in batch {
+            state.pending.insert(*ip);
         }
     }
 
@@ -149,6 +218,11 @@ impl IpsetPublisher {
     }
 
     async fn push(&self, batch: &[Ipv4Addr]) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.dry_run {
+            self.pushed.fetch_add(batch.len() as u64, Ordering::Relaxed);
+            return Ok(());
+        }
         let payload = restore_payload(&self.name, batch, self.ttl.as_secs() as u32);
         let mut child = tokio::process::Command::new("ipset")
             .arg("-!")
@@ -201,14 +275,7 @@ mod tests {
 
     #[test]
     fn add_ips_is_idempotent_within_the_ttl() {
-        let publisher = IpsetPublisher {
-            name: "phantom_proxy".into(),
-            ttl: Duration::from_secs(1800),
-            seeded: 0,
-            state: Mutex::new(State::default()),
-            entries: AtomicU64::new(0),
-            pushed: AtomicU64::new(0),
-        };
+        let publisher = test_publisher(0);
         let ip = Ipv4Addr::new(1, 2, 3, 4);
         publisher.add_ips(&[ip]);
         {
@@ -228,14 +295,61 @@ mod tests {
 
     #[test]
     fn entries_include_the_seeded_published_ranges() {
-        let publisher = IpsetPublisher {
+        let publisher = test_publisher(142);
+        publisher.entries.store(3, Ordering::Relaxed);
+        assert_eq!(publisher.entries(), 145);
+    }
+
+    /// A publisher that never forks `ipset` (see `dry_run`).
+    fn test_publisher(seeded: u64) -> IpsetPublisher {
+        IpsetPublisher {
             name: "phantom_proxy".into(),
             ttl: Duration::from_secs(1800),
-            seeded: 142,
+            seeded,
             state: Mutex::new(State::default()),
-            entries: AtomicU64::new(3),
-            pushed: AtomicU64::new(3),
-        };
-        assert_eq!(publisher.entries(), 145);
+            entries: AtomicU64::new(0),
+            pushed: AtomicU64::new(0),
+            flush_lock: tokio::sync::Mutex::new(()),
+            publish_wait_ms: AtomicU64::new(0),
+            dry_run: true,
+        }
+    }
+
+    /// The bug this method exists for: `add_ips` alone leaves the address in
+    /// `pending` for up to a second, while the app already has the DNS answer.
+    /// `publish_now` must not return before the kernel set is armed.
+    #[tokio::test]
+    async fn publish_now_arms_the_entry_before_returning() {
+        let publisher = test_publisher(0);
+        let ip = Ipv4Addr::new(142, 250, 0, 1);
+
+        publisher.add_ips(&[ip]);
+        assert_eq!(
+            publisher.state.lock().unwrap().known.len(),
+            0,
+            "add_ips must stay cheap: it only queues"
+        );
+
+        publisher.publish_now(&[ip]).await;
+        assert!(
+            publisher.state.lock().unwrap().known.contains_key(&ip),
+            "publish_now returned while the address was still unpublished"
+        );
+    }
+
+    /// A repeated DNS answer for an address that is already armed must not cost
+    /// an `ipset` fork (busy LANs ask for the same names constantly).
+    #[tokio::test]
+    async fn publish_now_skips_addresses_that_are_already_armed() {
+        let publisher = test_publisher(0);
+        let ip = Ipv4Addr::new(142, 250, 0, 1);
+        publisher.publish_now(&[ip]).await;
+        let after_first = publisher.pushed_total();
+        publisher.publish_now(&[ip]).await;
+        assert_eq!(
+            publisher.pushed_total(),
+            after_first,
+            "an already-armed address was pushed twice"
+        );
     }
 }

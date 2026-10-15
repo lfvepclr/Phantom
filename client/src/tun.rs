@@ -1034,9 +1034,15 @@ async fn deliver_dns_response(
         // that tells the kernel where to send this destination. Publishing it
         // here — before the response reaches the app — is what keeps the very
         // first connection of a session on the tunnel path.
+        //
+        // **必须是「发布完成」而不是「排入队列」。** add_ips 只把地址放进
+        // pending，真正落内核的是 1 秒一次的 flush_loop；而应答一出这个函数就
+        // 到客户端了，于是首个 SYN 可能赶在 ipset 生效之前发出去 —— 那一串包走
+        // 直连（被墙的目标就在这里被 RST），应用重试才进隧道，表现就是
+        // 「第一次打开某个站点要顿一下」。publish_now 会等到 ipset 真正跑完。
         if route == DnsRoute::Tunnel {
             if let Some(ipset) = &ipset {
-                ipset.add_ips(&ips);
+                ipset.publish_now(&ips).await;
             }
         }
         if !ips.is_empty() {
@@ -3621,6 +3627,30 @@ mod tests {
     /// This is the difference between "the app falls back to IPv4" and "the
     /// app retries an IPv6 address the tunnel exit cannot reach, forever" — the
     /// failure the operator reported as "google.com 打不开".
+    ///
+    /// 同源的顺序约束见下面的 `dns_answer_is_published_before_the_reply`。
+    #[test]
+    fn dns_answer_is_published_before_the_reply() {
+        // 这一条只能靠结构断言：deliver_dns_response 需要真的 TUN 才能端到端跑，
+        // 但它要守的顺序很关键 —— 白名单应答必须先落进内核 ipset，再写回给应用。
+        // 顺序反了就是「首个 SYN 走直连被 RST、重试才进隧道」的那个 bug。
+        let src = include_str!("tun.rs");
+        let body = src
+            .split("async fn deliver_dns_response")
+            .nth(1)
+            .expect("deliver_dns_response not found");
+        let publish = body
+            .find("publish_now(&ips)")
+            .expect("the DNS path no longer publishes into the ipset");
+        let reply = body
+            .find("build_dns_response_packet")
+            .expect("the DNS path no longer builds a reply");
+        assert!(
+            publish < reply,
+            "the ipset publish must happen before the answer is written back"
+        );
+    }
+
     #[test]
     fn aaaa_is_only_suppressed_for_tunnel_routed_queries() {
         let aaaa = Some(DNS_TYPE_AAAA);

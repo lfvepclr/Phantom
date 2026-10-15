@@ -51,9 +51,13 @@
 | 第 2 次 | 0.08 ms | 0.48 ms | 124 ms | 223 ms |
 | 第 3 次 | 0.09 ms | 0.42 ms | 127 ms | 228 ms |
 
-   3 次探测 = phantom_tunnel_connects_total +3，即每次都新建了外层隧道连接，TcpSessionPool
-   （TARGET_IDLE=2、MAX_IDLE_AGE=8s）并没有兜住冷启动；而池子的 PoolStats{created,reused}
-   目前没有暴露成 Prometheus 指标，真机上看不见命中率。
+   3 次探测 = phantom_tunnel_connects_total +3，但**这个计数是「每次转发尝试」而不是
+   「物理握手次数」**（`socks5.rs` 在 take/冷建分支之前就 +1，指标 HELP 文案写成
+   "Outer tunnel connections opened" 属于误导，本轮一并修正文案）——所以 +3 只能说明
+   三次都走了转发路径，**不能**证明每次都是冷连接。冷/暖 412ms 的差额究竟有多少来自
+   隧道握手，要靠新加的 `phantom_pool_*` 指标在真机上判定；在此之前不给结论。
+   （TcpSessionPool 的参数：TARGET_IDLE=2、MAX_IDLE_AGE=8s、REFILL_DELAY=150ms；
+   其 PoolStats{created,reused} 过去没有暴露成 Prometheus 指标，真机上看不见命中率。）
 
 ### 1.4 日志异常
 

@@ -83,6 +83,25 @@ pub struct TrafficStats {
     /// They are answered with RST so the app reconnects at once instead of
     /// waiting out its own retransmit timers.
     pub unknown_flow_rst: AtomicU64,
+
+    // ---- First-connection latency ----------------------------------------
+    //
+    // "为什么第一次打开某个站点会顿一下" 这个问题有两个可测量的来源：
+    // 一是 ipset 发布被推迟到 DNS 应答之后（首个 SYN 走了直连），
+    // 二是冷连接要现握手（池子里没有备用会话）。
+    // 前者用 ipset_publish_wait_ms 观察，后者用 pool_* 观察。
+    /// Worst wait for a synchronous ipset publish, in milliseconds.
+    ///
+    /// A whitelisted DNS answer is held until the kernel set actually contains
+    /// the address (see `IpsetPublisher::publish_now`), so this is a number the
+    /// user can feel.
+    pub ipset_publish_wait_ms: AtomicU64,
+    /// TCP tunnel sessions built by a handshake (cold flows + pool refills).
+    pub pool_created: AtomicU64,
+    /// Flows served by an already-handshaked pooled session.
+    pub pool_reused: AtomicU64,
+    /// Sessions currently waiting in the pool.
+    pub pool_idle: AtomicU64,
 }
 
 impl TrafficStats {
@@ -103,7 +122,8 @@ impl TrafficStats {
              \"retx_suppressed\":{},\"retx_budget_rst\":{},\"route_direct_failed\":{},\
              \"net_epoch_bumps\":{},\"flow_stall_drops\":{},\"tunnel_connects\":{},\"tunnel_connect_failures\":{},\
              \"direct_up\":{},\"direct_down\":{},\"tunnel_up\":{},\"tunnel_down\":{},\
-             \"ipset_entries\":{},\"kernel_split\":{},\"unknown_flow_rst\":{}}}",
+             \"ipset_entries\":{},\"kernel_split\":{},\"unknown_flow_rst\":{},\
+             \"ipset_publish_wait_ms\":{},\"pool_created\":{},\"pool_reused\":{},\"pool_idle\":{}}}",
             self.tcp_bytes_up.load(Ordering::Relaxed),
             self.tcp_bytes_down.load(Ordering::Relaxed),
             self.udp_bytes_up.load(Ordering::Relaxed),
@@ -130,6 +150,10 @@ impl TrafficStats {
             self.whitelist_ipset_entries.load(Ordering::Relaxed),
             self.gateway_kernel_split.load(Ordering::Relaxed),
             self.unknown_flow_rst.load(Ordering::Relaxed),
+            self.ipset_publish_wait_ms.load(Ordering::Relaxed),
+            self.pool_created.load(Ordering::Relaxed),
+            self.pool_reused.load(Ordering::Relaxed),
+            self.pool_idle.load(Ordering::Relaxed),
         )
     }
 
@@ -143,7 +167,8 @@ impl TrafficStats {
          \"retx_suppressed\":0,\"retx_budget_rst\":0,\"route_direct_failed\":0,\
          \"net_epoch_bumps\":0,\"flow_stall_drops\":0,\"tunnel_connects\":0,\"tunnel_connect_failures\":0,\
          \"direct_up\":0,\"direct_down\":0,\"tunnel_up\":0,\"tunnel_down\":0,\
-         \"ipset_entries\":0,\"kernel_split\":0,\"unknown_flow_rst\":0}"
+         \"ipset_entries\":0,\"kernel_split\":0,\"unknown_flow_rst\":0,\
+         \"ipset_publish_wait_ms\":0,\"pool_created\":0,\"pool_reused\":0,\"pool_idle\":0}"
             .to_string()
     }
 
@@ -262,6 +287,24 @@ impl TrafficStats {
         self.unknown_flow_rst.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record one synchronous ipset publish (see `IpsetPublisher::publish_now`).
+    ///
+    /// Only the worst case is kept: a publish that takes 200 ms is a DNS answer
+    /// the app waited 200 ms for, and averages would hide it inside a busy hour.
+    pub fn record_ipset_publish_wait(&self, millis: u64) {
+        self.ipset_publish_wait_ms
+            .fetch_max(millis, Ordering::Relaxed);
+    }
+
+    /// Mirror the TCP session pool's counters (idle is a level, the others are
+    /// monotonic). `reused` is the number that answers "did the pool actually
+    /// save anyone a handshake?".
+    pub fn set_pool_stats(&self, created: u64, reused: u64, idle: u64) {
+        self.pool_created.store(created, Ordering::Relaxed);
+        self.pool_reused.store(reused, Ordering::Relaxed);
+        self.pool_idle.store(idle, Ordering::Relaxed);
+    }
+
     /// Render stats in Prometheus exposition format.
     ///
     /// The TUN-health counters are included on purpose: "the tunnel is up but
@@ -289,7 +332,7 @@ impl TrafficStats {
              # HELP phantom_route_direct_failed_total Direct connects that timed out and fell back to the tunnel\n# TYPE phantom_route_direct_failed_total counter\nphantom_route_direct_failed_total {}\n\
              # HELP phantom_net_epoch_bumps_total Network changes that invalidated every in-flight flow\n# TYPE phantom_net_epoch_bumps_total counter\nphantom_net_epoch_bumps_total {}\n\
              # HELP phantom_flow_stall_drops_total Flows given up on after a stall (no acknowledgement progress)\n# TYPE phantom_flow_stall_drops_total counter\nphantom_flow_stall_drops_total {}\n\
-             # HELP phantom_tunnel_connects_total Outer tunnel connections opened\n# TYPE phantom_tunnel_connects_total counter\nphantom_tunnel_connects_total {}\n\
+             # HELP phantom_tunnel_connects_total Tunnel connect attempts, one per proxied flow (pooled sessions included)\n# TYPE phantom_tunnel_connects_total counter\nphantom_tunnel_connects_total {}\n\
              # HELP phantom_tunnel_connect_failures_total Outer tunnel connects that never produced a session\n# TYPE phantom_tunnel_connect_failures_total counter\nphantom_tunnel_connect_failures_total {}\n\
              # HELP phantom_direct_bytes_up Bytes taken from the LAN and sent to a destination **without** the tunnel (plaintext)\n# TYPE phantom_direct_bytes_up counter\nphantom_direct_bytes_up {}\n\
              # HELP phantom_direct_bytes_down Bytes received from a direct destination (plaintext)\n# TYPE phantom_direct_bytes_down counter\nphantom_direct_bytes_down {}\n\
@@ -297,7 +340,11 @@ impl TrafficStats {
              # HELP phantom_tunnel_bytes_down Bytes received from the encrypted tunnel\n# TYPE phantom_tunnel_bytes_down counter\nphantom_tunnel_bytes_down {}\n\
              # HELP phantom_whitelist_ipset_entries Destinations currently marked into the TUN by the kernel-split gateway\n# TYPE phantom_whitelist_ipset_entries gauge\nphantom_whitelist_ipset_entries {}\n\
              # HELP phantom_gateway_kernel_split 1 when only whitelisted destinations enter the TUN, 0 when every packet is relayed in user space\n# TYPE phantom_gateway_kernel_split gauge\nphantom_gateway_kernel_split {}\n\
-             # HELP phantom_tun_unknown_flow_rst_total Non-SYN packets for unknown flows answered with RST\n# TYPE phantom_tun_unknown_flow_rst_total counter\nphantom_tun_unknown_flow_rst_total {}\n",
+             # HELP phantom_tun_unknown_flow_rst_total Non-SYN packets for unknown flows answered with RST\n# TYPE phantom_tun_unknown_flow_rst_total counter\nphantom_tun_unknown_flow_rst_total {}\n\
+             # HELP phantom_ipset_publish_wait_max_ms Worst synchronous ipset publish (a DNS answer is held this long)\n# TYPE phantom_ipset_publish_wait_max_ms gauge\nphantom_ipset_publish_wait_max_ms {}\n\
+             # HELP phantom_pool_created_total TCP tunnel sessions built by a handshake (cold flows + pool refills)\n# TYPE phantom_pool_created_total counter\nphantom_pool_created_total {}\n\
+             # HELP phantom_pool_reused_total Flows served by an already-handshaked pooled session\n# TYPE phantom_pool_reused_total counter\nphantom_pool_reused_total {}\n\
+             # HELP phantom_pool_idle Sessions idle in the TCP session pool right now\n# TYPE phantom_pool_idle gauge\nphantom_pool_idle {}\n",
             self.tcp_bytes_up.load(Ordering::Relaxed),
             self.tcp_bytes_down.load(Ordering::Relaxed),
             self.udp_bytes_up.load(Ordering::Relaxed),
@@ -326,6 +373,10 @@ impl TrafficStats {
             self.whitelist_ipset_entries.load(Ordering::Relaxed),
             self.gateway_kernel_split.load(Ordering::Relaxed),
             self.unknown_flow_rst.load(Ordering::Relaxed),
+            self.ipset_publish_wait_ms.load(Ordering::Relaxed),
+            self.pool_created.load(Ordering::Relaxed),
+            self.pool_reused.load(Ordering::Relaxed),
+            self.pool_idle.load(Ordering::Relaxed),
         )
     }
 }
@@ -446,7 +497,8 @@ mod tests {
              \"retx_suppressed\":0,\"retx_budget_rst\":0,\"route_direct_failed\":0,\
              \"net_epoch_bumps\":0,\"flow_stall_drops\":0,\"tunnel_connects\":0,\"tunnel_connect_failures\":0,\
              \"direct_up\":0,\"direct_down\":0,\"tunnel_up\":0,\"tunnel_down\":0,\
-             \"ipset_entries\":0,\"kernel_split\":0,\"unknown_flow_rst\":0}"
+             \"ipset_entries\":0,\"kernel_split\":0,\"unknown_flow_rst\":0,\
+             \"ipset_publish_wait_ms\":0,\"pool_created\":0,\"pool_reused\":0,\"pool_idle\":0}"
         );
     }
 

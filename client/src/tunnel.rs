@@ -138,6 +138,7 @@ impl PhantomClient {
         self.verify().await?;
         self.prewarm_tcp_pool();
         self.tcp_pool.spawn_sweeper();
+        self.spawn_pool_metrics();
         let listener = self.bind_socks5().await?;
         self.spawn_health_check();
         self.spawn_metrics();
@@ -158,6 +159,7 @@ impl PhantomClient {
         self.verify().await?;
         self.prewarm_tcp_pool();
         self.tcp_pool.spawn_sweeper();
+        self.spawn_pool_metrics();
 
         // Bind SOCKS5 before touching the network configuration: a port clash
         // should fail cleanly rather than half-install a gateway.
@@ -226,7 +228,9 @@ impl PhantomClient {
 
         if let Some(ipset) = &ipset {
             proxy = proxy.with_ipset(std::sync::Arc::clone(ipset));
-            // Publish the set size for the UI/perf sampler.
+            // Publish the set size for the UI/perf sampler, plus the worst
+            // synchronous publish wait (a whitelisted DNS answer is held until
+            // the kernel set is armed, so that wait is user-visible latency).
             let stats = Arc::clone(&self.stats);
             let handle = std::sync::Arc::clone(ipset);
             tokio::spawn(async move {
@@ -234,6 +238,7 @@ impl PhantomClient {
                 loop {
                     ticker.tick().await;
                     stats.set_whitelist_ipset_entries(handle.entries());
+                    stats.record_ipset_publish_wait(handle.publish_wait_max_ms());
                 }
             });
         }
@@ -363,6 +368,26 @@ impl PhantomClient {
     /// Expose the TCP session pool (used by platform bridges and tests).
     pub fn tcp_pool(&self) -> Arc<TcpSessionPool> {
         Arc::clone(&self.tcp_pool)
+    }
+
+    /// Mirror the TCP session pool's counters into the metrics every 5 seconds.
+    ///
+    /// "Did the pool actually save anyone a handshake?" was unanswerable on a
+    /// real router before this: the numbers existed in-process and nowhere else,
+    /// so the first-connection cost (measured at 635 ms cold vs 223 ms warm)
+    /// could only be guessed at. `pool_reused` is the verdict.
+    fn spawn_pool_metrics(&self) {
+        let pool = Arc::clone(&self.tcp_pool);
+        let stats = Arc::clone(&self.stats);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                ticker.tick().await;
+                let counters = pool.stats();
+                let idle = pool.idle_count().await as u64;
+                stats.set_pool_stats(counters.created, counters.reused, idle);
+            }
+        });
     }
 
     /// Handshake one tunnel session before the first flow asks for it.
