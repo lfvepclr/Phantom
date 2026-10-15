@@ -156,6 +156,12 @@
   - -I 是前插，因此按逆序生成命令；teardown_plan 对称删除两条新规则。
 - 在途连接因此不再被中途拉进 TUN（unknown_flow_rst 停止增长），新连接仍按白名单进隧道。
 - 能力探测失败（无 conntrack/CONNMARK）回退旧规则并暴露 phantom_gateway_connmark。
+- **在真机（aarch64 Linux）上跑 gateway 单测**才发现：这个模块是 `#[cfg(target_os = "linux")]`，
+  macOS 上根本不编译、也从不运行，其中一个既有测试 `teardown_mirrors_every_added_rule`
+  **在 HEAD 上就是红的**（teardown 少了 `ip route del default dev … table …`，
+  只有 `ip route flush table`）。已补齐该删除步骤，23 项 gateway 测试全绿。
+  验证方式：`cargo build --tests --target aarch64-unknown-linux-musl -p phantom-client`，
+  把测试二进制丢到路由器上只跑 `gateway::`（纯字符串断言，不碰设备）。
 
 ### 2.6 采样修正 + 一键网络体检
 

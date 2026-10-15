@@ -565,6 +565,13 @@ cleanup_rules() {
         while iptables -t mangle -D PREROUTING -i "$iface" -m set \
             --match-set "${PHANTOM_IPSET:-phantom_proxy}" dst \
             -j MARK --set-mark "${PHANTOM_FWMARK:-1}" 2>/dev/null; do :; done
+        # connmark 形态（只标记新连接）的规则同样要兜底清掉：
+        # 残留的 restore-mark 会让"本来直连"的连接继续被旧 mark 影响路由。
+        while iptables -t mangle -D PREROUTING -i "$iface" -m conntrack --ctstate NEW \
+            -m set --match-set "${PHANTOM_IPSET:-phantom_proxy}" dst \
+            -j MARK --set-mark "${PHANTOM_FWMARK:-1}" -j CONNMARK --save-mark 2>/dev/null; do :; done
+        while iptables -t mangle -D PREROUTING -i "$iface" -m conntrack \
+            --ctstate ESTABLISHED,RELATED -j CONNMARK --restore-mark 2>/dev/null; do :; done
     done
     while ip rule del fwmark "${PHANTOM_FWMARK:-1}" lookup "$table" 2>/dev/null; do :; done
     ipset destroy "${PHANTOM_IPSET:-phantom_proxy}" 2>/dev/null

@@ -199,6 +199,9 @@ impl PhantomClient {
             self.stats.set_gateway_kernel_split(
                 gw.effective_mode() == crate::gateway::GatewayMode::KernelSplit,
             );
+            // 0 = 逐包标记（老固件无 conntrack/CONNMARK）：会话中途学到的地址
+            // 会打断在途连接。排查"看着看着断一下"时先看这个。
+            self.stats.set_gateway_connmark(gw.connmark_active());
             gw.ipset_name().map(|name| {
                 tracing::info!(
                     "kernel-split gateway active: ipset={} ttl={}s",

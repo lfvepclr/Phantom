@@ -202,6 +202,20 @@ pub struct GatewayConfig {
     /// and Google/YouTube via its published ranges) work before any DNS query
     /// has been observed.
     pub ipset_seed_cidrs: Vec<String>,
+    /// Keep an *established* connection on the path it started on, by marking
+    /// only new connections and saving the mark in conntrack
+    /// (`CONNMARK --save-mark` / `--restore-mark`).
+    ///
+    /// Why this matters: without it the marking rule matches **every** packet,
+    /// so the moment a whitelisted address is learned from DNS (mid-session),
+    /// the packets of a connection that has been flowing direct all along start
+    /// entering the TUN. The userspace stack only ever saw its ACKs, so it
+    /// answers RST (`phantom_tun_unknown_flow_rst_total`) and the app's
+    /// transfer dies — "the video stalls for a second, then it is fine".
+    ///
+    /// Probed at install time; turned off on firmware without
+    /// `conntrack`/`CONNMARK` (then the old per-packet behaviour applies).
+    pub connmark: bool,
 }
 
 impl Default for GatewayConfig {
@@ -218,6 +232,7 @@ impl Default for GatewayConfig {
             ipset_name: DEFAULT_IPSET_NAME.to_string(),
             fwmark: DEFAULT_FWMARK,
             ipset_seed_cidrs: crate::whitelist::builtin_ipv4_cidrs(),
+            connmark: true,
         }
     }
 }
@@ -392,10 +407,6 @@ impl GatewayConfig {
                 // TUN proxy, otherwise whitelisted domains never make it into
                 // the ipset and their connections stay on the direct path.
                 for proto in ["udp", "tcp"] {
-                    cmds.push(GatewayCommand::required(&format!(
-                        "iptables -t mangle -I PREROUTING -i {} -p {} --dport 53 -j MARK --set-mark {}",
-                        iface, proto, self.fwmark
-                    )));
                     cmds.push(GatewayCommand::best_effort(&format!(
                         "iptables -t nat -I PREROUTING -i {} -p {} --dport 53 -j DNAT --to-destination {}:53",
                         iface, proto, self.dns_sentinel
@@ -403,10 +414,48 @@ impl GatewayConfig {
                 }
             }
 
-            cmds.push(GatewayCommand::required(&format!(
-                "iptables -t mangle -I PREROUTING -i {} -m set --match-set {} dst -j MARK --set-mark {}",
-                iface, name, self.fwmark
-            )));
+            // **mangle PREROUTING 的插入顺序是反的。**
+            // `iptables -I` 前插，所以想让最终链读作
+            //     restore-mark → DNS(53) → 白名单(+save-mark)
+            // 就必须按相反的顺序下发（白名单 → tcp53 → udp53 → restore）。
+            //
+            // restore-mark 必须在最前面：DNS 规则是按端口逐包标记的，而 DNS 的
+            // conntrack 条目里保存的 mark 是 0（只有白名单规则才 save-mark）——
+            // 如果 restore 排在 DNS 规则后面，同一个源端口的后续查询会被它重置成 0，
+            // 那些查询就走直连了，域名也就学不到。
+            if self.connmark {
+                // 新建连接才标 + 把 mark 存进 conntrack。
+                // **这是"在途连接不被打断"的关键**：没有 ctstate 限制时，白名单里
+                // 的地址一旦在会话中途被 DNS 学到，一条本来走直连的连接会被逐包
+                // 拽进 TUN，而用户态从没见过它的 SYN，只能回 RST
+                // （phantom_tun_unknown_flow_rst_total）。表现就是"看着看着断一下"。
+                cmds.push(GatewayCommand::required(&format!(
+                    "iptables -t mangle -I PREROUTING -i {} -m conntrack --ctstate NEW -m set --match-set {} dst -j MARK --set-mark {} -j CONNMARK --save-mark",
+                    iface, name, self.fwmark
+                )));
+            } else {
+                cmds.push(GatewayCommand::required(&format!(
+                    "iptables -t mangle -I PREROUTING -i {} -m set --match-set {} dst -j MARK --set-mark {}",
+                    iface, name, self.fwmark
+                )));
+            }
+            if self.lan_dns_hijack {
+                // tcp 先插、udp 后插 → 最终顺序是 udp 在前、tcp 在后（无所谓，两者同 mark）
+                for proto in ["tcp", "udp"] {
+                    cmds.push(GatewayCommand::required(&format!(
+                        "iptables -t mangle -I PREROUTING -i {} -p {} --dport 53 -j MARK --set-mark {}",
+                        iface, proto, self.fwmark
+                    )));
+                }
+            }
+            if self.connmark {
+                // 已建立/相关连接恢复它创建时的 mark：本来就直连的保持直连，
+                // 本来就进隧道的继续进隧道 —— 中途学到新地址不会改变既有连接的路由。
+                cmds.push(GatewayCommand::best_effort(&format!(
+                    "iptables -t mangle -I PREROUTING -i {} -m conntrack --ctstate ESTABLISHED,RELATED -j CONNMARK --restore-mark",
+                    iface
+                )));
+            }
         }
     }
 
@@ -435,6 +484,16 @@ impl GatewayConfig {
             cmds.push(GatewayCommand::best_effort(&format!(
                 "iptables -t mangle -D PREROUTING -i {} -m set --match-set {} dst -j MARK --set-mark {}",
                 iface, self.ipset_name, self.fwmark
+            )));
+            // connmark 版本的规则：两个形态都删，升级/切换模式时都不能留残渣
+            // （残留的 restore-mark 会让"本来直连"的连接继续被旧 mark 影响）。
+            cmds.push(GatewayCommand::best_effort(&format!(
+                "iptables -t mangle -D PREROUTING -i {} -m conntrack --ctstate NEW -m set --match-set {} dst -j MARK --set-mark {} -j CONNMARK --save-mark",
+                iface, self.ipset_name, self.fwmark
+            )));
+            cmds.push(GatewayCommand::best_effort(&format!(
+                "iptables -t mangle -D PREROUTING -i {} -m conntrack --ctstate ESTABLISHED,RELATED -j CONNMARK --restore-mark",
+                iface
             )));
             cmds.push(GatewayCommand::best_effort(&format!(
                 "iptables -D FORWARD -i {} -o {} -j ACCEPT",
@@ -465,6 +524,13 @@ impl GatewayConfig {
             "ip route flush table {}",
             self.table_id
         )));
+        // `flush` 已经把它清掉了；这条是显式镜像安装时的 `ip route add default`，
+        // 让「每条 add 都有对应的 del」这个不变量成立（teardown_mirrors_every_added_rule
+        // 就是靠它守住的），删不到时 best-effort 静默通过。
+        cmds.push(GatewayCommand::best_effort(&format!(
+            "ip route del default dev {} table {}",
+            self.tun_name, self.table_id
+        )));
         cmds.push(GatewayCommand::best_effort(&format!(
             "ipset destroy {}",
             self.ipset_name
@@ -494,6 +560,17 @@ impl Gateway {
     /// duplicate `ip rule` entries behind.
     pub fn install(config: GatewayConfig) -> Result<Self> {
         let requested = config.mode;
+        // Probe once: a firmware without `conntrack`/`CONNMARK` must fall back
+        // to the old per-packet marking rather than failing to install at all
+        // (the ipset path itself still works there).
+        let mut config = config;
+        if config.mode == GatewayMode::KernelSplit && config.connmark && !connmark_supported() {
+            tracing::warn!(
+                "conntrack/CONNMARK unavailable: falling back to per-packet marking \
+                 (an address learned mid-session can reset an in-flight connection)"
+            );
+            config.connmark = false;
+        }
         match Self::try_install(config.clone()) {
             Ok(gateway) => Ok(gateway),
             Err(e) if requested == GatewayMode::KernelSplit => {
@@ -595,6 +672,12 @@ impl Gateway {
         self.config.ipset_seed_cidrs.len() as u64
     }
 
+    /// Whether only *new* connections are marked (conntrack-backed), i.e. an
+    /// address learned mid-session cannot reset a running transfer.
+    pub fn connmark_active(&self) -> bool {
+        self.effective_mode == GatewayMode::KernelSplit && self.config.connmark
+    }
+
     /// Populated when kernel-split was requested but relay had to be used.
     pub fn fallback_reason(&self) -> Option<&str> {
         self.fallback_reason.as_deref()
@@ -624,6 +707,22 @@ impl Drop for Gateway {
     fn drop(&mut self) {
         self.uninstall();
     }
+}
+
+/// Whether this firmware can do conntrack-backed marking.
+///
+/// Both halves are required: `-m conntrack` for the state match and the
+/// `CONNMARK` target to save/restore the mark. `/proc/net/ip_tables_matches`
+/// and `_targets` list exactly what the kernel was built with, and reading them
+/// needs no privileges — unlike poking iptables and interpreting the error.
+fn connmark_supported() -> bool {
+    let has = |path: &str, needle: &str| {
+        std::fs::read_to_string(path)
+            .map(|body| body.lines().any(|l| l.trim() == needle))
+            .unwrap_or(false)
+    };
+    has("/proc/net/ip_tables_matches", "conntrack")
+        && has("/proc/net/ip_tables_targets", "CONNMARK")
 }
 
 fn run_command(cmd: &GatewayCommand) -> Result<()> {
@@ -901,8 +1000,14 @@ mod tests {
         let lines = plan_lines(&GatewayConfig::default());
         assert!(
             lines.iter().any(|l| l
-                == "iptables -t mangle -I PREROUTING -i br0 -m set --match-set phantom_proxy dst -j MARK --set-mark 1"),
+                == "iptables -t mangle -I PREROUTING -i br0 -m conntrack --ctstate NEW -m set --match-set phantom_proxy dst -j MARK --set-mark 1 -j CONNMARK --save-mark"),
             "whitelist match rule missing: {lines:#?}"
+        );
+        // 只有白名单目标进隧道 —— 逐包标记的老形态必须已经不在了。
+        assert!(
+            lines.iter().all(|l| l
+                != "iptables -t mangle -I PREROUTING -i br0 -m set --match-set phantom_proxy dst -j MARK --set-mark 1"),
+            "per-packet marking is still present: {lines:#?}"
         );
         assert!(lines.contains(&"ip rule add fwmark 1 lookup 200 priority 9050".to_string()));
         // The catch-all that made every packet visit user space must be gone.
@@ -912,6 +1017,86 @@ mod tests {
         );
         // …and the private-range bypass is unnecessary once selection is by mark.
         assert!(lines.iter().all(|l| !l.contains("lookup main priority 9040")));
+    }
+
+    /// 白名单里的地址是**会话中途**才被 DNS 学到的。如果规则匹配每一包，
+    /// 一条本来走直连的连接会被逐包拽进 TUN，而用户态从没见过它的 SYN，
+    /// 只能回 RST（phantom_tun_unknown_flow_rst_total）—— 这就是
+    /// 「看着看着断一下」的机制。所以标记必须限定在新建连接上，并把 mark
+    /// 存进 conntrack，让既有连接继续走它原来的路。
+    #[test]
+    fn kernel_split_marks_only_new_connections_and_saves_the_mark() {
+        let lines = plan_lines(&GatewayConfig::default());
+        let whitelist = lines
+            .iter()
+            .find(|l| l.contains("--match-set phantom_proxy"))
+            .expect("whitelist rule missing");
+        assert!(
+            whitelist.contains("-m conntrack --ctstate NEW"),
+            "whitelist marking must be limited to new connections: {whitelist}"
+        );
+        assert!(
+            whitelist.contains("-j CONNMARK --save-mark"),
+            "the mark must be saved so the flow keeps its path: {whitelist}"
+        );
+        assert!(
+            lines.iter().any(|l| l
+                .contains("-m conntrack --ctstate ESTABLISHED,RELATED -j CONNMARK --restore-mark")),
+            "established connections must restore their saved mark: {lines:#?}"
+        );
+    }
+
+    /// `-I` 是前插：计划里的顺序 = 最终链的**倒序**。restore-mark 必须在最终链
+    /// 的最前面（DNS 规则按端口逐包标记、而 DNS 的 conntrack mark 是 0，
+    /// restore 排到它后面会把同一源端口的后续查询重置成直连，域名就学不到了），
+    /// 所以在计划里它必须是最后一条。
+    #[test]
+    fn connmark_restore_is_inserted_last_so_it_is_evaluated_first() {
+        let lines = plan_lines(&GatewayConfig::default());
+        let mangle: Vec<&String> = lines
+            .iter()
+            .filter(|l| l.contains("-t mangle -I PREROUTING"))
+            .collect();
+        let restore_at = mangle
+            .iter()
+            .position(|l| l.contains("--restore-mark"))
+            .expect("restore rule missing");
+        let whitelist_at = mangle
+            .iter()
+            .position(|l| l.contains("--match-set phantom_proxy"))
+            .expect("whitelist rule missing");
+        let dns_at = mangle
+            .iter()
+            .position(|l| l.contains("--dport 53 -j MARK"))
+            .expect("dns mark rule missing");
+        assert!(
+            whitelist_at < restore_at,
+            "restore-mark must be inserted after the whitelist rule: {mangle:#?}"
+        );
+        assert!(
+            dns_at < restore_at,
+            "restore-mark must be inserted after the DNS rules: {mangle:#?}"
+        );
+    }
+
+    /// 老固件可能没有 xt_conntrack / CONNMARK：那时退回逐包标记（ipset 分流
+    /// 本身还能用），至少不能装不上。
+    #[test]
+    fn kernel_split_without_conntrack_uses_per_packet_marking() {
+        let config = GatewayConfig {
+            connmark: false,
+            ..GatewayConfig::default()
+        };
+        let lines = plan_lines(&config);
+        assert!(
+            lines.iter().any(|l| l
+                == "iptables -t mangle -I PREROUTING -i br0 -m set --match-set phantom_proxy dst -j MARK --set-mark 1"),
+            "legacy per-packet rule missing: {lines:#?}"
+        );
+        assert!(
+            lines.iter().all(|l| !l.contains("CONNMARK")),
+            "no CONNMARK rules may be planned when it is unsupported: {lines:#?}"
+        );
     }
 
     #[test]

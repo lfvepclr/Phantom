@@ -338,7 +338,7 @@ LAN 客户端 ──转发──▶ ip rule iif br0 ─▶ table 200 ─▶ defa
 
 | 模式 | 规则 | 数据流 | 直连流量 |
 |---|---|---|---|
-| `kernel-split`（默认） | ipset `phantom_proxy` + `iptables -t mangle … MARK` + `ip rule fwmark 0x1`；另单独标记 53 端口进隧道 | 命中白名单/53 的包才进 `phantom0` | **不进 TUN**，留在 `main` 表，走内核（Broadcom 上还有 Runner/Flow Cache 硬件加速） |
+| `kernel-split`（默认） | ipset `phantom_proxy` + `iptables -t mangle … MARK` + `ip rule fwmark 0x1`；另单独标记 53 端口进隧道。标记**只作用于新建连接**（`--ctstate NEW` + `CONNMARK --save-mark`），已建立连接靠 `CONNMARK --restore-mark` 走回它创建时的路 | 命中白名单/53 的**新连接**才进 `phantom0` | **不进 TUN**，留在 `main` 表，走内核（Broadcom 上还有 Runner/Flow Cache 硬件加速） |
 | `relay`（兼容） | `ip rule iif br0 lookup 200` | 全部 LAN 转发流量进 `phantom0`，逐连接在用户态判定 | 也进 TUN，由 `tcp_direct_relay_task` 明文转发 |
 
 为什么默认 kernel-split：实测同一台 RT-AX86U Pro，本机内核路径 8 路并行 420 Mbps，
@@ -353,6 +353,14 @@ A 记录批量写入 ipset，1s 合并、30 min 超时）、内置 CIDR（`clien
 
 直连是否被加密，可用数据自证：`phantom_direct_bytes_*` 与 `phantom_tunnel_bytes_*`
 是两套独立计数，只有后者进 AEAD 与服务端。
+
+**为什么标记要带 conntrack**：白名单地址是**会话中途**由 DNS 学到的。如果规则逐包
+匹配 ipset，一条本来走直连的连接会被逐包拽进 TUN，而用户态从没见过它的 SYN，
+只能回 RST（`phantom_tun_unknown_flow_rst_total` 会一路涨）—— 现象是"视频看着看着
+断一下再自己重连"。改成「只标记新连接 + 把 mark 存进 conntrack + 已建立连接恢复
+自己的 mark」之后，在途连接不再被打断，新连接照旧按白名单进隧道。
+固件缺 `xt_conntrack`/`CONNMARK` 时自动退回逐包标记，并由 `phantom_gateway_connmark`
+= 0 暴露出来。
 
 ### 7.0.1 koolshare 软件中心插件（路由器控制面）
 

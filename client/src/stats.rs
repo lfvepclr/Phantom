@@ -110,6 +110,12 @@ pub struct TrafficStats {
     pub dns_direct_failovers: AtomicU64,
     /// Queries abandoned after every resolver timed out.
     pub dns_direct_timeouts: AtomicU64,
+    /// 1 when the kernel-split gateway marks only *new* connections
+    /// (conntrack-backed), 0 when it falls back to per-packet marking.
+    ///
+    /// 0 意味着「会话中途学到的白名单地址会打断在途连接」，是排查
+    /// "看着看着断一下" 时第一个要看的开关。
+    pub gateway_connmark: AtomicU64,
 }
 
 impl TrafficStats {
@@ -132,7 +138,8 @@ impl TrafficStats {
              \"direct_up\":{},\"direct_down\":{},\"tunnel_up\":{},\"tunnel_down\":{},\
              \"ipset_entries\":{},\"kernel_split\":{},\"unknown_flow_rst\":{},\
              \"ipset_publish_wait_ms\":{},\"pool_created\":{},\"pool_reused\":{},\"pool_idle\":{},\
-             \"dns_direct_active\":{},\"dns_direct_failovers\":{},\"dns_direct_timeouts\":{}}}",
+             \"dns_direct_active\":{},\"dns_direct_failovers\":{},\"dns_direct_timeouts\":{},\
+             \"gateway_connmark\":{}}}",
             self.tcp_bytes_up.load(Ordering::Relaxed),
             self.tcp_bytes_down.load(Ordering::Relaxed),
             self.udp_bytes_up.load(Ordering::Relaxed),
@@ -166,6 +173,7 @@ impl TrafficStats {
             self.dns_direct_active.load(Ordering::Relaxed),
             self.dns_direct_failovers.load(Ordering::Relaxed),
             self.dns_direct_timeouts.load(Ordering::Relaxed),
+            self.gateway_connmark.load(Ordering::Relaxed),
         )
     }
 
@@ -181,7 +189,8 @@ impl TrafficStats {
          \"direct_up\":0,\"direct_down\":0,\"tunnel_up\":0,\"tunnel_down\":0,\
          \"ipset_entries\":0,\"kernel_split\":0,\"unknown_flow_rst\":0,\
          \"ipset_publish_wait_ms\":0,\"pool_created\":0,\"pool_reused\":0,\"pool_idle\":0,\
-         \"dns_direct_active\":0,\"dns_direct_failovers\":0,\"dns_direct_timeouts\":0}"
+         \"dns_direct_active\":0,\"dns_direct_failovers\":0,\"dns_direct_timeouts\":0,\
+         \"gateway_connmark\":0}"
             .to_string()
     }
 
@@ -334,6 +343,11 @@ impl TrafficStats {
         self.dns_direct_timeouts.fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn set_gateway_connmark(&self, on: bool) {
+        self.gateway_connmark
+            .store(u64::from(on), Ordering::Relaxed);
+    }
+
     /// Render stats in Prometheus exposition format.
     ///
     /// The TUN-health counters are included on purpose: "the tunnel is up but
@@ -376,7 +390,8 @@ impl TrafficStats {
              # HELP phantom_pool_idle Sessions idle in the TCP session pool right now\n# TYPE phantom_pool_idle gauge\nphantom_pool_idle {}\n\
              # HELP phantom_dns_direct_active Index of the preferred direct-path DNS resolver (0 = first in client.dns_direct)\n# TYPE phantom_dns_direct_active gauge\nphantom_dns_direct_active {}\n\
              # HELP phantom_dns_direct_failovers_total DNS queries re-sent through another resolver after a timeout\n# TYPE phantom_dns_direct_failovers_total counter\nphantom_dns_direct_failovers_total {}\n\
-             # HELP phantom_dns_direct_timeouts_total DNS queries abandoned after every resolver in the pool timed out\n# TYPE phantom_dns_direct_timeouts_total counter\nphantom_dns_direct_timeouts_total {}\n",
+             # HELP phantom_dns_direct_timeouts_total DNS queries abandoned after every resolver in the pool timed out\n# TYPE phantom_dns_direct_timeouts_total counter\nphantom_dns_direct_timeouts_total {}\n\
+             # HELP phantom_gateway_connmark 1 when only new connections are marked (in-flight flows keep their path); 0 = per-packet marking\n# TYPE phantom_gateway_connmark gauge\nphantom_gateway_connmark {}\n",
             self.tcp_bytes_up.load(Ordering::Relaxed),
             self.tcp_bytes_down.load(Ordering::Relaxed),
             self.udp_bytes_up.load(Ordering::Relaxed),
@@ -412,6 +427,7 @@ impl TrafficStats {
             self.dns_direct_active.load(Ordering::Relaxed),
             self.dns_direct_failovers.load(Ordering::Relaxed),
             self.dns_direct_timeouts.load(Ordering::Relaxed),
+            self.gateway_connmark.load(Ordering::Relaxed),
         )
     }
 }
@@ -534,7 +550,8 @@ mod tests {
              \"direct_up\":0,\"direct_down\":0,\"tunnel_up\":0,\"tunnel_down\":0,\
              \"ipset_entries\":0,\"kernel_split\":0,\"unknown_flow_rst\":0,\
              \"ipset_publish_wait_ms\":0,\"pool_created\":0,\"pool_reused\":0,\"pool_idle\":0,\
-             \"dns_direct_active\":0,\"dns_direct_failovers\":0,\"dns_direct_timeouts\":0}"
+             \"dns_direct_active\":0,\"dns_direct_failovers\":0,\"dns_direct_timeouts\":0,\
+             \"gateway_connmark\":0}"
         );
     }
 
