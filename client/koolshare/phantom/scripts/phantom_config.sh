@@ -12,6 +12,8 @@
 #   status       打印状态
 #   start_nat    nat-start 兜底（规则被冲掉时重启补回）
 #   ks <0|1>     兼容入口（真实固件的开机路径是 init.d/S98phantom.sh start）
+#   start_force  无视总开关强制启动（唯一例外，供安装脚本/SSH 排障）
+#   cleanup      关闭状态下清理残留进程/规则/定时任务（页面「一键修复」）
 #   cron         重注册定时重启与看门狗
 #   diag         输出诊断信息
 #
@@ -70,6 +72,23 @@ else
 fi
 # tracing 默认输出 ANSI 颜色，重定向到文件后会影响 grep/展示
 export NO_COLOR=1
+
+# ---------------------------------------------------------------- 触发源
+#
+# 「谁把它拉起来的」是开关类问题的第一现场：真机上曾经出现「关掉插件→重启
+# 路由器→自己又开了」，而日志里只有一句「启动成功」，看不出是开机钩子干的还是
+# cron 干的。触发源用两种方式确定：
+#   1) 显式环境变量 PHANTOM_TRIGGER（cron / 看门狗 / 安装脚本 / 页面）；
+#   2) $0 是 init.d 里的软链时直接认出来（S98=开机、N98=nat-start）。
+TRIGGER="${PHANTOM_TRIGGER:-}"
+if [ -z "$TRIGGER" ]; then
+    case "$0" in
+        */init.d/S98*) TRIGGER="boot" ;;
+        */init.d/N98*) TRIGGER="nat" ;;
+    esac
+fi
+[ -n "$TRIGGER" ] || TRIGGER="user"
+export PHANTOM_TRIGGER="$TRIGGER"
 
 mkdir -p "${RUNTIME_DIR}/etc" 2>/dev/null
 # 页面要读的两个文件必须能建出来；/tmp/upload 建不出来时退回 /tmp 并告警
@@ -168,6 +187,17 @@ log_line() {
     # PHANTOM_QUIET=1：被软件中心 POST 调用的路径不回显 stdout。
     # 那个请求的响应体被前端按 JSON 解析，混进文本会解析失败。
     [ "${PHANTOM_QUIET:-0}" = "1" ] || echo "$*"
+}
+
+# 带触发源的动作日志：start/stop 这类状态迁移一律用它，
+# 以后再看日志就能回答「是开机钩子、cron、看门狗还是人点的」。
+log_act() {
+    log_line "[${TRIGGER}] $*"
+}
+
+# 「上次动作」里也带上触发源：页面第一眼就能看出这次是谁开的。
+last_act_now() {
+    printf '%s %s（%s）' "$1" "$(date '+%m-%d %H:%M:%S')" "$TRIGGER"
 }
 
 # ---------------------------------------------------------------- 软件中心回包
@@ -451,7 +481,12 @@ is_healthy() {
 # 状态文件始终存在（内容是合法的「未运行」文档），
 # 页面第一次轮询就是 200，不会刷一屏 404
 write_zero_status() {
-    printf '%s\n' '{"ts":0,"running":0,"up_rate":0,"down_rate":0,"total_up":0,"total_down":0,"udp_up":0,"udp_down":0,"conns":0,"direct":0,"proxy":0,"cpu":0}' >"$STATUS_JSON" 2>/dev/null
+    # ts 用当前时间而不是 0：页面靠「ts 是否继续推进」判断采样进程死没死，
+    # 而这份「已停止」是刚刚真实写下的，不该被当成过期数据。
+    # rules/proc/trigger 一并给全，页面的「期望/实际」核对才有依据。
+    printf '%s\n' \
+        "{\"ts\":$(date +%s),\"running\":0,\"up_rate\":0,\"down_rate\":0,\"total_up\":0,\"total_down\":0,\"udp_up\":0,\"udp_down\":0,\"conns\":0,\"direct\":0,\"proxy\":0,\"cpu\":0,\"gw\":\"-\",\"ipset\":0,\"fd\":0,\"fdl\":0,\"rules\":0,\"proc\":0,\"trigger\":\"\",\"last_act\":\"$(get_cfg last_act | tr -d '\"')\"}" \
+        >"$STATUS_JSON" 2>/dev/null
     chmod 644 "$STATUS_JSON" 2>/dev/null
 }
 
@@ -552,12 +587,16 @@ stop() {
     remove_doh_block
     if ! is_running; then
         rm -f "$PIDFILE"
-        log_line "服务未运行"
+        log_act "服务未运行"
         # 这里**不能提前 return**：进程可能早就崩了/被 OOM 杀了，
         # 它装的 ip rule / iptables 不会自己消失 —— 那正是「全屋断网」的形态。
         cleanup_rules
+        set_cfg run_trigger ""
+        set_cfg last_act "$(last_act_now 已停止)"
         write_zero_status
-        set_cfg last_act "已停止 $(date '+%m-%d %H:%M:%S')"
+        # 关掉之后必须顺手把「定时重启」摘掉，否则明天 4:30 它会自己再开回来
+        # （真机实测过：日志里 04:30:02 服务已停止 → 04:30:06 启动成功）。
+        register_cron
         return 0
     fi
     pid=$(cat "$PIDFILE" 2>/dev/null)
@@ -571,27 +610,38 @@ stop() {
         i=$((i + 1))
     done
     if kill -0 "$pid" 2>/dev/null; then
-        log_line "进程未在 3s 内退出，发送 SIGKILL"
+        log_act "进程未在 3s 内退出，发送 SIGKILL"
         kill -9 "$pid" 2>/dev/null
     fi
     rm -f "$PIDFILE"
     # 无条件再清一次：优雅退出时由被控进程自己回滚是理想情况，
     # 但它卡死/被 SIGKILL 时就回滚不了，规则会永久留在内核里。
     cleanup_rules
+    log_act "服务已停止"
+    set_cfg run_trigger ""
+    set_cfg last_act "$(last_act_now 已停止)"
     write_zero_status
-    log_line "服务已停止"
-    set_cfg last_act "已停止 $(date '+%m-%d %H:%M:%S')"
+    register_cron
     return 0
 }
 
 start() {
+    # **关就是关。**
+    # 开机钩子（init.d/S98 → ks-wan-start.sh start）、cron 的定时重启、看门狗都会
+    # 走到这里；如果 start 不看总开关，「关掉插件→重启路由器」就会自己开回来，
+    # 用户永远说不清到底关没关。唯一例外是 start_force（安装脚本与 SSH 排障）。
+    if [ "${FORCE_START:-0}" != "1" ] && [ "$(get_cfg enable)" != "1" ]; then
+        log_act "插件处于关闭状态，忽略 start"
+        set_cfg last_act "$(last_act_now 已关闭，忽略启动)"
+        return 0
+    fi
     if is_running; then
         if is_healthy; then
             # 早退也必须补写 last_act / 拉起采样 / 同步定时任务：
             # 页面读的是 last_act，这里不写，页面就永远停在「正在启动…」，
             # 前端等不到结果 → 报「后台执行失败」，而隧道其实一直是好的。
-            log_line "服务已在运行且健康（pid $(cat "$PIDFILE" 2>/dev/null)）"
-            set_cfg last_act "已启动 $(date '+%m-%d %H:%M:%S')"
+            log_act "服务已在运行且健康（pid $(cat "$PIDFILE" 2>/dev/null)）"
+            set_cfg last_act "$(last_act_now 已启动)"
             start_status_loop
             register_cron
             return 0
@@ -599,26 +649,26 @@ start() {
         # 进程还在但 metrics 不通 = 僵死。它劫持的规则还指着 tun，
         # 必须先彻底拆掉（stop 会清 ip rule/iptables）再重新拉起，
         # 否则只是在黑洞上再叠一个。
-        log_line "检测到进程僵死（metrics 无响应），强制重启"
+        log_act "检测到进程僵死（metrics 无响应），强制重启"
         stop
     fi
     if [ ! -x "$BIN" ]; then
-        log_line "错误：二进制不存在或不可执行：$BIN"
-        set_cfg last_act "启动失败：缺少二进制"
+        log_act "错误：二进制不存在或不可执行：$BIN"
+        set_cfg last_act "$(last_act_now 启动失败：缺少二进制)"
         return 1
     fi
 
     uri=$(get_cfg uri)
     if [ -z "$uri" ]; then
-        log_line "错误：未配置连接串（phantom_uri）"
-        set_cfg last_act "启动失败：未配置连接串"
+        log_act "错误：未配置连接串（phantom_uri）"
+        set_cfg last_act "$(last_act_now 启动失败：未配置连接串)"
         return 1
     fi
     case "$uri" in
         phantom://*) ;;
         *)
-            log_line "错误：连接串必须以 phantom:// 开头"
-            set_cfg last_act "启动失败：连接串格式错误"
+            log_act "错误：连接串必须以 phantom:// 开头"
+            set_cfg last_act "$(last_act_now 启动失败：连接串格式错误)"
             return 1
             ;;
     esac
@@ -644,7 +694,7 @@ start() {
 
     # 连接串含密钥，日志里只留 host 部分
     safe_uri=$(printf '%s' "$uri" | sed 's|^\(phantom://\)[^@]*@|\1***@|')
-    log_line "启动 Phantom（模式 $(get_cfg mode)，协议 ${proto}，服务端 ${safe_uri}）"
+    log_act "启动 Phantom（模式 $(get_cfg mode)，协议 ${proto}，服务端 ${safe_uri}）"
 
     write_toml
     write_domains
@@ -652,8 +702,8 @@ start() {
     # OpenVPN 会在 Asuswrt 上带出 tun 模块，这里兜底加载一次
     [ -c /dev/net/tun ] || modprobe tun 2>/dev/null
     if [ ! -c /dev/net/tun ]; then
-        log_line "错误：/dev/net/tun 不可用（请在 Web UI 开一次 OpenVPN 客户端或 insmod tun）"
-        set_cfg last_act "启动失败：TUN 不可用"
+        log_act "错误：/dev/net/tun 不可用（请在 Web UI 开一次 OpenVPN 客户端或 insmod tun）"
+        set_cfg last_act "$(last_act_now 启动失败：TUN 不可用)"
         return 1
     fi
 
@@ -674,21 +724,22 @@ start() {
     # Hello 校验在装路由规则之前，给 3s 让失败能在这里暴露
     sleep 3
     if is_running; then
-        log_line "启动成功（pid $(cat "$PIDFILE" 2>/dev/null)）"
-        set_cfg last_act "已启动 $(date '+%m-%d %H:%M:%S')"
+        log_act "启动成功（pid $(cat "$PIDFILE" 2>/dev/null)）"
+        set_cfg run_trigger "$TRIGGER"
+        set_cfg last_act "$(last_act_now 已启动)"
         start_status_loop
         register_cron
         if [ "$(get_cfg block_doh)" != "0" ]; then
             apply_doh_block
-            log_line "已拦截 LAN 侧加密 DNS（DoT/DoH），保证域名分流可学习（可在页面关闭）"
+            log_act "已拦截 LAN 侧加密 DNS（DoT/DoH），保证域名分流可学习（可在页面关闭）"
         fi
         return 0
     fi
 
     rm -f "$PIDFILE"
-    log_line "启动失败，最近日志："
+    log_act "启动失败，最近日志："
     tail -n 15 "$LOG" 2>/dev/null | while read -r l; do log_line "  $l"; done
-    set_cfg last_act "启动失败 $(date '+%m-%d %H:%M:%S')，请看日志"
+    set_cfg last_act "$(last_act_now 启动失败，请看日志)"
     return 1
 }
 
@@ -701,6 +752,13 @@ start_status_loop() {
 }
 
 restart() {
+    # restart 同样受总开关门控：cron 的定时重启是「自己开回来」的第二条路径，
+    # 关掉插件后它必须只负责把残留清干净，而不是把隧道重新拉起来。
+    if [ "${FORCE_START:-0}" != "1" ] && [ "$(get_cfg enable)" != "1" ]; then
+        log_act "插件处于关闭状态，忽略 restart（改为确保停止）"
+        stop
+        return 0
+    fi
     stop
     sleep 1
     start
@@ -731,14 +789,17 @@ rules_installed() {
 }
 
 start_nat() {
+    # 走到这里一定是 nat-start 触发的（init.d/N98 软链或 /jffs 钩子），
+    # 显式标上触发源，免得日志里看起来像用户手工重启。
+    TRIGGER="nat"
     if [ "$(get_cfg enable)" != "1" ]; then
         return 0
     fi
     if is_running && rules_installed; then
-        log_line "nat-start：转发规则健在，无需重启"
+        log_act "nat-start：转发规则健在，无需重启"
         return 0
     fi
-    log_line "nat-start：转发规则被冲掉（或进程已退出），重启补回"
+    log_act "nat-start：转发规则被冲掉（或进程已退出），重启补回"
     restart
 }
 
@@ -755,6 +816,8 @@ register_cron() {
 status() {
     if is_running; then
         echo "phantom: running (pid $(cat "$PIDFILE" 2>/dev/null))"
+        echo "trigger: $(get_cfg run_trigger)"
+        echo "enable: $(get_cfg enable)"
         lan_if=$(get_cfg lan_if); [ -n "$lan_if" ] || lan_if="br0"
         table=$(get_cfg table);   [ -n "$table" ] || table="200"
         echo "--- ip rule ---"
@@ -781,6 +844,8 @@ status() {
 apply() {
     # 本函数由软件中心的 POST 同步调用 —— 必须尽快返回，且不往 stdout 写东西
     PHANTOM_QUIET=1
+    # 页面上点的开关/提交一律算 user，detach_run 出来的子进程靠这个环境变量认。
+    export PHANTOM_TRIGGER=user
     enable=$(get_cfg enable)
     if [ "$enable" = "1" ]; then
         # 加密 DNS 拦截随开关即时生效（隧道已在跑时 start 会早退，不会重放）
@@ -789,14 +854,30 @@ apply() {
         else
             remove_doh_block
         fi
-        set_cfg last_act "正在启动… $(date '+%m-%d %H:%M:%S')"
-        log_line "配置已保存，后台启动隧道…"
+        set_cfg last_act "$(last_act_now 正在启动…)"
+        log_act "配置已保存，后台启动隧道…"
         detach_run start
     else
         # 关闭是「用户等得起」的操作，但仍然只写日志、不回显
         stop
-        set_cfg last_act "已保存并关闭 $(date '+%m-%d %H:%M:%S')"
+        set_cfg last_act "$(last_act_now 已保存并关闭)"
     fi
+    trim_log
+    return 0
+}
+
+# 页面「一键修复」：期望是关、但实际还有残留（进程/ip rule/iptables/cron）时用。
+# 插件已经被关掉的前提下，这里不会有任何「顺手把隧道开起来」的副作用。
+cleanup_residue() {
+    PHANTOM_QUIET=1
+    export PHANTOM_TRIGGER=user
+    if [ "$(get_cfg enable)" = "1" ]; then
+        log_act "cleanup：插件处于开启状态，仅重建定时任务"
+    else
+        stop
+        log_act "cleanup：已清理残留进程与规则"
+    fi
+    register_cron
     trim_log
     return 0
 }
@@ -862,7 +943,7 @@ do_diag() {
 # 判据：$1 本身是已知 action 就当直接调用；否则只要 $2 是已知 action 就按
 # 软件中心调用解析；再不然，只要 $1 是纯数字（请求 id 的形态）也按软件中心
 # 调用处理——认不出 action 时同样先回包再报错，页面不会卡住。
-KNOWN_ACTIONS="1 2 3 start_nat start stop restart status ks cron diag _speedtest _health _trim"
+KNOWN_ACTIONS="1 2 3 start_nat start start_force stop restart status ks cron diag cleanup _speedtest _health _trim"
 
 is_known_action() {
     for _a in $KNOWN_ACTIONS; do
@@ -914,10 +995,17 @@ case "$ACTION" in
         exit 0
         ;;
     start)    start ;;
+    start_force)
+        # 唯一能无视总开关启动的入口：安装脚本与 SSH 排障用，
+        # 日志里会留下 [${TRIGGER}] 标记，事后能看出是谁绕过了开关。
+        FORCE_START=1
+        start
+        ;;
     stop)     stop ;;
     restart)  restart ;;
     status)   status ;;
     start_nat) start_nat ;;
+    cleanup)  cleanup_residue ;;
     cron)     register_cron ;;
     diag)     do_diag ;;
     ks)
@@ -935,7 +1023,7 @@ case "$ACTION" in
     *)
         log_line "错误：未知动作 '${ACTION}'（软件中心调用：id=${API_ID:-无}）"
         [ "${PHANTOM_QUIET:-0}" = "1" ] \
-            || echo "Usage: $0 {1|2|3|start|stop|restart|status|start_nat|cron|diag|ks <0|1>}"
+            || echo "Usage: $0 {1|2|3|start|start_force|stop|restart|status|start_nat|cleanup|cron|diag|ks <0|1>}"
         exit 1
         ;;
 esac

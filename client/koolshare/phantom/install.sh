@@ -489,7 +489,10 @@ install_now() {
     local ENABLE=$("$DBUS" get ${module}_enable 2>/dev/null)
     if [ "${ENABLE}" = "1" ] && [ -f "${SCRIPTS_DIR}/${module}_config.sh" ]; then
         echo_date "安装完毕，重新启用${TITLE}！"
-        "$SH" "${SCRIPTS_DIR}/${module}_config.sh" start >/dev/null 2>&1
+        # 安装脚本是「显式」的重启：万一 dbus 里的 enable 因为异常没读到，
+        # 这里也不能把「装完就停」变成「装完永远不启动」，所以用 start_force
+        # 标注成安装触发（日志里看得出是谁绕过了总开关）。
+        PHANTOM_TRIGGER=install "$SH" "${SCRIPTS_DIR}/${module}_config.sh" start_force >/dev/null 2>&1
     fi
 
     echo_date "${TITLE} 插件安装完毕（版本 ${PLVER}）！"

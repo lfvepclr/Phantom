@@ -6,6 +6,9 @@
 
 module=phantom
 
+# 看门狗拉起的进程在插件日志里要能认出来（谁开的、还是自己崩了自己救的）
+export PHANTOM_TRIGGER="${PHANTOM_TRIGGER:-watchdog}"
+
 for candidate in /koolshare/etc/phantom/phantom.env /jffs/phantom/phantom.env; do
     if [ -f "$candidate" ]; then
         . "$candidate"

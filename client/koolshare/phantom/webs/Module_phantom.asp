@@ -59,8 +59,17 @@
 <script>
 // 前端修订号：页面右上角会显示，用来确认浏览器加载的是哪一版
 // （改了 UI 就 +1，排查「改了没生效」时先看这个数字）
-var PHANTOM_UI_REV = '8';
+var PHANTOM_UI_REV = '9';
 var dbus = {};
+// 「期望」= 服务端已经保存的开关值（不是开关控件当前的值：控件改了但没点提交
+// 属于「尚未生效」）。页面把它和状态文件里的「实际」并排显示，用户才能一眼
+// 看出「我关了可它还在跑」「我开了可它没起来」这类要命的状态。
+var saved_want = null;
+// 状态新鲜度：采样进程死掉后文件会停在旧值，页面不能装作没事。
+// 用「ts 是否继续推进 + 本地经过的时间」判断，避免浏览器与路由器时钟偏差。
+var _lastStatusTs = null;
+var _lastStatusAt = 0;
+var STATUS_STALE_MS = 20000;
 var _responseLen;
 var noChange = 0;
 var _statusTimer = null;
@@ -307,12 +316,15 @@ function fetch_dbus_data() {
 				return;
 			}
 			dbus = (data && data.result && data.result[0]) ? data.result[0] : {};
+			saved_want = (dbus["phantom_enable"] === undefined || dbus["phantom_enable"] === null)
+				? null : String(dbus["phantom_enable"]);
 			// 分步 try/catch：conf2obj 里任何一个字段对不上 DOM，
 			// 都不能连累后面的界面初始化（否则表现为「页面没反应」）
 			try { conf2obj(); } catch (e) { console.log("conf2obj: " + e); }
 			try { toggle_func(); } catch (e) { console.log("toggle_func: " + e); }
 			try { update_visibility(); } catch (e) { console.log("update_visibility: " + e); }
 			try { hook_event(); } catch (e) { console.log("hook_event: " + e); }
+			try { update_pending_hint(); } catch (e) { console.log("update_pending_hint: " + e); }
 		},
 		error: function(XmlHttpRequest, textStatus, errorThrown) {
 			console.log(XmlHttpRequest.responseText);
@@ -328,13 +340,28 @@ function fetch_dbus_data() {
 
 function hook_event() {
 	$("#phantom_enable").click(function() {
-		if (gid('phantom_enable').checked) {
-			dbus["phantom_enable"] = "1";
-		} else {
-			dbus["phantom_enable"] = "0";
-		}
+		// 这里**不能**改 dbus["phantom_enable"]：那是服务端已保存的值，
+		// 「期望 vs 实际」的比对全靠它。开关动了只影响控件与提示。
 		update_visibility();
+		update_pending_hint();
 	});
+}
+
+// 开关改了但没提交时给一句人话，避免「我以为我关了」。
+// （真机上就是这么误会的：开关只是本地控件，要点【提交】才会落到 dbus 并启停隧道。）
+function update_pending_hint() {
+	var el = gid("phantom_enable"), tip = gid("switch_pending");
+	if (!el || !tip) { return; }
+	var cur = el.checked ? "1" : "0";
+	if (saved_want === null || cur === saved_want) {
+		tip.style.display = "none";
+		tip.innerHTML = "";
+		return;
+	}
+	tip.style.display = "";
+	tip.innerHTML = "开关已改动但<b>尚未生效</b>：点底部【提交】后才会"
+		+ (cur === "1" ? "启动" : "停止") + "（当前服务端保存的是「"
+		+ (saved_want === "1" ? "开" : "关") + "」）。";
 }
 
 function validate_uri() {
@@ -448,19 +475,15 @@ function schedule_status(ms) {
 function get_run_status() {
 	_statusTimer = null;
 	if (SESSION_LOST) { return; }
-	// 未启用时隧道一定没在跑，没必要每 2 秒去请求状态文件
-	var on = gid("phantom_enable") && gid("phantom_enable").checked;
-	if (!on) {
-		render_stopped();
-		schedule_status(5000);
-		return;
-	}
 	if (document.hidden) { schedule_status(5000); return; }
 	if (statusPath >= STATUS_PATHS.length) {
-		render_stopped();
+		render_state(null, "读不到状态文件");
 		schedule_status(5000);
 		return;
 	}
+	// **开关关着也要查**：过去关掉开关就直接 render_stopped()，于是「我关了但它
+	// 还在跑」（开机钩子/cron 把它拉起来）在页面上永远看不出来 —— 用户说
+	// 「不知道到底是开还是关」就是这么来的。现在两种状态都读真实值。
 	// **必须先过会话探针**：会话失效时直接打 /_temp/ 会把 httpd 打崩
 	probe_then(function() {
 		$.ajax({
@@ -472,44 +495,129 @@ function get_run_status() {
 			success: function(response) {
 				var st = null;
 				try { st = JSON.parse(response); } catch (e) { st = null; }
-				if (!st) { render_stopped(); return; }
-				// 「上次动作」随状态文件一起带回，不再单独轮询 /_api/phantom_last_act
-				if (st.last_act !== undefined && gid("last_act")) {
-					gid("last_act").innerHTML = st.last_act;
-				}
-				if (st.running === 1) {
-					gid("run_status").innerHTML = '<span class="phantom-badge phantom-badge-running">运行中</span>';
-					set_metric("m_down", fmt_rate(st.down_rate));
-					set_metric("m_up", fmt_rate(st.up_rate));
-					set_metric("m_total_down", fmt_bytes(st.total_down));
-					set_metric("m_total_up", fmt_bytes(st.total_up));
-					set_metric("m_conns", String(st.conns));
-					set_metric("m_direct", String(st.direct));
-					set_metric("m_proxy", String(st.proxy));
-					set_metric("m_cpu", st.cpu + " %");
-					set_metric("m_gw", gw_label(st.gw));
-					set_metric("m_ipset", String(st.ipset || 0));
-					set_metric("m_fd", (st.fd || 0) + " / " + (st.fdl || 0));
-				} else {
-					render_stopped();
-				}
+				render_state(st, null);
 			},
 			error: function() {
 				// 这条路径读不到就换下一条（不同固件的 docroot 不一样）
 				statusPath++;
-				render_stopped();
+				render_state(null, "读不到状态文件");
 			},
 			complete: function() {
-				if (!SESSION_LOST) { schedule_status(2000); }
+				if (!SESSION_LOST) { schedule_status(poll_interval_ms()); }
 			}
 		});
 	});
+}
+
+// 已保存的期望为「开」时轮询快一点（用户在等隧道起来），否则 5 秒足够。
+function poll_interval_ms() {
+	return (saved_want === "1") ? 2500 : 5000;
+}
+
+// 状态渲染的唯一入口：期望（dbus 已保存值）与实际（状态文件）分开显示，
+// 不一致就直说，并给出可执行的补救动作。
+function render_state(st, errText) {
+	var want = saved_want;
+	var wantText = (want === "1") ? "开" : (want === "0" ? "关" : "未知");
+	var wantCls = (want === "1") ? "phantom-badge-running" : "phantom-badge-stopped";
+
+	var running = !!(st && Number(st.running) === 1);
+	var proc = st ? Number(st.proc || 0) : 0;
+	var rules = !!(st && Number(st.rules) === 1);
+	var stale = false;
+	if (st && st.ts !== undefined) {
+		if (_lastStatusTs !== st.ts) { _lastStatusTs = st.ts; _lastStatusAt = Date.now(); }
+		stale = (Date.now() - _lastStatusAt) > STATUS_STALE_MS;
+	}
+
+	var actualText, actualCls, mismatch = "";
+	if (errText) {
+		actualText = errText;
+		actualCls = "phantom-badge-stopped";
+	} else if (running && !stale) {
+		actualText = "运行中";
+		actualCls = "phantom-badge-running";
+	} else if (proc > 0 || rules) {
+		actualText = "残留（进程或规则还在）";
+		actualCls = "phantom-badge-error";
+	} else if (stale) {
+		actualText = "状态未知（采样已停止）";
+		actualCls = "phantom-badge-error";
+	} else {
+		actualText = "已停止";
+		actualCls = "phantom-badge-stopped";
+	}
+
+	// 不一致的三种形态，各自给出补救建议
+	if (!errText && want === "0" && (proc > 0 || rules || running)) {
+		mismatch = "插件处于<b>关闭</b>状态，但" + (proc > 0 ? "进程仍在（pid " + proc + "）" : "")
+			+ ((proc > 0 && rules) ? "、" : "") + (rules ? "转发规则仍在" : "")
+			+ "。这会让 LAN 流量继续被导入隧道（或留下黑洞路由）。"
+			+ "<a href=\"javascript:cleanup_residue();\" style=\"margin-left:8px;\">一键修复</a>";
+	} else if (!errText && want === "1" && !running && !stale) {
+		mismatch = "开关是<b>开</b>的，但隧道没有在运行。切到「查看日志」看看最后一条动作（上次动作栏也会显示原因）。";
+	} else if (!errText && want === "1" && running && !rules) {
+		mismatch = "隧道在跑，但<b>转发规则不在位</b>：LAN 的流量可能没进隧道（照常直连）。"
+			+ "通常出现在路由器重建 iptables 之后，点一次【提交】或等 nat-start 钩子补回。";
+	} else if (!errText && stale && (proc > 0 || running)) {
+		mismatch = "状态文件超过 20 秒没有更新：采样进程可能已经停了，下面这些数字是旧值。";
+	}
+
+	if (gid("badge_want")) {
+		gid("badge_want").className = "phantom-badge " + wantCls;
+		gid("badge_want").innerHTML = "期望：" + wantText;
+	}
+	if (gid("badge_actual")) {
+		gid("badge_actual").className = "phantom-badge " + actualCls;
+		gid("badge_actual").innerHTML = "实际：" + actualText;
+	}
+	if (gid("badge_trigger")) {
+		var trg = (st && st.trigger) ? String(st.trigger) : "";
+		gid("badge_trigger").innerHTML = trg ? ("当前实例由 <b>" + trigger_label(trg) + "</b> 拉起") : "";
+	}
+	if (gid("state_mismatch")) {
+		gid("state_mismatch").style.display = mismatch ? "" : "none";
+		gid("state_mismatch").innerHTML = mismatch;
+	}
+
+	if (st && st.last_act !== undefined && gid("last_act")) {
+		gid("last_act").innerHTML = st.last_act;
+	}
+	if (running) {
+		gid("run_status").innerHTML = '<span class="phantom-badge phantom-badge-running">运行中</span>';
+		set_metric("m_down", fmt_rate(st.down_rate));
+		set_metric("m_up", fmt_rate(st.up_rate));
+		set_metric("m_total_down", fmt_bytes(st.total_down));
+		set_metric("m_total_up", fmt_bytes(st.total_up));
+		set_metric("m_conns", String(st.conns));
+		set_metric("m_direct", String(st.direct));
+		set_metric("m_proxy", String(st.proxy));
+		set_metric("m_cpu", st.cpu + " %");
+		set_metric("m_gw", gw_label(st.gw));
+		set_metric("m_ipset", String(st.ipset || 0));
+		set_metric("m_fd", (st.fd || 0) + " / " + (st.fdl || 0));
+	} else {
+		render_stopped();
+	}
+}
+
+// 触发源的人话标签（phantom_config.sh 写进 phantom_run_trigger）
+function trigger_label(t) {
+	if (t === "boot") { return "开机钩子"; }
+	if (t === "cron") { return "定时任务"; }
+	if (t === "nat") { return "nat-start 钩子"; }
+	if (t === "watchdog") { return "看门狗"; }
+	if (t === "install") { return "安装脚本"; }
+	if (t === "user") { return "页面/SSH 操作"; }
+	return t;
 }
 
 function render_stopped() {
 	gid("run_status").innerHTML = '<span class="phantom-badge phantom-badge-stopped">未运行</span>';
 	set_metric("m_down", "0 B/s");
 	set_metric("m_up", "0 B/s");
+	set_metric("m_total_down", "0 B");
+	set_metric("m_total_up", "0 B");
 	set_metric("m_conns", "0");
 	set_metric("m_direct", "0");
 	set_metric("m_proxy", "0");
@@ -590,11 +698,14 @@ function set_busy(on, msg) {
 var POST_MAX_ATTEMPTS = 2;      // 首发 + 1 次重试（每次都用新的请求 id）
 var POST_RETRY_DELAY_MS = 5000; // 等 watchdog 把 httpd 拉起来
 
-function post_action(flag, after, busyMsg, attempt) {
+// light=true：不携带表单字段（只发一个动作）。「一键修复」这类运维动作
+// 不能顺手把页面上还没提交的编辑一起写进 dbus。
+function post_action(flag, after, busyMsg, attempt, light) {
 	if (SESSION_LOST) { return; }
 	if (attempt === undefined) { attempt = 1; }
 	var id = parseInt(Math.random() * 100000000);
-	var postData = {"id": id, "method": "phantom_config.sh", "params": [String(flag)], "fields": collect_fields()};
+	var postData = {"id": id, "method": "phantom_config.sh", "params": [String(flag)],
+	                "fields": light ? {} : collect_fields()};
 	if (attempt === 1) {
 		set_busy(true, busyMsg || "正在应用配置，请稍候…（启动隧道需要几秒）");
 	}
@@ -631,6 +742,13 @@ function post_action(flag, after, busyMsg, attempt) {
 					return;
 				}
 				set_busy(true, "没有收到回应，正在核对配置是否已经生效…");
+				if (light) {
+					// 轻提交没有字段可核对，只能如实报失败
+					set_busy(false);
+					alert("操作失败（请求未完成）：HTTP " + ((xhr && xhr.status) ? xhr.status : "无响应")
+						+ "（" + (textStatus || "") + "）\n若页面顶部提示会话失效，请重新登录后重试。");
+					return;
+				}
 				verify_applied(postData.fields, function(applied) {
 					set_busy(false);
 					if (applied) {
@@ -779,8 +897,12 @@ function save(flag) {
 	// 换行原样落库后又被当成一条非法规则）
 	gid("phantom_whitelist").value = normalize_whitelist(gid("phantom_whitelist").value);
 	update_wl_count();
-	dbus["phantom_enable"] = gid("phantom_enable").checked ? "1" : "0";
+	var wantNow = gid("phantom_enable").checked ? "1" : "0";
 	post_action(flag, function() {
+		// 提交成功 = 服务端已经保存这个值：「期望」基线随之更新，
+		// 未提交提示与期望/实际核对才不会自己打自己。
+		saved_want = wantNow;
+		update_pending_hint();
 		get_log();
 		if (gid("phantom_enable").checked) {
 			wait_started(20);
@@ -788,6 +910,18 @@ function save(flag) {
 			setTimeout("refreshpage();", 1500);
 		}
 	});
+}
+
+// 「一键修复」：期望是关、实际还有残留（进程 / ip rule / iptables / 定时任务）时用。
+// 走轻提交（不带表单字段），修复动作不会顺手把未提交的编辑写进 dbus。
+function cleanup_residue() {
+	if (SESSION_LOST) { return; }
+	if (!confirm("将停止插件，并清理残留的进程、ip rule / iptables 规则与定时任务。\n继续？")) { return; }
+	post_action("cleanup", function() {
+		get_log();
+		get_run_status();
+		setTimeout(function() { get_run_status(); }, 2500);
+	}, "正在清理残留…", 1, true);
 }
 
 function speedtest() {
@@ -945,7 +1079,17 @@ function reload_Soft_Center() {
 													<th>上次动作</th>
 													<td><span id="last_act"></span></td>
 												</tr>
+												<tr id="state_tr">
+													<th>状态核对</th>
+													<td colspan="2">
+														<span id="badge_want" class="phantom-badge phantom-badge-stopped">期望：—</span>
+														<span id="badge_actual" class="phantom-badge phantom-badge-stopped">实际：—</span>
+														<span id="badge_trigger" class="phantom-hint" style="margin-left:6px;"></span>
+														<div id="state_mismatch" class="phantom-warn" style="display:none;margin-top:6px;"></div>
+													</td>
+												</tr>
 											</table>
+											<div id="switch_pending" class="phantom-hint" style="display:none;margin:8px 0 0 8px;"></div>
 											<div id="off_hint" class="phantom-warn" style="margin:8px 0 0 8px;">
 												操作顺序：打开上面的开关 → 填写连接串 → 点底部【提交】。提交后隧道才会启动。
 											</div>
@@ -1022,7 +1166,7 @@ function reload_Soft_Center() {
 																<td class="phantom-metric"></td>
 															</tr>
 														</table>
-														<div class="phantom-hint">每 2 秒自动刷新。累计值为本次启动以来的计数，重启隧道会归零。「内核分流」= 只有白名单目标进隧道，直连走内核快路径；「兼容模式」= 全部进隧道由用户态判定（老固件没有 ipset 时自动回退）。</div>
+														<div class="phantom-hint">自动刷新（约 2.5 秒）。累计值为本次启动以来的计数，重启隧道会归零。「内核分流」= 只有白名单目标进隧道，直连走内核快路径；「兼容模式」= 全部进隧道由用户态判定（老固件没有 ipset 时自动回退）。</div>
 													</td>
 												</tr>
 											</table>

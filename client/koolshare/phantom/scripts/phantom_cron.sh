@@ -131,8 +131,13 @@ sync_all() {
     fi
 
     # 定时重启：cron_time 形如 4:30 或 4:30:1（第三个字段是周几，0=周日）
+    #
+    # **必须同时看总开关。** 真机上这条 cron 过去只受 cron_enable 控制，于是
+    # 「关掉插件 → 第二天 4:30 自己又开了」（日志：04:30:02 服务已停止 →
+    # 04:30:06 启动成功）。关就是关：插件关闭时不注册，已经存在的直接删掉。
     cron_enable=$(get_cfg cron_enable)
-    if [ "$cron_enable" = "1" ]; then
+    enable=$(get_cfg enable)
+    if [ "$cron_enable" = "1" ] && [ "$enable" = "1" ]; then
         cron_time=$(get_cfg cron_time)
         [ -n "$cron_time" ] || cron_time="4:30"
         hour=$(printf '%s' "$cron_time" | cut -d: -f1)
@@ -141,10 +146,13 @@ sync_all() {
         [ -n "$hour" ] || hour="4"
         [ -n "$minute" ] || minute="30"
         [ -n "$dow" ] && [ "$dow" != "$cron_time" ] || dow="*"
-        cron_add phantom_restart "${minute} ${hour} * * ${dow}" "${SH} ${CONFIG} restart"
+        # PHANTOM_TRIGGER=cron 让插件日志能回答「这次是谁重启的」
+        cron_add phantom_restart "${minute} ${hour} * * ${dow}" \
+            "PHANTOM_TRIGGER=cron ${SH} ${CONFIG} restart"
         echo "已注册定时重启：每天 ${hour}:${minute}（周字段 ${dow}）"
     else
         cron_del phantom_restart
+        [ "$cron_enable" = "1" ] && echo "插件处于关闭状态，不注册定时重启"
     fi
     return 0
 }

@@ -309,10 +309,37 @@ fi
 # 因此页面必须：每次访问 httpdb 之前先用 .asp 探针确认会话（.asp 不会崩），
 # 探针说会话没了就停掉全部轮询；后台标签页也不轮询（浏览器把定时器限流到
 # 1 分钟一次，正是真机上「每分钟崩一次、连崩两小时」的形态）。
-if grep -q "PHANTOM_UI_REV = '8'" "$ASP"; then
-    ok "UI rev 已推进到 8（改了页面要能看出浏览器加载的是哪一版）"
+# 只要求「推进到 >= 9」，不再钉死具体数字：页面改一次就要 +1，
+# 否则「改了没生效」这类问题只能靠猜。
+_ui_rev=$(sed -n "s/.*PHANTOM_UI_REV *= *'\([0-9]*\)'.*/\1/p" "$ASP" | head -n 1)
+case "$_ui_rev" in
+    ''|*[!0-9]*) bad "PHANTOM_UI_REV 缺失或不是数字" ;;
+    *)
+        if [ "$_ui_rev" -ge 9 ] 2>/dev/null; then
+            ok "UI rev = ${_ui_rev}（改了页面要能看出浏览器加载的是哪一版）"
+        else
+            bad "UI rev 未推进（仍为 ${_ui_rev}，期望 >= 9）"
+        fi
+        ;;
+esac
+
+# 「开关到底是开还是关」必须一眼可辨：期望（dbus 已保存）与实际（状态文件）分开显示，
+# 不一致要说人话，并给出可执行动作。真机上就是因为两者混在一起，
+# 才出现「我关了它还在跑 / 我开了它没起来」这种说不清的状态。
+for _mark in 'id="badge_want"' 'id="badge_actual"' 'id="state_mismatch"' \
+             'id="switch_pending"' 'function cleanup_residue' 'function trigger_label' \
+             'saved_want' 'STATUS_STALE_MS' 'poll_interval_ms'; do
+    if grep -q -- "$_mark" "$ASP"; then
+        ok "页面含状态核对相关实现（${_mark}）"
+    else
+        bad "页面缺少「期望 vs 实际」相关实现（${_mark}）"
+    fi
+done
+# 开关关着时也要轮询（否则「关了却还在跑」永远看不见）
+if grep -q '开关关着也要查' "$ASP"; then
+    ok "开关关闭时仍然轮询真实状态"
 else
-    bad "UI rev 未推进（仍为 $(sed -n "s/.*PHANTOM_UI_REV *= *'\([0-9]*\)'.*/\1/p" "$ASP" | head -n 1)）"
+    bad "开关关闭时不查真实状态（残留状态看不见）"
 fi
 # 探针文件名必须以 Module_ 开头：httpd 只把 /Module_* 路由到 /koolshare/webs，
 # 真机实测 /phantom_ping.asp 恒 404（/Module_xxx.css 则由它的 webs 处理器接管）。
@@ -734,6 +761,61 @@ sleep 1
 pid_after2=$(cat "$RUN_PID" 2>/dev/null)
 [ -n "$pid_after2" ] && ok "start_nat 之后隧道仍在跑（pid ${pid_after2}）" || bad "start_nat 之后隧道没了"
 
+step "开关语义：关就是关（开机钩子 / cron 都不许自己开回来）"
+# 真机上「关掉插件 → 重启路由器 → 自己又开了」有两条路径，这里逐条钉住：
+#   1) 开机钩子 init.d/S98phantom.sh 会执行 `start`（syslog 里能看到 ks-wan-start.sh 调它）
+#   2) cron 的 `phantom_config.sh restart` 只受 cron_enable 控制
+# 另外 stop() 必须顺手把定时重启摘掉，否则第二天 4:30 它照样开回来。
+"$SH" "$CONF_SH" stop >/dev/null 2>&1
+setcfg enable 0
+setcfg cron_enable 1
+"$SH" "$CONF_SH" cron >/dev/null 2>&1
+if cru l | grep -q phantom_restart; then
+    bad "插件已关闭，仍注册了定时重启任务（第二天会自己开回来）"
+else
+    ok "插件已关闭时不注册定时重启任务"
+fi
+: >"$LOG"
+"$SH" "$CONF_SH" start >/dev/null 2>&1
+if [ -f "$RUN_PID" ] && kill -0 "$(cat "$RUN_PID" 2>/dev/null)" 2>/dev/null; then
+    bad "关闭状态下 start 仍把隧道拉起来了（开机钩子会绕过总开关）"
+else
+    ok "关闭状态下 start 被拒绝（开机钩子不再绕过总开关）"
+fi
+if grep -q "忽略 start" "$LOG" 2>/dev/null; then
+    ok "日志记录了「忽略 start」（含触发源标记）"
+else
+    bad "缺少「已关闭，忽略 start」的日志"
+fi
+"$SH" "$CONF_SH" restart >/dev/null 2>&1
+sleep 4
+if [ -f "$RUN_PID" ] && kill -0 "$(cat "$RUN_PID" 2>/dev/null)" 2>/dev/null; then
+    bad "关闭状态下 restart 仍把隧道拉起来了（cron 会自己开回来）"
+else
+    ok "关闭状态下 restart 只停不启"
+fi
+if cru l | grep -q phantom_restart; then
+    bad "stop 之后定时重启任务仍在（第二天 4:30 会自己开回来）"
+else
+    ok "stop 之后定时重启任务已摘除"
+fi
+# 唯一例外：start_force（安装脚本与 SSH 排障）
+PHANTOM_TRIGGER=install "$SH" "$CONF_SH" start_force >/dev/null 2>&1
+sleep 1
+if [ -f "$RUN_PID" ] && kill -0 "$(cat "$RUN_PID" 2>/dev/null)" 2>/dev/null; then
+    ok "start_force 是唯一能无视总开关启动的入口"
+    grep -q '"trigger":"install"' "$RUN_STATUS" 2>/dev/null \
+        && ok "状态文件记录触发源 install" \
+        || bad "状态文件未记录触发源（trigger 字段）"
+else
+    bad "start_force 未能强制启动"
+fi
+# 恢复正常状态，后面的步骤继续用
+setcfg enable 1
+"$SH" "$CONF_SH" start >/dev/null 2>&1
+sleep 1
+[ -f "$RUN_PID" ] && ok "恢复 enable=1 后隧道重新运行" || bad "恢复 enable=1 后隧道没起来"
+
 step "测速（后台派发，稍等结果）"
 # 单位对齐检查：speed 是 bytes/s → kbps，天花板也要是 kbps。
 # 曾经写成 kbps/（KB/s），真机上打印出「达到 786%」这种荒唐结论。
@@ -809,7 +891,9 @@ fi
 
 step "状态文件新字段（CPU/分流模式/ipset/fd）"
 if [ -f "$RUN_STATUS" ]; then
-    for f in '"cpu"' '"gw"' '"ipset"' '"fd"' '"fdl"' '"last_act"'; do
+    # rules/proc/trigger 是「期望 vs 实际」核对与「残留」判定的依据：
+    # 没有它们，页面只能靠猜测回答「我到底关掉了没有」。
+    for f in '"cpu"' '"gw"' '"ipset"' '"fd"' '"fdl"' '"last_act"' '"rules"' '"proc"' '"trigger"'; do
         grep -q "$f" "$RUN_STATUS" && ok "状态含 $f 字段" || bad "状态缺 $f 字段"
     done
     grep -q '"gw":"kernel-split"' "$RUN_STATUS" \

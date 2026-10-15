@@ -99,6 +99,47 @@ read_last_act() {
     fi
 }
 
+# 当前实例由谁拉起（boot/cron/nat/watchdog/user/install）。
+# 页面拿它解释「这次是自己开的还是被谁开的」，与 last_act 里的标签同源。
+read_run_trigger() {
+    if [ "$USE_DBUS" = "1" ]; then
+        "$DBUS" get ${module}_run_trigger 2>/dev/null
+    else
+        sed -n "s/^run_trigger='\(.*\)'\$/\1/p" "${RUNTIME_DIR}/etc/phantom.conf" 2>/dev/null | head -n 1
+    fi
+}
+
+# 转发面规则是否在位（ip rule + iptables FORWARD 的两条 ACCEPT）。
+#
+# 为什么页面需要它：进程活着、metrics 能读，**不等于** LAN 流量真的在走隧道 ——
+# Asuswrt 重建 iptables 之后规则会没了，而进程还在跑。只有把「实际」摊开给用户看，
+# 「开关到底是开还是关」才不再靠猜。
+#
+# 每 15 秒才查一次（ip/iptables 各一次 fork，2 秒一次的采样循环里不能每次都做）。
+RULES_STATE=0
+check_rules() {
+    _lan=$(printf '%s' "${STATUS_LAN_IF:-br0}" | cut -d' ' -f1)
+    _tun="${STATUS_TUN_NAME:-phantom0}"
+    _table="${STATUS_TABLE:-200}"
+    ip rule show 2>/dev/null | grep -qE "lookup[[:space:]]+${_table}([[:space:]]|$)" || return 1
+    iptables -S FORWARD 2>/dev/null | grep -q -- "-i ${_lan} -o ${_tun} " || return 1
+    iptables -S FORWARD 2>/dev/null | grep -q -- "-i ${_tun} -o ${_lan} " || return 1
+    return 0
+}
+
+# 采样进程只在「隧道正在跑」时存在，所以这些值读一次就够
+# （改 LAN 接口/表号会重启隧道，采样进程跟着重启）。
+get_cfg_lite() {
+    if [ "$USE_DBUS" = "1" ]; then
+        "$DBUS" get "${module}_$1" 2>/dev/null
+    else
+        sed -n "s/^$1='\(.*\)'\$/\1/p" "${RUNTIME_DIR}/etc/phantom.conf" 2>/dev/null | head -n 1
+    fi
+}
+STATUS_LAN_IF=$(get_cfg_lite lan_if); [ -n "$STATUS_LAN_IF" ] || STATUS_LAN_IF="br0"
+STATUS_TUN_NAME=$(get_cfg_lite tun_name); [ -n "$STATUS_TUN_NAME" ] || STATUS_TUN_NAME="phantom0"
+STATUS_TABLE=$(get_cfg_lite table); [ -n "$STATUS_TABLE" ] || STATUS_TABLE="200"
+
 # curl 优先，没有就退到 busybox wget（部分精简固件只带 wget）
 fetch() {
     if [ -n "$CURL" ]; then
@@ -109,13 +150,19 @@ fetch() {
 }
 
 write_empty() {
+    # 即使 metrics 读不到，也要把「进程还在不在、规则还在不在」照实写出来：
+    # 页面正是靠这三者区分「已停止」和「进程/规则残留」的。
+    _ep=$(cat "$PIDFILE" 2>/dev/null)
+    case "$_ep" in ''|*[!0-9]*) _ep=0 ;; esac
+    _tr=$(read_run_trigger | tr -d '"\\')
     cat >"${STATUS_JSON}.tmp" 2>/dev/null <<EOF
-{"ts":$(date +%s),"running":0,"up_rate":0,"down_rate":0,"total_up":0,"total_down":0,"udp_up":0,"udp_down":0,"conns":0,"direct":0,"proxy":0,"cpu":0,"gw":"-","ipset":0,"fd":0,"fdl":0,"last_act":"$(read_last_act | tr -d '\\"')"}
+{"ts":$(date +%s),"running":0,"up_rate":0,"down_rate":0,"total_up":0,"total_down":0,"udp_up":0,"udp_down":0,"conns":0,"direct":0,"proxy":0,"cpu":0,"gw":"-","ipset":0,"fd":0,"fdl":0,"rules":${RULES_STATE},"proc":${_ep},"trigger":"${_tr}","last_act":"$(read_last_act | tr -d '\\"')"}
 EOF
     mv "${STATUS_JSON}.tmp" "${STATUS_JSON}" 2>/dev/null
     chmod 644 "${STATUS_JSON}" 2>/dev/null
 }
 
+tick=0
 while :; do
     # 隧道进程没了就退出（config.sh 也会 kill，这里是双保险）
     if [ ! -f "$PIDFILE" ]; then
@@ -127,6 +174,13 @@ while :; do
     fi
 
     now=$(date +%s)
+    # 规则在位检查要 fork 两次（ip / iptables），2 秒一轮太浪费，
+    # 每 5 轮（约 15s）查一次即可 —— 页面上的「实际」标签不需要秒级精度。
+    tick=$((tick + 1))
+    if [ $((tick % 5)) -eq 1 ] || [ "$tick" -eq 1 ]; then
+        if check_rules; then RULES_STATE=1; else RULES_STATE=0; fi
+    fi
+    trigger_val=$(read_run_trigger | tr -d '"\\')
     body=$(fetch "$METRICS")
 
     if [ -n "$body" ]; then
@@ -190,7 +244,7 @@ while :; do
         prev_ticks=$ticks
 
         cat >"${STATUS_JSON}.tmp" 2>/dev/null <<EOF
-{"ts":${now},"running":1,"up_rate":${up_rate},"down_rate":${down_rate},"total_up":${total_up},"total_down":${total_down},"udp_up":${udp_up},"udp_down":${udp_down},"conns":${conns},"direct":${direct},"proxy":${proxy},"cpu":${cpu},"gw":"${gw}","ipset":${ipset_entries},"fd":${fd_used},"fdl":${fd_limit},"last_act":"$(read_last_act | tr -d '\\"')"}
+{"ts":${now},"running":1,"up_rate":${up_rate},"down_rate":${down_rate},"total_up":${total_up},"total_down":${total_down},"udp_up":${udp_up},"udp_down":${udp_down},"conns":${conns},"direct":${direct},"proxy":${proxy},"cpu":${cpu},"gw":"${gw}","ipset":${ipset_entries},"fd":${fd_used},"fdl":${fd_limit},"rules":${RULES_STATE},"proc":${pid},"trigger":"${trigger_val}","last_act":"$(read_last_act | tr -d '\\"')"}
 EOF
         mv "${STATUS_JSON}.tmp" "${STATUS_JSON}" 2>/dev/null
         chmod 644 "${STATUS_JSON}" 2>/dev/null
