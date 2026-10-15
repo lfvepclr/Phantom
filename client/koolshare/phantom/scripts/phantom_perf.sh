@@ -238,8 +238,10 @@ if [ -r /proc/net/dev ]; then
     _dev() {
         awk -v d="$1" '$1 == d":" { print $4, $5 }' /proc/net/dev 2>/dev/null | head -n 1
     }
-    _e0=$(_dev eth0); eth0_drop=$(printf '%s' "$_e0" | cut -d' ' -f1); eth0_err=$(printf '%s' "$_e0" | cut -d' ' -f2)
-    _e2=$(_dev eth2); eth2_drop=$(printf '%s' "$_e2" | cut -d' ' -f1); eth2_err=$(printf '%s' "$_e2" | cut -d' ' -f2)
+    # /proc/net/dev 的 RX 列顺序是 bytes packets **errs drop** —— 别取反了
+    # （真机上第一版就写反了，日志里 drop 列记的是 errs）。
+    _e0=$(_dev eth0); eth0_err=$(printf '%s' "$_e0" | cut -d' ' -f1); eth0_drop=$(printf '%s' "$_e0" | cut -d' ' -f2)
+    _e2=$(_dev eth2); eth2_err=$(printf '%s' "$_e2" | cut -d' ' -f1); eth2_drop=$(printf '%s' "$_e2" | cut -d' ' -f2)
     case "$eth0_drop" in ''|*[!0-9]*) eth0_drop=0 ;; esac
     case "$eth0_err" in ''|*[!0-9]*) eth0_err=0 ;; esac
     case "$eth2_drop" in ''|*[!0-9]*) eth2_drop=0 ;; esac
