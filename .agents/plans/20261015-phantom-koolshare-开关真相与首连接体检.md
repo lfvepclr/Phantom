@@ -191,6 +191,24 @@
   跑全量单测 + 端到端 + 基准冒烟；重出 koolshare 双架构包与 server 包。
 - 若某依赖在 1.99 下破坏 aarch64-musl / armv7 / OHOS 目标，逐个回退该依赖并在此记录。
 
+**实施记录（2026-10-15）**
+
+- 工具链：rustc/cargo 1.96.0 → **1.99.0**；`cargo update` 落 patch/minor
+  （tokio 1.53.3、serde_json 1.0.154、thiserror 2.0.21、clap 4.6.7…），无跨大版本跳变，
+  **没有出现需要回退的依赖**。
+- 编译面：`cargo check --workspace --all-targets` 干净（只剩既有的一条 dead_code 警告）；
+  交叉目标 `aarch64-unknown-linux-musl`、`armv7-unknown-linux-musleabihf`、
+  `x86_64-unknown-linux-musl`、`aarch64-linux-android`、`aarch64-unknown-linux-ohos` 全部通过。
+- 测试面：`cargo test --workspace --exclude phantom-e2e` 里 phantom-harmony 的**测试二进制
+  在 macOS 上本来就链接不过**（`napi_ohos` 的 `napi_*` 符号在宿主上不存在；HEAD 上同样失败，
+  与本轮无关）。排除它之后：client 98 / core 75 / e2e 6 / bench 25 全绿。
+- 出包：`cargo xtask package clients koolshare cli` 重新出包成功
+  （`dist/client-koolshare-0.1.0.tar.gz`，`.valid=hnd`，aarch64 与 armv7 均为静态 ELF，
+  包内含新的 `phantom_health.sh`，ASP rev=11）。
+  **server 包没能在这里重出**：`cargo xtask package server --platform linux/amd64` 依赖
+  podman 容器引擎，而本机 podman 虚拟机没在运行（连接 127.0.0.1:56779 被拒）。
+  这是环境限制，不是代码问题；需要时在容器引擎可用的机器上重跑同一条命令。
+
 ## 三、接口与默认值
 
 | 项 | 变更 |

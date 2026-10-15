@@ -176,7 +176,7 @@ bash deploy/router/install.sh <路由器IP> "phantom://KEY@vpn.example.com:443"
 ### 1. 环境准备
 
 **系统要求**:
-- Rust ≥ 1.85（Rust 2024 edition；如 nightly 缺失部分特性需要切换）
+- Rust ≥ 1.85（Rust 2024 edition；当前用 **stable 1.99** 验证，见下）
 - Linux / macOS（服务端推荐 Linux）
 - 端口开放：默认 443/TCP（auto 模式被占时自动 +1 探测，最多 10 次）
 
@@ -185,6 +185,7 @@ bash deploy/router/install.sh <路由器IP> "phantom://KEY@vpn.example.com:443"
 ```bash
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
+rustup update stable          # 仓库不锁定工具链；当前在 stable 1.99 上验证
 ```
 
 **从源码构建**:
