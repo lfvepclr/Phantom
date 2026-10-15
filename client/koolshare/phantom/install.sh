@@ -392,6 +392,9 @@ set_defaults() {
     [ -n "$("$DBUS" get ${module}_tun_addr)" ]    || "$DBUS" set ${module}_tun_addr="10.7.0.1/24"
     [ -n "$("$DBUS" get ${module}_tun_name)" ]    || "$DBUS" set ${module}_tun_name="phantom0"
     [ -n "$("$DBUS" get ${module}_dns_hijack)" ]  || "$DBUS" set ${module}_dns_hijack="1"
+    # 国内解析器池：逗号分隔、按优先级排列。**不要只填一台** —— 某一家抽风或
+    # 被劫持时，整屋的普通域名就全解析不了（见 client/src/dns.rs 的故障切换）。
+    [ -n "$("$DBUS" get ${module}_dns_direct)" ]  || "$DBUS" set ${module}_dns_direct="223.5.5.5:53,119.29.29.29:53,180.76.76.76:53"
     [ -n "$("$DBUS" get ${module}_builtin_wl)" ]  || "$DBUS" set ${module}_builtin_wl="1"
     [ -n "$("$DBUS" get ${module}_whitelist)" ]   || "$DBUS" set ${module}_whitelist=""
     [ -n "$("$DBUS" get ${module}_cron_enable)" ] || "$DBUS" set ${module}_cron_enable="0"
@@ -535,6 +538,8 @@ tun_name='phantom0'
 tun_addr='10.7.0.1/24'
 table='200'
 dns_hijack='1'
+# 国内解析器池（逗号分隔、按优先级）：单台是国内全量域名的单点故障
+dns_direct='223.5.5.5:53,119.29.29.29:53,180.76.76.76:53'
 builtin_wl='1'
 whitelist=''
 cron_enable='0'

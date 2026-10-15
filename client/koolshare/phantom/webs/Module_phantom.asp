@@ -59,7 +59,7 @@
 <script>
 // 前端修订号：页面右上角会显示，用来确认浏览器加载的是哪一版
 // （改了 UI 就 +1，排查「改了没生效」时先看这个数字）
-var PHANTOM_UI_REV = '9';
+var PHANTOM_UI_REV = '10';
 var dbus = {};
 // 「期望」= 服务端已经保存的开关值（不是开关控件当前的值：控件改了但没点提交
 // 属于「尚未生效」）。页面把它和状态文件里的「实际」并排显示，用户才能一眼
@@ -112,6 +112,7 @@ var _probeWaiters = [];
 // 不能放进这个数组——否则 conf2obj() 会访问 null 并中断整个初始化。
 var params_inp = ['phantom_uri', 'phantom_mode', 'phantom_protocol', 'phantom_lan_if',
                   'phantom_tun_name', 'phantom_tun_addr', 'phantom_table', 'phantom_whitelist',
+                  'phantom_dns_direct',
                   'phantom_log_level', 'phantom_gateway_mode',
                   'phantom_server_up_mbps', 'phantom_server_down_mbps'];
 var params_chk = ['phantom_enable', 'phantom_dns_hijack', 'phantom_builtin_wl',
@@ -362,6 +363,50 @@ function update_pending_hint() {
 	tip.innerHTML = "开关已改动但<b>尚未生效</b>：点底部【提交】后才会"
 		+ (cur === "1" ? "启动" : "停止") + "（当前服务端保存的是「"
 		+ (saved_want === "1" ? "开" : "关") + "」）。";
+}
+
+// ---------------------------------------------------------------- 国内解析器池
+//
+// 不在白名单里的域名（也就是绝大多数国内站点）用这里的解析器。**只填一台是
+// 单点故障**：那一家抽风/被劫持时，整屋的普通域名都解析不出来，看起来像"路由器
+// 坏了"。所以默认给三家（阿里/腾讯/百度），客户端会按顺序使用并在超时后换人。
+//
+// 这里的清洗与 phantom_config.sh 的 sanitize_dns_pool() 保持一致：
+// 只认 IP[:端口]，非法项直接丢掉（写进 TOML 前必须过滤，一个引号就能写坏配置）。
+function normalize_dns_pool(v) {
+	var parts = String(v === undefined || v === null ? "" : v).split(/[\s,;]+/);
+	var out = [], i, m, port;
+	for (i = 0; i < parts.length; i++) {
+		if (!parts[i]) { continue; }
+		m = parts[i].match(/^(\d{1,3}(?:\.\d{1,3}){3})(?::(\d{1,5}))?$/);
+		if (!m) { continue; }
+		port = m[2] ? parseInt(m[2], 10) : 53;
+		if (!(port >= 1 && port <= 65535)) { continue; }
+		out.push(m[1] + ":" + port);
+	}
+	return out.join(",");
+}
+
+function validate_dns_pool() {
+	var el = gid("phantom_dns_direct"), tip = gid("dns_pool_tip");
+	if (!el) { return true; }
+	var raw = String(el.value || "").replace(/^\s+|\s+$/g, "");
+	var norm = normalize_dns_pool(raw);
+	var count = norm ? norm.split(",").length : 0;
+	// 留空 = 用内置三家（脚本会兜底）；但打了字却一台都解析不出来就是错的。
+	if (count === 0 && raw !== "") {
+		if (tip) { tip.innerHTML = "格式不对：请填 <i>IP</i> 或 <i>IP:端口</i>，逗号分隔，例如 223.5.5.5,119.29.29.29"; }
+		el.className = "input_ss_table phantom-invalid";
+		return false;
+	}
+	el.value = norm;
+	el.className = "input_ss_table";
+	if (tip) {
+		tip.innerHTML = count
+			? ("共 " + count + " 台，按顺序优先使用（第一台超时就换下一台）")
+			: "留空则使用内置三家（223.5.5.5 / 119.29.29.29 / 180.76.76.76）";
+	}
+	return true;
 }
 
 function validate_uri() {
@@ -889,7 +934,7 @@ function poll_speed() {
 
 function save(flag) {
 	if (SESSION_LOST) { return; }
-	if (!validate_uri() || !validate_tun()) {
+	if (!validate_uri() || !validate_tun() || !validate_dns_pool()) {
 		alert("配置有误，请先修正标红的输入项");
 		return;
 	}
@@ -1242,6 +1287,12 @@ function reload_Soft_Center() {
 													<th>拦截加密 DNS</th>
 													<td><input type="checkbox" id="phantom_block_doh" class="input" style="vertical-align:middle;">
 														<span class="phantom-hint">拦掉 LAN 侧的 DoT(853) 与已知 DoH 解析器：客户端一旦绕过路由器做加密解析，被墙域名的 IP 就进不了白名单，那些站点会直连失败。代价是 <i>1.1.1.1</i> 这类解析器的网页版也打不开。</span></td>
+												</tr>
+												<tr>
+													<th>国内解析器池</th>
+													<td><input type="text" id="phantom_dns_direct" class="input_ss_table" style="width:420px;" onblur="validate_dns_pool();">
+														<div class="phantom-hint" id="dns_pool_tip"></div>
+														<div class="phantom-hint">逗号分隔、<b>按优先级排列</b>：不在白名单里的域名（绝大多数国内站点）用这里的解析器走物理网卡解析。某台 900ms 没应答就自动换下一台，连续 3 次超时的会被冷落 60 秒 —— <b>不要只填一台</b>，那一家抽风时整屋域名都解析不出来。默认 阿里 223.5.5.5 / 腾讯 119.29.29.29 / 百度 180.76.76.76（可选 114DNS 114.114.114.114、字节 180.184.1.1）。</div></td>
 												</tr>
 												<tr>
 													<th>日志级别</th>

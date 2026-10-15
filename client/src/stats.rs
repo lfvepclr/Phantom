@@ -102,6 +102,14 @@ pub struct TrafficStats {
     pub pool_reused: AtomicU64,
     /// Sessions currently waiting in the pool.
     pub pool_idle: AtomicU64,
+
+    // ---- Direct-path DNS resolver pool ------------------------------------
+    /// Index of the resolver the direct path currently prefers.
+    pub dns_direct_active: AtomicU64,
+    /// Queries re-sent through another resolver after a timeout.
+    pub dns_direct_failovers: AtomicU64,
+    /// Queries abandoned after every resolver timed out.
+    pub dns_direct_timeouts: AtomicU64,
 }
 
 impl TrafficStats {
@@ -123,7 +131,8 @@ impl TrafficStats {
              \"net_epoch_bumps\":{},\"flow_stall_drops\":{},\"tunnel_connects\":{},\"tunnel_connect_failures\":{},\
              \"direct_up\":{},\"direct_down\":{},\"tunnel_up\":{},\"tunnel_down\":{},\
              \"ipset_entries\":{},\"kernel_split\":{},\"unknown_flow_rst\":{},\
-             \"ipset_publish_wait_ms\":{},\"pool_created\":{},\"pool_reused\":{},\"pool_idle\":{}}}",
+             \"ipset_publish_wait_ms\":{},\"pool_created\":{},\"pool_reused\":{},\"pool_idle\":{},\
+             \"dns_direct_active\":{},\"dns_direct_failovers\":{},\"dns_direct_timeouts\":{}}}",
             self.tcp_bytes_up.load(Ordering::Relaxed),
             self.tcp_bytes_down.load(Ordering::Relaxed),
             self.udp_bytes_up.load(Ordering::Relaxed),
@@ -154,6 +163,9 @@ impl TrafficStats {
             self.pool_created.load(Ordering::Relaxed),
             self.pool_reused.load(Ordering::Relaxed),
             self.pool_idle.load(Ordering::Relaxed),
+            self.dns_direct_active.load(Ordering::Relaxed),
+            self.dns_direct_failovers.load(Ordering::Relaxed),
+            self.dns_direct_timeouts.load(Ordering::Relaxed),
         )
     }
 
@@ -168,7 +180,8 @@ impl TrafficStats {
          \"net_epoch_bumps\":0,\"flow_stall_drops\":0,\"tunnel_connects\":0,\"tunnel_connect_failures\":0,\
          \"direct_up\":0,\"direct_down\":0,\"tunnel_up\":0,\"tunnel_down\":0,\
          \"ipset_entries\":0,\"kernel_split\":0,\"unknown_flow_rst\":0,\
-         \"ipset_publish_wait_ms\":0,\"pool_created\":0,\"pool_reused\":0,\"pool_idle\":0}"
+         \"ipset_publish_wait_ms\":0,\"pool_created\":0,\"pool_reused\":0,\"pool_idle\":0,\
+         \"dns_direct_active\":0,\"dns_direct_failovers\":0,\"dns_direct_timeouts\":0}"
             .to_string()
     }
 
@@ -305,6 +318,22 @@ impl TrafficStats {
         self.pool_idle.store(idle, Ordering::Relaxed);
     }
 
+    /// Which resolver of the direct path is currently preferred (0 = the first
+    /// entry of `client.dns_direct`). A non-zero value means a resolver was
+    /// demoted after repeated timeouts — the interesting case for "国内网站
+    /// 解析很慢" reports.
+    pub fn set_dns_direct_active(&self, idx: u64) {
+        self.dns_direct_active.store(idx, Ordering::Relaxed);
+    }
+
+    pub fn record_dns_direct_failover(&self) {
+        self.dns_direct_failovers.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_dns_direct_timeout(&self) {
+        self.dns_direct_timeouts.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Render stats in Prometheus exposition format.
     ///
     /// The TUN-health counters are included on purpose: "the tunnel is up but
@@ -344,7 +373,10 @@ impl TrafficStats {
              # HELP phantom_ipset_publish_wait_max_ms Worst synchronous ipset publish (a DNS answer is held this long)\n# TYPE phantom_ipset_publish_wait_max_ms gauge\nphantom_ipset_publish_wait_max_ms {}\n\
              # HELP phantom_pool_created_total TCP tunnel sessions built by a handshake (cold flows + pool refills)\n# TYPE phantom_pool_created_total counter\nphantom_pool_created_total {}\n\
              # HELP phantom_pool_reused_total Flows served by an already-handshaked pooled session\n# TYPE phantom_pool_reused_total counter\nphantom_pool_reused_total {}\n\
-             # HELP phantom_pool_idle Sessions idle in the TCP session pool right now\n# TYPE phantom_pool_idle gauge\nphantom_pool_idle {}\n",
+             # HELP phantom_pool_idle Sessions idle in the TCP session pool right now\n# TYPE phantom_pool_idle gauge\nphantom_pool_idle {}\n\
+             # HELP phantom_dns_direct_active Index of the preferred direct-path DNS resolver (0 = first in client.dns_direct)\n# TYPE phantom_dns_direct_active gauge\nphantom_dns_direct_active {}\n\
+             # HELP phantom_dns_direct_failovers_total DNS queries re-sent through another resolver after a timeout\n# TYPE phantom_dns_direct_failovers_total counter\nphantom_dns_direct_failovers_total {}\n\
+             # HELP phantom_dns_direct_timeouts_total DNS queries abandoned after every resolver in the pool timed out\n# TYPE phantom_dns_direct_timeouts_total counter\nphantom_dns_direct_timeouts_total {}\n",
             self.tcp_bytes_up.load(Ordering::Relaxed),
             self.tcp_bytes_down.load(Ordering::Relaxed),
             self.udp_bytes_up.load(Ordering::Relaxed),
@@ -377,6 +409,9 @@ impl TrafficStats {
             self.pool_created.load(Ordering::Relaxed),
             self.pool_reused.load(Ordering::Relaxed),
             self.pool_idle.load(Ordering::Relaxed),
+            self.dns_direct_active.load(Ordering::Relaxed),
+            self.dns_direct_failovers.load(Ordering::Relaxed),
+            self.dns_direct_timeouts.load(Ordering::Relaxed),
         )
     }
 }
@@ -498,7 +533,8 @@ mod tests {
              \"net_epoch_bumps\":0,\"flow_stall_drops\":0,\"tunnel_connects\":0,\"tunnel_connect_failures\":0,\
              \"direct_up\":0,\"direct_down\":0,\"tunnel_up\":0,\"tunnel_down\":0,\
              \"ipset_entries\":0,\"kernel_split\":0,\"unknown_flow_rst\":0,\
-             \"ipset_publish_wait_ms\":0,\"pool_created\":0,\"pool_reused\":0,\"pool_idle\":0}"
+             \"ipset_publish_wait_ms\":0,\"pool_created\":0,\"pool_reused\":0,\"pool_idle\":0,\
+             \"dns_direct_active\":0,\"dns_direct_failovers\":0,\"dns_direct_timeouts\":0}"
         );
     }
 

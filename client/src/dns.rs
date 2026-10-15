@@ -20,7 +20,9 @@ use bytes::{Bytes, BytesMut};
 use phantom_core::{PhantomError, Result};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc::UnboundedSender;
@@ -36,6 +38,80 @@ pub fn parse_dns_addr(dns: &str) -> Option<SocketAddr> {
         .parse()
         .ok()
         .or_else(|| format!("{}:53", stripped).parse().ok())
+}
+
+// ---------------------------------------------------------------------------
+// Direct-path failover
+// ---------------------------------------------------------------------------
+
+/// How long one direct-path attempt may take before the next resolver is tried.
+///
+/// Domestic public resolvers answer in single-digit milliseconds, so most of
+/// this window is spare. It only has to be short enough that a dead resolver
+/// does not become the user's page-load latency.
+const DIRECT_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(900);
+
+/// How many resolvers one query may try before the app is left to time out.
+const DIRECT_MAX_ATTEMPTS: u32 = 3;
+
+/// Consecutive timeouts before a resolver is taken out of rotation.
+const DIRECT_FAILURE_THRESHOLD: u32 = 3;
+
+/// How long a demoted resolver stays out of rotation.
+const DIRECT_COOLDOWN: Duration = Duration::from_secs(60);
+
+/// How often the retry sweeper looks for unanswered direct queries.
+const DIRECT_SWEEP_INTERVAL: Duration = Duration::from_millis(200);
+
+/// One unanswered direct-path query, kept so it can be re-sent elsewhere.
+struct DirectAttempt {
+    /// The query as it was sent; re-sent verbatim (same transaction id, so the
+    /// app's pending lookup still matches whatever answers first).
+    payload: Vec<u8>,
+    /// Resolver this attempt went to.
+    upstream: SocketAddr,
+    sent_at: Instant,
+    tries: u32,
+}
+
+/// Failover bookkeeping for the direct-path resolver pool.
+#[derive(Default)]
+struct DirectHealth {
+    /// Consecutive timeouts per resolver.
+    failures: HashMap<SocketAddr, u32>,
+    /// Resolver -> instant it may be used again.
+    cooldown: HashMap<SocketAddr, Instant>,
+    /// In-flight direct queries: transaction id -> attempt state.
+    attempts: HashMap<u16, DirectAttempt>,
+}
+
+/// Parse a resolver list (`client.dns_direct`) into addresses.
+///
+/// Accepts commas and/or whitespace as separators, so both of these work:
+///
+/// ```text
+/// dns_direct = "223.5.5.5:53"
+/// dns_direct = "223.5.5.5,119.29.29.29,180.76.76.76"
+/// ```
+///
+/// A single value keeps working (older configs, and every other platform's
+/// default), and an entry that does not parse is dropped with a warning rather
+/// than taking the whole list down — a typo in the third resolver must not cost
+/// the user their first two.
+///
+/// The order is the preference order: index 0 is tried first, the rest are
+/// fallbacks (see [`DnsProxy::set_direct_upstreams`]).
+pub fn parse_dns_addrs(dns: &str) -> Vec<SocketAddr> {
+    dns.split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| {
+            let addr = parse_dns_addr(s);
+            if addr.is_none() {
+                tracing::warn!("ignoring unparsable DNS resolver '{}'", s);
+            }
+            addr
+        })
+        .collect()
 }
 
 /// Simple DNS header (12 bytes).
@@ -203,8 +279,27 @@ pub struct DnsProxy {
     local_socket: Arc<UdpSocket>,
     /// Resolver reached through the tunnel (`client.dns`).
     tunnel_upstream: RwLock<SocketAddr>,
-    /// Resolver reached over the physical network (`client.dns_direct`).
-    local_upstream: RwLock<SocketAddr>,
+    /// Resolvers reached over the physical network (`client.dns_direct`), in
+    /// preference order. A single Chinese public resolver is a single point of
+    /// failure: when it is unreachable (or lying), every domestic name fails to
+    /// resolve and the whole LAN looks broken.
+    direct_upstreams: RwLock<Vec<SocketAddr>>,
+    /// Index into `direct_upstreams` we currently prefer.
+    direct_active: AtomicUsize,
+    /// Failover state for the direct path.
+    direct_health: Mutex<DirectHealth>,
+    /// Failovers performed (a query re-sent through another resolver).
+    direct_failovers: AtomicU64,
+    /// Queries given up on after every resolver timed out.
+    direct_timeouts: AtomicU64,
+    /// Optional Prometheus surface; absent on platform bridges that do not
+    /// mirror these counters.
+    stats: RwLock<Option<Arc<crate::stats::TrafficStats>>>,
+    /// Per-attempt timeout for the direct path.
+    ///
+    /// A field rather than a constant so the failover tests do not have to sit
+    /// through the production 900 ms window.
+    direct_attempt_timeout: Duration,
     /// Outbound half of the shared tunnel-side UDP flow to `tunnel_upstream`.
     /// `None` until the flow is established; cleared again when it dies.
     tunnel_out: RwLock<Option<UnboundedSender<Vec<u8>>>>,
@@ -224,9 +319,19 @@ pub struct DnsProxy {
 impl DnsProxy {
     /// Create a new DNS proxy bound to a local ephemeral port.
     ///
-    /// `tunnel_upstream` is only dialled through the tunnel (never directly),
-    /// `local_upstream` is only dialled over the physical network.
-    pub async fn new(tunnel_upstream: SocketAddr, local_upstream: SocketAddr) -> Result<Self> {
+    /// `tunnel_upstream` is only dialled through the tunnel (never directly);
+    /// `direct_upstreams` are only dialled over the physical network, in the
+    /// given preference order. An empty list is a configuration error: without
+    /// a direct resolver the proxy would have nowhere to send ordinary queries.
+    pub async fn new(
+        tunnel_upstream: SocketAddr,
+        direct_upstreams: Vec<SocketAddr>,
+    ) -> Result<Self> {
+        if direct_upstreams.is_empty() {
+            return Err(PhantomError::Config(
+                "No direct DNS resolver configured (client.dns_direct)".to_string(),
+            ));
+        }
         let bind_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
         let socket = UdpSocket::bind(bind_addr)
             .await
@@ -238,15 +343,25 @@ impl DnsProxy {
         #[cfg(unix)]
         crate::net_tune::protect_socket(std::os::unix::io::AsRawFd::as_raw_fd(&socket));
         tracing::info!(
-            "DNS proxy bound to {} (tunnel resolver {}, direct resolver {})",
+            "DNS proxy bound to {} (tunnel resolver {}, direct resolvers [{}])",
             socket.local_addr()?,
             tunnel_upstream,
-            local_upstream
+            direct_upstreams
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
         Ok(Self {
             local_socket: Arc::new(socket),
             tunnel_upstream: RwLock::new(tunnel_upstream),
-            local_upstream: RwLock::new(local_upstream),
+            direct_upstreams: RwLock::new(direct_upstreams),
+            direct_active: AtomicUsize::new(0),
+            direct_health: Mutex::new(DirectHealth::default()),
+            direct_failovers: AtomicU64::new(0),
+            direct_timeouts: AtomicU64::new(0),
+            stats: RwLock::new(None),
+            direct_attempt_timeout: DIRECT_ATTEMPT_TIMEOUT,
             tunnel_out: RwLock::new(None),
             pending: Arc::new(Mutex::new(std::collections::HashMap::new())),
             query_domains: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -335,10 +450,30 @@ impl DnsProxy {
                     .map_err(|_| PhantomError::Config("Tunnel DNS flow closed".to_string()))?;
             }
             DnsRoute::Local => {
+                let Some(upstream) = self.direct_upstream() else {
+                    return Err(PhantomError::Config(
+                        "No direct DNS resolver configured".to_string(),
+                    ));
+                };
                 self.local_socket
-                    .send_to(payload, self.direct_upstream())
+                    .send_to(payload, upstream)
                     .await
                     .map_err(PhantomError::Io)?;
+                // Remember what we sent so a resolver that never answers can be
+                // rotated off without the app ever seeing a timeout
+                // (see `sweep_direct`). Same transaction id on the retry, so
+                // whichever answer arrives first satisfies the lookup.
+                if let Some(header) = DnsHeader::decode(payload) {
+                    self.direct_health.lock().await.attempts.insert(
+                        header.id,
+                        DirectAttempt {
+                            payload: payload.to_vec(),
+                            upstream,
+                            sent_at: Instant::now(),
+                            tries: 1,
+                        },
+                    );
+                }
             }
         }
         Ok(())
@@ -363,6 +498,8 @@ impl DnsProxy {
     ) -> Option<(DnsQueryContext, Option<String>, DnsRoute)> {
         let header = DnsHeader::decode(payload)?;
         let id = header.id;
+        // Answered: stop the failover sweeper from re-sending it.
+        self.direct_health.lock().await.attempts.remove(&id);
         let ctx = self.pending.lock().await.remove(&id)?;
         let domain = self.query_domains.lock().await.remove(&id);
         let route = self
@@ -385,11 +522,14 @@ impl DnsProxy {
         loop {
             buf.clear();
             buf.resize(4096, 0);
-            let (n, _peer) = self
+            let (n, peer) = self
                 .local_socket
                 .recv_from(&mut buf)
                 .await
                 .map_err(|e| PhantomError::Io(e))?;
+            // The source address is the resolver that actually answered, which
+            // is how a demoted one earns its way back into rotation.
+            self.note_direct_success(peer).await;
             let payload = buf[..n].to_vec();
             self.dispatch_response(payload, &mut on_response).await;
         }
@@ -424,12 +564,53 @@ impl DnsProxy {
             .unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Resolver used over the physical network (`client.dns_direct`).
-    pub fn direct_upstream(&self) -> SocketAddr {
-        *self
-            .local_upstream
+    /// Resolver currently used over the physical network.
+    ///
+    /// This is the pool entry we prefer right now; when it starts timing out
+    /// the failover sweeper advances the index (see [`Self::spawn_direct_failover`]).
+    pub fn direct_upstream(&self) -> Option<SocketAddr> {
+        let list = self
+            .direct_upstreams
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        if list.is_empty() {
+            return None;
+        }
+        let idx = self.direct_active.load(Ordering::Relaxed) % list.len();
+        Some(list[idx])
+    }
+
+    /// The whole direct-path pool, in preference order.
+    pub fn direct_upstreams(&self) -> Vec<SocketAddr> {
+        self.direct_upstreams
             .read()
             .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Attach the metrics surface (optional: platform bridges may skip it).
+    pub fn set_stats(&self, stats: Arc<crate::stats::TrafficStats>) {
+        *self.stats.write().unwrap_or_else(|e| e.into_inner()) = Some(stats);
+    }
+
+    /// Number of queries that had to be re-sent through another resolver.
+    pub fn direct_failovers(&self) -> u64 {
+        self.direct_failovers.load(Ordering::Relaxed)
+    }
+
+    /// Number of queries abandoned because every resolver timed out.
+    pub fn direct_timeout_count(&self) -> u64 {
+        self.direct_timeouts.load(Ordering::Relaxed)
+    }
+
+    /// Test hook: shorten the per-attempt timeout.
+    #[cfg(test)]
+    fn set_direct_attempt_timeout(&mut self, timeout: Duration) {
+        self.direct_attempt_timeout = timeout;
+    }
+
+    fn stats(&self) -> Option<Arc<crate::stats::TrafficStats>> {
+        self.stats.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Retarget the tunnel resolver. Returns `true` when it actually changed.
@@ -452,18 +633,228 @@ impl DnsProxy {
         true
     }
 
-    /// Retarget the direct resolver. Returns `true` when it actually changed.
-    pub fn set_direct_upstream(&self, addr: SocketAddr) -> bool {
-        let mut guard = self
-            .local_upstream
-            .write()
-            .unwrap_or_else(|e| e.into_inner());
-        if *guard == addr {
+    /// Replace the direct resolver pool (config reload). Returns `true` when it
+    /// actually changed.
+    ///
+    /// Health state is reset with it: an operator who edits the list wants the
+    /// new order tried as-is, not the old cooldowns carried over.
+    pub fn set_direct_upstreams(&self, addrs: Vec<SocketAddr>) -> bool {
+        if addrs.is_empty() {
+            tracing::warn!("refusing to empty the direct DNS resolver pool");
             return false;
         }
-        tracing::info!("DNS direct upstream changed: {} -> {}", *guard, addr);
-        *guard = addr;
+        let mut guard = self
+            .direct_upstreams
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if *guard == addrs {
+            return false;
+        }
+        tracing::info!(
+            "DNS direct resolvers changed: [{}] -> [{}]",
+            guard
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+            addrs
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        *guard = addrs;
+        self.direct_active.store(0, Ordering::Relaxed);
+        if let Ok(mut health) = self.direct_health.try_lock() {
+            health.failures.clear();
+            health.cooldown.clear();
+        }
+        if let Some(stats) = self.stats() {
+            stats.set_dns_direct_active(0);
+        }
         true
+    }
+
+    /// Start the direct-path failover sweeper.
+    ///
+    /// Spawned once per proxy. Without it a query sent to a resolver that never
+    /// answers is simply lost: the app waits out its own timeout, then retries,
+    /// which is exactly the "国内网站打开很慢/打不开" shape of a dead upstream.
+    pub fn spawn_direct_failover(self: &Arc<Self>) {
+        let proxy = Arc::clone(self);
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(DIRECT_SWEEP_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                proxy.sweep_direct().await;
+            }
+        });
+    }
+
+    /// Resolver index to use: the preferred one if it is not cooling down,
+    /// otherwise the first that is not.
+    fn pick_direct(&self, health: &DirectHealth, list: &[SocketAddr], start: usize) -> usize {
+        let now = Instant::now();
+        for offset in 0..list.len() {
+            let idx = (start + offset) % list.len();
+            let cooling = matches!(health.cooldown.get(&list[idx]), Some(until) if now < *until);
+            if !cooling {
+                return idx;
+            }
+        }
+        start % list.len()
+    }
+
+    /// Resolver to retry a timed-out query on.
+    fn next_direct_upstream(&self, failed: SocketAddr) -> Option<SocketAddr> {
+        let list = self.direct_upstreams();
+        if list.is_empty() {
+            return None;
+        }
+        if list.len() == 1 {
+            // A single resolver is still worth one more datagram: UDP loss is
+            // not the same failure as a dead resolver.
+            return Some(list[0]);
+        }
+        let active = self.direct_active.load(Ordering::Relaxed) % list.len();
+        if list[active] != failed {
+            return Some(list[active]);
+        }
+        let pos = list.iter().position(|a| *a == failed).unwrap_or(0);
+        let health = self.direct_health.try_lock().ok();
+        match health {
+            Some(health) => Some(list[self.pick_direct(&health, &list, (pos + 1) % list.len())]),
+            None => Some(list[(pos + 1) % list.len()]),
+        }
+    }
+
+    /// Count a timeout against a resolver and demote it when it keeps failing.
+    async fn note_direct_failure(&self, upstream: SocketAddr) {
+        let list = self.direct_upstreams();
+        let mut health = self.direct_health.lock().await;
+        let failures = health.failures.entry(upstream).or_insert(0);
+        *failures += 1;
+        if *failures < DIRECT_FAILURE_THRESHOLD {
+            return;
+        }
+        *failures = 0;
+        health
+            .cooldown
+            .insert(upstream, Instant::now() + DIRECT_COOLDOWN);
+        if let Some(pos) = list.iter().position(|a| *a == upstream) {
+            let next = (pos + 1) % list.len().max(1);
+            self.direct_active.store(next, Ordering::Relaxed);
+            if let Some(stats) = self.stats() {
+                stats.set_dns_direct_active(next as u64);
+            }
+            tracing::warn!(
+                "direct DNS resolver {} demoted for {}s ({} consecutive timeouts); now preferring {}",
+                upstream,
+                DIRECT_COOLDOWN.as_secs(),
+                DIRECT_FAILURE_THRESHOLD,
+                list.get(next).map(|a| a.to_string()).unwrap_or_default()
+            );
+        }
+    }
+
+    /// A resolver answered: clear its history and prefer it again.
+    async fn note_direct_success(&self, from: SocketAddr) {
+        let list = self.direct_upstreams();
+        if !list.contains(&from) {
+            return;
+        }
+        let mut health = self.direct_health.lock().await;
+        health.failures.remove(&from);
+        let was_cooling = health.cooldown.remove(&from).is_some();
+        if let Some(pos) = list.iter().position(|a| *a == from) {
+            let active = self.direct_active.load(Ordering::Relaxed) % list.len().max(1);
+            if pos < active || was_cooling {
+                self.direct_active.store(pos, Ordering::Relaxed);
+                if let Some(stats) = self.stats() {
+                    stats.set_dns_direct_active(pos as u64);
+                }
+            }
+        }
+    }
+
+    /// One pass of the retry sweeper.
+    async fn sweep_direct(&self) {
+        let now = Instant::now();
+        let list = self.direct_upstreams();
+        if list.is_empty() {
+            self.direct_health.lock().await.attempts.clear();
+            return;
+        }
+
+        let mut retry: Vec<u16> = Vec::new();
+        let mut give_up: Vec<u16> = Vec::new();
+        {
+            let mut health = self.direct_health.lock().await;
+            health.cooldown.retain(|_, until| now < *until);
+            // The preferred resolver is back in rotation once its cooldown ends.
+            if list.len() > 1 && !health.cooldown.contains_key(&list[0]) {
+                self.direct_active.store(0, Ordering::Relaxed);
+                if let Some(stats) = self.stats() {
+                    stats.set_dns_direct_active(0);
+                }
+            }
+            for (id, attempt) in health.attempts.iter() {
+                if now.duration_since(attempt.sent_at) < self.direct_attempt_timeout {
+                    continue;
+                }
+                if attempt.tries >= DIRECT_MAX_ATTEMPTS {
+                    give_up.push(*id);
+                } else {
+                    retry.push(*id);
+                }
+            }
+        }
+
+        for id in give_up {
+            let attempt = self.direct_health.lock().await.attempts.remove(&id);
+            if let Some(attempt) = attempt {
+                self.direct_timeouts.fetch_add(1, Ordering::Relaxed);
+                if let Some(stats) = self.stats() {
+                    stats.record_dns_direct_timeout();
+                }
+                tracing::warn!(
+                    "direct DNS {} gave up after {} tries via {}",
+                    id,
+                    attempt.tries,
+                    attempt.upstream
+                );
+            }
+        }
+
+        for id in retry {
+            let attempt = self.direct_health.lock().await.attempts.remove(&id);
+            let Some(mut attempt) = attempt else { continue };
+            // The answer may have arrived between the sweep decision and here.
+            if !self.pending.lock().await.contains_key(&id) {
+                continue;
+            }
+            self.note_direct_failure(attempt.upstream).await;
+            let Some(next) = self.next_direct_upstream(attempt.upstream) else {
+                continue;
+            };
+            attempt.tries += 1;
+            attempt.upstream = next;
+            attempt.sent_at = Instant::now();
+            match self.local_socket.send_to(&attempt.payload, next).await {
+                Ok(_) => {
+                    self.direct_failovers.fetch_add(1, Ordering::Relaxed);
+                    if let Some(stats) = self.stats() {
+                        stats.record_dns_direct_failover();
+                    }
+                    tracing::info!("direct DNS {} timed out, retrying via {}", id, next);
+                    self.direct_health.lock().await.attempts.insert(id, attempt);
+                }
+                Err(e) => {
+                    tracing::warn!("direct DNS {} retry to {} failed: {}", id, next, e);
+                }
+            }
+        }
     }
 }
 
@@ -948,16 +1339,141 @@ mod tests {
         assert_eq!(parse_dns_addr("not-an-address"), None);
     }
 
+    /// `client.dns_direct` may carry a pool. Commas and whitespace both work,
+    /// a single value keeps working (older configs), and one bad entry must not
+    /// take the good ones down with it.
+    #[test]
+    fn parse_dns_addrs_accepts_pools_and_survives_typos() {
+        assert_eq!(
+            parse_dns_addrs("223.5.5.5,119.29.29.29,180.76.76.76"),
+            vec![
+                "223.5.5.5:53".parse().unwrap(),
+                "119.29.29.29:53".parse().unwrap(),
+                "180.76.76.76:53".parse().unwrap(),
+            ]
+        );
+        assert_eq!(
+            parse_dns_addrs("223.5.5.5:5353 119.29.29.29"),
+            vec![
+                "223.5.5.5:5353".parse().unwrap(),
+                "119.29.29.29:53".parse().unwrap(),
+            ]
+        );
+        // Single value: the pre-pool spelling.
+        assert_eq!(
+            parse_dns_addrs("223.5.5.5:53"),
+            vec!["223.5.5.5:53".parse().unwrap()]
+        );
+        // A typo costs that entry only.
+        assert_eq!(
+            parse_dns_addrs("223.5.5.5,,  ,oops,119.29.29.29"),
+            vec![
+                "223.5.5.5:53".parse().unwrap(),
+                "119.29.29.29:53".parse().unwrap(),
+            ]
+        );
+        assert!(parse_dns_addrs("").is_empty());
+        // The tls:// prefix stays tolerated (and stays plain UDP).
+        assert_eq!(
+            parse_dns_addrs("tls://1.1.1.1:853"),
+            vec!["1.1.1.1:853".parse().unwrap()]
+        );
+    }
+
+    /// A resolver that stops answering must not cost the app a timeout: the
+    /// query is re-sent through the next one, and the answer reaches the app
+    /// exactly once even though two queries are in flight.
+    #[tokio::test]
+    async fn direct_path_fails_over_and_drops_the_late_answer() {
+        // Resolver A answers after 250 ms (too slow); resolver B answers at once.
+        let slow = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let slow_addr = slow.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            if let Ok((n, peer)) = slow.recv_from(&mut buf).await {
+                let mut reply = buf[..n].to_vec();
+                reply[2] |= 0x80;
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                let _ = slow.send_to(&reply, peer).await;
+            }
+        });
+        let fast = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let fast_addr = fast.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            while let Ok((n, peer)) = fast.recv_from(&mut buf).await {
+                let mut reply = buf[..n].to_vec();
+                reply[2] |= 0x80;
+                let _ = fast.send_to(&reply, peer).await;
+            }
+        });
+
+        let mut proxy = DnsProxy::new("127.0.0.1:1".parse().unwrap(), vec![slow_addr, fast_addr])
+            .await
+            .unwrap();
+        proxy.set_direct_attempt_timeout(std::time::Duration::from_millis(50));
+        let proxy = Arc::new(proxy);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DnsRoute>();
+        let loop_proxy = Arc::clone(&proxy);
+        tokio::spawn(async move {
+            let mut on_response = move |_payload: Bytes,
+                                        _ctx: DnsQueryContext,
+                                        _domain: Option<String>,
+                                        route: DnsRoute| {
+                let tx = tx.clone();
+                async move {
+                    let _ = tx.send(route);
+                    Ok(())
+                }
+            };
+            let _ = loop_proxy.run_local(&mut on_response).await;
+        });
+
+        proxy.spawn_direct_failover();
+        proxy
+            .forward(
+                &a_query(0x7a7a, "www.example.com"),
+                query_ctx(),
+                DnsRoute::Local,
+            )
+            .await
+            .unwrap();
+
+        let route = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("failover never delivered an answer")
+            .unwrap();
+        assert_eq!(route, DnsRoute::Local);
+        assert_eq!(
+            proxy.direct_failovers(),
+            1,
+            "the query should have been re-sent exactly once"
+        );
+
+        // A's late answer must not reach the app a second time.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(600), rx.recv())
+                .await
+                .is_err(),
+            "the late answer from the demoted resolver was delivered twice"
+        );
+        assert_eq!(proxy.direct_timeout_count(), 0);
+    }
+
     #[tokio::test]
     async fn set_upstream_swaps_resolver_once() {
         let proxy = DnsProxy::new(
             "8.8.8.8:53".parse().unwrap(),
-            "223.5.5.5:53".parse().unwrap(),
+            vec!["223.5.5.5:53".parse().unwrap()],
         )
         .await
         .unwrap();
         assert_eq!(proxy.upstream(), "8.8.8.8:53".parse().unwrap());
-        assert_eq!(proxy.direct_upstream(), "223.5.5.5:53".parse().unwrap());
+        assert_eq!(
+            proxy.direct_upstream(),
+            Some("223.5.5.5:53".parse().unwrap())
+        );
 
         assert!(proxy.set_upstream("1.1.1.1:53".parse().unwrap()));
         assert_eq!(proxy.upstream(), "1.1.1.1:53".parse().unwrap());
@@ -965,10 +1481,20 @@ mod tests {
         // hot-reload watcher stays quiet on unrelated config edits.
         assert!(!proxy.set_upstream("1.1.1.1:53".parse().unwrap()));
 
-        // The direct resolver is retargeted independently.
-        assert!(proxy.set_direct_upstream("119.29.29.29:53".parse().unwrap()));
-        assert_eq!(proxy.direct_upstream(), "119.29.29.29:53".parse().unwrap());
-        assert!(!proxy.set_direct_upstream("119.29.29.29:53".parse().unwrap()));
+        // The direct resolver pool is retargeted independently.
+        assert!(proxy.set_direct_upstreams(vec!["119.29.29.29:53".parse().unwrap()]));
+        assert_eq!(
+            proxy.direct_upstream(),
+            Some("119.29.29.29:53".parse().unwrap())
+        );
+        assert!(!proxy.set_direct_upstreams(vec!["119.29.29.29:53".parse().unwrap()]));
+        // An empty pool is refused: it would leave the proxy with nowhere to
+        // send ordinary queries.
+        assert!(!proxy.set_direct_upstreams(vec![]));
+        assert_eq!(
+            proxy.direct_upstream(),
+            Some("119.29.29.29:53".parse().unwrap())
+        );
         assert_eq!(proxy.upstream(), "1.1.1.1:53".parse().unwrap());
     }
 
@@ -1075,7 +1601,7 @@ mod tests {
 
         // The tunnel resolver address is never dialled on this path.
         let proxy = Arc::new(
-            DnsProxy::new("127.0.0.1:1".parse().unwrap(), resolver_addr)
+            DnsProxy::new("127.0.0.1:1".parse().unwrap(), vec![resolver_addr])
                 .await
                 .unwrap(),
         );
@@ -1115,7 +1641,7 @@ mod tests {
     async fn tunnel_route_goes_through_the_udp_flow() {
         let proxy = DnsProxy::new(
             "9.9.9.9:53".parse().unwrap(),
-            "127.0.0.1:1".parse().unwrap(),
+            vec!["127.0.0.1:1".parse().unwrap()],
         )
         .await
         .unwrap();

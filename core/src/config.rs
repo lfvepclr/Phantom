@@ -78,11 +78,20 @@ pub struct ClientSettings {
     /// compatibility but DoT is not implemented.
     #[serde(default = "default_dns")]
     pub dns: String,
-    /// Resolver used for destinations that are routed **directly** (everything
+    /// Resolvers used for destinations that are routed **directly** (everything
     /// not in the proxy whitelist while in Smart mode).
     ///
+    /// A comma/whitespace separated **preference-ordered list**, e.g.
+    /// `"223.5.5.5:53,119.29.29.29:53,180.76.76.76:53"` (AliDNS, DNSPod,
+    /// Baidu; 114DNS and 180.184.1.1 also work). A single address keeps
+    /// working, but one domestic resolver is a single point of failure: when it
+    /// is unreachable or lying, every ordinary name stops resolving and the
+    /// whole LAN looks broken.
+    ///
     /// Queried from the physical network so domestic CDNs still answer with a
-    /// local node; never polluted by the tunnel's egress country.
+    /// local node; never polluted by the tunnel's egress country. The client
+    /// rotates to the next entry when the current one stops answering (see
+    /// `client/src/dns.rs`), so the order is a preference, not a hard pin.
     #[serde(default = "default_dns_direct")]
     pub dns_direct: String,
     /// Forward AAAA answers for domains that are routed **through the tunnel**.
@@ -132,7 +141,8 @@ fn default_dns() -> String {
 }
 
 fn default_dns_direct() -> String {
-    "223.5.5.5:53".to_string()
+    // 三家不同厂商的国内公共解析：单点故障时还有两家顶上。
+    "223.5.5.5:53,119.29.29.29:53,180.76.76.76:53".to_string()
 }
 
 fn default_proxy_mode() -> ProxyMode {
@@ -615,7 +625,11 @@ public_key = "dGVzdA=="
         assert_eq!(config.servers.len(), 1);
         assert_eq!(config.client.listen, "127.0.0.1:1080");
         assert_eq!(config.client.dns, "8.8.8.8:53");
-        assert_eq!(config.client.dns_direct, "223.5.5.5:53");
+        // 默认是一组国内公共解析器（阿里/腾讯/百度）：单点故障时还有两家顶上。
+        assert_eq!(
+            config.client.dns_direct,
+            "223.5.5.5:53,119.29.29.29:53,180.76.76.76:53"
+        );
         assert!(
             !config.client.dns_ipv6_via_tunnel,
             "an AAAA for a tunnel-routed name is an address the exit may not be able to use"

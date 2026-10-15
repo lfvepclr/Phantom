@@ -166,7 +166,7 @@ Reject → RST packet   Proxy  → Noise tunnel (UDP SYN frame) → Server
 | `rules.*` | `RulesConfig` | `rules.rs` RuleEngine (7种规则+GeoIP) | **已实现** |
 | `rules.geoip` | `HashMap<String, RuleAction>` | maxminddb 查询 + 国家码匹配 | **已实现** |
 | `client.dns`（热更） | `String` | `dns.rs` `DnsProxy::set_upstream()` | **已实现** |
-| `client.dns_direct` | `String` | `dns.rs` 直连解析器（物理网卡，`net_tune::protect_socket`） | **已实现** |
+| `client.dns_direct` | `String`（逗号/空白分隔的**优先级列表**，单值兼容） | `dns.rs` 直连解析器池（物理网卡，`net_tune::protect_socket`）；`parse_dns_addrs()` 解析，`DIRECT_ATTEMPT_TIMEOUT`(900ms) 无应答即换下一台，连续 3 次超时冷却 60s，`set_direct_upstreams()` 热更整个池。默认 `223.5.5.5:53,119.29.29.29:53,180.76.76.76:53` | **已实现** |
 | `client.dns_ipv6_via_tunnel` | `bool`（默认 `false`） | `tun.rs::handle_dns_query` + `dns.rs::build_nodata_response()`：隧道内域名不下发 AAAA，避免 App 死磕出口不可达的 IPv6 地址；直连域名不受影响 | **已实现** |
 | `client.metrics_listen` | `String` | `client/src/stats.rs` `serve_metrics()`，SOCKS5/TUN 共享 | **已实现** |
 | `client.listen` | `String` | 入站监听地址，`0.0.0.0` 即局域网共享；默认 `127.0.0.1:1080` | **已实现** |

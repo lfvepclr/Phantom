@@ -260,19 +260,31 @@ impl PhantomClient {
             Err(e) => tracing::warn!("Rule engine init failed: {}", e),
         }
         let tunnel_dns = crate::dns::parse_dns_addr(&self.config.client.dns);
-        let direct_dns = crate::dns::parse_dns_addr(&self.config.client.dns_direct);
-        if let (Some(tunnel_dns), Some(direct_dns)) = (tunnel_dns, direct_dns) {
+        // `dns_direct` is a preference-ordered pool: one domestic resolver is a
+        // single point of failure, and when it is unreachable every ordinary
+        // name stops resolving.
+        let direct_dns = crate::dns::parse_dns_addrs(&self.config.client.dns_direct);
+        if let Some(tunnel_dns) = tunnel_dns {
             match crate::dns::DnsProxy::new(tunnel_dns, direct_dns).await {
                 Ok(dns) => {
                     // See `ClientSettings::dns_ipv6_via_tunnel`: the tunnel exit
                     // is one server, so by default an AAAA for a tunnelled name
                     // is an address the app cannot use.
                     dns.set_suppress_tunnel_aaaa(!self.config.client.dns_ipv6_via_tunnel);
-                    proxy = proxy.with_dns(std::sync::Arc::new(dns));
+                    dns.set_stats(Arc::clone(&self.stats));
+                    let dns = std::sync::Arc::new(dns);
+                    // Rotate off a resolver that stops answering before the app
+                    // ever sees a timeout.
+                    dns.spawn_direct_failover();
+                    proxy = proxy.with_dns(std::sync::Arc::clone(&dns));
                     tracing::info!(
-                        "DNS hijack enabled, tunnel resolver = {}, direct resolver = {}, tunnel AAAA = {}",
+                        "DNS hijack enabled, tunnel resolver = {}, direct resolvers = [{}], tunnel AAAA = {}",
                         tunnel_dns,
-                        direct_dns,
+                        dns.direct_upstreams()
+                            .iter()
+                            .map(|a| a.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", "),
                         if self.config.client.dns_ipv6_via_tunnel { "forwarded" } else { "suppressed" }
                     );
                 }

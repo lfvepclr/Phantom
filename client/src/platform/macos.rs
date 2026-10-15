@@ -436,7 +436,7 @@ fn start_with_config(config: ClientConfig) -> i32 {
             let mut proxy =
                 crate::tun::TunProxy::new(device, socks5_addr)
                     .with_mode(config.client.mode)
-                    .with_stats(stats)
+                    .with_stats(std::sync::Arc::clone(&stats))
                     .with_whitelist(crate::whitelist::shared(&config).whitelist());
 
             if let Some(server) = config.servers.first() {
@@ -452,16 +452,23 @@ fn start_with_config(config: ClientConfig) -> i32 {
             }
 
             let tunnel_dns = crate::dns::parse_dns_addr(&config.client.dns);
-            let direct_dns = crate::dns::parse_dns_addr(&config.client.dns_direct);
-            if let (Some(tunnel_dns), Some(direct_dns)) = (tunnel_dns, direct_dns) {
+            let direct_dns = crate::dns::parse_dns_addrs(&config.client.dns_direct);
+            if let Some(tunnel_dns) = tunnel_dns {
                 match crate::dns::DnsProxy::new(tunnel_dns, direct_dns).await {
                     Ok(dns) => {
                         dns.set_suppress_tunnel_aaaa(!config.client.dns_ipv6_via_tunnel);
-                        proxy = proxy.with_dns(std::sync::Arc::new(dns));
+                        dns.set_stats(std::sync::Arc::clone(&stats));
+                        let dns = std::sync::Arc::new(dns);
+                        dns.spawn_direct_failover();
+                        proxy = proxy.with_dns(std::sync::Arc::clone(&dns));
                         tracing::info!(
-                            "DNS hijack enabled, tunnel resolver = {}, direct resolver = {}, tunnel AAAA = {}",
+                            "DNS hijack enabled, tunnel resolver = {}, direct resolvers = [{}], tunnel AAAA = {}",
                             tunnel_dns,
-                            direct_dns,
+                            dns.direct_upstreams()
+                                .iter()
+                                .map(|a| a.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", "),
                             if config.client.dns_ipv6_via_tunnel { "forwarded" } else { "suppressed" }
                         );
                     }

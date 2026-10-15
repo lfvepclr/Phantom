@@ -648,6 +648,46 @@ else
     ok "日志中连接串已脱敏"
 fi
 
+step "国内解析器池（多台 DNS 备选，避免单点）"
+# 只有一台国内解析器就是单点故障：那家抽风时整屋普通域名都解析不出来。
+# 页面填的池子要能落进 client.toml，并且必须清洗（非法项丢掉、缺省端口补 53）。
+_toml_dns() { sed -n 's/^dns_direct = "\(.*\)"$/\1/p' "$RUNTIME_T/etc/phantom.toml" 2>/dev/null | head -n 1; }
+if [ "$(_toml_dns)" = "223.5.5.5:53,119.29.29.29:53,180.76.76.76:53" ]; then
+    ok "默认写入三家国内解析器（阿里/腾讯/百度）"
+else
+    bad "dns_direct 默认值异常：$(_toml_dns)"
+fi
+setcfg dns_direct '119.29.29.29, 223.5.5.5:5353; 114.114.114.114,oops,"quoted"'
+# 走「提交」那条路（action 1）：它必须在隧道还健康时也把新配置写下去并重启，
+# 否则用户改了配置、页面提示成功，隧道用的还是旧配置。
+_pid_before=$(cat "$RUN_PID" 2>/dev/null)
+"$SH" "$CONF_SH" 1 >/dev/null 2>&1
+sleep 5
+_pid_after=$(cat "$RUN_PID" 2>/dev/null)
+if [ -n "$_pid_before" ] && [ -n "$_pid_after" ] && [ "$_pid_before" != "$_pid_after" ]; then
+    ok "隧道健康时提交会重启（新配置才真的生效，pid ${_pid_before} → ${_pid_after}）"
+else
+    bad "提交没有重启隧道：新配置不会生效（pid ${_pid_before:-无} → ${_pid_after:-无}）"
+fi
+grep -q "后台重启隧道以生效" "$LOG" 2>/dev/null \
+    && ok "日志说明了这次提交是「重启以生效」" || bad "日志缺少「重启以生效」的说明"
+if [ "$(_toml_dns)" = "119.29.29.29:53,223.5.5.5:5353,114.114.114.114:53" ]; then
+    ok "解析器池被清洗（非法项丢弃、缺省端口补 53）"
+else
+    bad "解析器池清洗异常：$(_toml_dns)"
+fi
+setcfg dns_direct ""
+"$SH" "$CONF_SH" 1 >/dev/null 2>&1
+sleep 5
+if [ "$(_toml_dns)" = "223.5.5.5:53,119.29.29.29:53,180.76.76.76:53" ]; then
+    ok "池子留空时回退内置三家（不会写空 dns_direct）"
+else
+    bad "空池未回退默认：$(_toml_dns)"
+fi
+for _m in 'phantom_dns_direct' 'normalize_dns_pool' 'validate_dns_pool' 'dns_pool_tip'; do
+    grep -q -- "$_m" "$ASP" && ok "页面含解析器池实现（${_m}）" || bad "页面缺少解析器池实现（${_m}）"
+done
+
 step "QUIC 参数改写"
 setcfg protocol quic
 "$SH" "$CONF_SH" restart >/dev/null 2>&1

@@ -295,6 +295,35 @@ is_ip() {
     printf '%s' "$1" | grep -Eq '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
 }
 
+# 国内解析器池的默认值（阿里 223.5.5.5 / 腾讯 119.29.29.29 / 百度 180.76.76.76）。
+# install.sh 也会写进 dbus，这里再兜一次底：页面把输入框清空也不该让
+# dns_direct 变成空字符串（那会让 DNS 代理直接起不来）。
+PHANTOM_DNS_POOL_DEFAULT="223.5.5.5:53,119.29.29.29:53,180.76.76.76:53"
+
+# 把用户填的「国内解析器池」洗成 `ip:port,ip:port`。
+# 必须过滤：这段文本会被写进 TOML，一个引号就能把整个配置文件写坏；
+# 同时顺手支持空格/分号分隔与省略端口（默认 53）。
+sanitize_dns_pool() {
+    _pool_in="$1"
+    _pool_out=""
+    _oldifs="$IFS"
+    IFS=' ,;'
+    # shellcheck disable=SC2086
+    set -- $_pool_in
+    IFS="$_oldifs"
+    for _entry in "$@"; do
+        [ -n "$_entry" ] || continue
+        _host="${_entry%%:*}"
+        _port="${_entry##*:}"
+        [ "$_port" = "$_entry" ] && _port="53"
+        case "$_port" in ''|*[!0-9]*) continue ;; esac
+        [ "$_port" -ge 1 ] 2>/dev/null && [ "$_port" -le 65535 ] 2>/dev/null || continue
+        is_ip "$_host" || continue
+        _pool_out="${_pool_out}${_pool_out:+,}${_host}:${_port}"
+    done
+    printf '%s' "$_pool_out"
+}
+
 # URI 里的 host 必须是 IP：phantom 的 server.address 直接 parse::<SocketAddr>()，
 # 不做 DNS 解析，填域名会在启动时报 Invalid server address。
 uri_hostport() {
@@ -399,6 +428,11 @@ write_toml() {
         builtin_flag="false"
     fi
 
+    # 直连解析器池：页面上的文本框 → 洗成 ip:port 列表 → TOML。
+    # 结果为空（没填/全填错）时用内置三家，绝不让 dns_direct 变成空串。
+    DNS_DIRECT=$(sanitize_dns_pool "$(get_cfg dns_direct)")
+    [ -n "$DNS_DIRECT" ] || DNS_DIRECT="$PHANTOM_DNS_POOL_DEFAULT"
+
     cat >"$CONF_FILE" <<EOF
 # 由 phantom_config.sh 自动生成，勿手工编辑。
 # 服务器地址来自 dbus 的 phantom_uri，由 --server 传入并覆盖 servers 段，
@@ -406,7 +440,10 @@ write_toml() {
 [client]
 listen = "127.0.0.1:1080"
 dns = "8.8.8.8:53"
-dns_direct = "223.5.5.5:53"
+# 国内解析器池：逗号分隔、按优先级排列。phantom 在 900ms 没有应答时自动换
+# 下一台，连续 3 次超时的那台会被冷落 60 秒 —— 某家 DNS 抽风时不会整屋解析失败。
+# 页面上的「国内解析器池」文本框就是改这一行；留空则退回三家内置默认。
+dns_direct = "${DNS_DIRECT}"
 mode = "${mode}"
 metrics_listen = "127.0.0.1:9150"
 
@@ -855,8 +892,19 @@ apply() {
             remove_doh_block
         fi
         set_cfg last_act "$(last_act_now 正在启动…)"
-        log_act "配置已保存，后台启动隧道…"
-        detach_run start
+        # **已经跑着的时候必须重启，不能只 start。**
+        # start 在「进程在跑且 metrics 健康」时会直接早退，于是 client.toml /
+        # proxy_domains.txt 都不会重写 —— 用户改了配置、点了提交、页面显示成功，
+        # 但隧道用的还是旧配置（"改了不生效"就是这么来的）。
+        # 提交的语义是「保存并应用」，所以这里选 restart：先按旧配置干净回滚，
+        # 再用新配置起来。仍然是后台派发，页面毫秒级返回。
+        if is_running; then
+            log_act "配置已保存，后台重启隧道以生效…"
+            detach_run restart
+        else
+            log_act "配置已保存，后台启动隧道…"
+            detach_run start
+        fi
     else
         # 关闭是「用户等得起」的操作，但仍然只写日志、不回显
         stop

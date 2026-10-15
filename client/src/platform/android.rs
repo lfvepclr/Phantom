@@ -801,18 +801,26 @@ fn start_with_config(fd: RawFd, config: ClientConfig) -> i32 {
             }
 
             let tunnel_dns = crate::dns::parse_dns_addr(&config_tun.client.dns);
-            let direct_dns = crate::dns::parse_dns_addr(&config_tun.client.dns_direct);
-            if let (Some(tunnel_dns), Some(direct_dns)) = (tunnel_dns, direct_dns) {
+            let direct_dns = crate::dns::parse_dns_addrs(&config_tun.client.dns_direct);
+            if let Some(tunnel_dns) = tunnel_dns {
                 match crate::dns::DnsProxy::new(tunnel_dns, direct_dns).await {
                     Ok(dns) => {
                         dns.set_suppress_tunnel_aaaa(!config_tun.client.dns_ipv6_via_tunnel);
+                        dns.set_stats(std::sync::Arc::clone(&stats));
+                        let direct_label = dns
+                            .direct_upstreams()
+                            .iter()
+                            .map(|a| a.to_string())
+                            .collect::<Vec<_>>()
+                            .join(", ");
                         let dns = std::sync::Arc::new(dns);
+                        dns.spawn_direct_failover();
                         *SHARED_DNS.lock().unwrap_or_else(|e| e.into_inner()) = Some(dns.clone());
                         proxy = proxy.with_dns(dns);
                         tracing::info!(
-                            "DNS hijack enabled, tunnel resolver = {}, direct resolver = {}, tunnel AAAA = {}",
+                            "DNS hijack enabled, tunnel resolver = {}, direct resolvers = [{}], tunnel AAAA = {}",
                             tunnel_dns,
-                            direct_dns,
+                            direct_label,
                             if config_tun.client.dns_ipv6_via_tunnel { "forwarded" } else { "suppressed" }
                         );
                     }

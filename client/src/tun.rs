@@ -989,15 +989,21 @@ async fn apply_reload(
                 dns.upstream()
             ),
         }
-        match parse_dns_addr(&cfg.client.dns_direct) {
-            Some(addr) => {
-                dns.set_direct_upstream(addr);
-            }
-            None => tracing::warn!(
-                "Config reload: invalid client.dns_direct '{}', keeping direct resolver {}",
+        // `dns_direct` is a pool: replace the whole list (and reset its health
+        // state) rather than just the first entry.
+        let addrs = crate::dns::parse_dns_addrs(&cfg.client.dns_direct);
+        if addrs.is_empty() {
+            tracing::warn!(
+                "Config reload: no usable client.dns_direct in '{}', keeping [{}]",
                 cfg.client.dns_direct,
-                dns.direct_upstream()
-            ),
+                dns.direct_upstreams()
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        } else {
+            dns.set_direct_upstreams(addrs);
         }
     }
 
@@ -3391,7 +3397,7 @@ mod tests {
     async fn test_dns_proxy() -> DnsProxy {
         DnsProxy::new(
             "8.8.8.8:53".parse().unwrap(),
-            "223.5.5.5:53".parse().unwrap(),
+            vec!["223.5.5.5:53".parse().unwrap()],
         )
         .await
         .unwrap()
@@ -3484,7 +3490,10 @@ mod tests {
 
         apply_reload(&hot, Some(&dns), None, &cfg).await;
 
-        assert_eq!(dns.direct_upstream(), "119.29.29.29:53".parse().unwrap());
+        assert_eq!(
+            dns.direct_upstream(),
+            Some("119.29.29.29:53".parse().unwrap())
+        );
         assert_eq!(dns.upstream(), "8.8.8.8:53".parse().unwrap());
     }
 
