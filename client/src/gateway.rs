@@ -262,6 +262,26 @@ impl GatewayConfig {
         Ok(())
     }
 
+    /// 「我们这一位」的掩码写法：`0x1/0x1`（fwmark 值未变，只是加了掩码）。
+    ///
+    /// **为什么必须带掩码**：固件（Broadcom QoS/Runner）也在写 mark —— 真机实测
+    /// 路由器自发流是 `0x80000014`，经我们标记过的流是 `0xa861`、`0xa421` 这类值：
+    /// 我们的 bit0 被保留、其它位是固件加的。第一版把路由规则写成
+    /// `ip rule add fwmark 0x1`（**不带掩码**），只在 mark 恰好等于 1 时命中，
+    /// 于是 `CONNMARK --restore-mark` 恢复出来的 `0xa861` 不匹配 → 后续包落 `main`
+    /// 表走直连被墙。症状很好认：**远端 TCP 连得上（首个 SYN 的包 mark 被直接写成 1，
+    /// 进了隧道）、TLS 卡死、`phantom_tunnel_bytes_up` 恒 0、`flow_stall_drops` 一直涨**。
+    ///
+    /// 带掩码同时也让我们不去抹掉固件那几位：`--set-xmark 0x1/0x1` 只置位不清位。
+    fn mark_spec(&self) -> String {
+        format!("{:#x}/{:#x}", self.fwmark, self.fwmark)
+    }
+
+    /// 掩码本身（`0x1`），给 `CONNMARK --nfmask/--ctmask` 用。
+    fn mark_mask(&self) -> String {
+        format!("{:#x}", self.fwmark)
+    }
+
     /// Build the ordered list of commands that installs the gateway.
     pub fn plan(&self) -> Result<Vec<GatewayCommand>> {
         self.validate()?;
@@ -353,7 +373,7 @@ impl GatewayConfig {
     /// direct flow never leaves the forwarding path the hardware accelerates:
     ///
     /// ```text
-    ///   LAN ──▶ mangle PREROUTING ──▶ ip rule fwmark 0x1 ──▶ table 200 ──▶ phantom0 ──▶ (user space)
+    ///   LAN ──▶ mangle PREROUTING ──▶ ip rule fwmark 0x1/0x1 ──▶ table 200 ──▶ phantom0 ──▶ (user space)
     ///                    │
     ///                    └── not marked ──▶ main table ──▶ WAN (hardware fast path)
     /// ```
@@ -387,9 +407,25 @@ impl GatewayConfig {
         }
 
         // Marked packets take the tunnel table; everything else stays in main.
+        //
+        // **必须带掩码**（`fwmark 0x1/0x1`，不是 `fwmark 0x1`）：固件会往同一个
+        // mark 里加自己的位，`CONNMARK --restore-mark` 恢复出来的值形如 `0xa861`，
+        // 不带掩码的规则只在 mark 恰好为 1 时命中 —— 那会让只有首个 SYN 进隧道、
+        // 后续包全部走直连（详见 `mark_spec`）。
+        //
+        // 升级路径：先尽力删掉旧的无掩码规则，别让两条规则同时挂着。
+        // 当前（掩码）形态 + 旧的无掩码形态都删：升级过来时可能两条都在。
+        for spec in [self.mark_spec(), self.fwmark.to_string()] {
+            cmds.push(GatewayCommand::best_effort(&format!(
+                "ip rule del fwmark {} lookup {} priority {}",
+                spec, self.table_id, TUNNEL_RULE_PRIORITY
+            )));
+        }
         cmds.push(GatewayCommand::required(&format!(
             "ip rule add fwmark {} lookup {} priority {}",
-            self.fwmark, self.table_id, TUNNEL_RULE_PRIORITY
+            self.mark_spec(),
+            self.table_id,
+            TUNNEL_RULE_PRIORITY
         )));
 
         for iface in &self.lan_interfaces {
@@ -440,35 +476,50 @@ impl GatewayConfig {
                 //
                 // `-I` 是前插：先下发 save-mark，最终链里它才落在 MARK 之后。
                 // save-mark 存的是**当前包的 mark**，所以 MARK 必须排在它前面。
+                //
+                // 掩码（`--nfmask/--ctmask 0x1`）同样是为了跟固件共存：只搬我们
+                // 这一位进出 conntrack，不覆盖固件写的 QoS 位（默认的全掩码会覆盖）。
                 cmds.push(GatewayCommand::required(&format!(
-                    "iptables -t mangle -I PREROUTING -i {} -m conntrack --ctstate NEW -m set --match-set {} dst -j CONNMARK --save-mark",
-                    iface, name
+                    "iptables -t mangle -I PREROUTING -i {} -m conntrack --ctstate NEW -m set --match-set {} dst -j CONNMARK --save-mark --nfmask {} --ctmask {}",
+                    iface,
+                    name,
+                    self.mark_mask(),
+                    self.mark_mask()
                 )));
                 cmds.push(GatewayCommand::required(&format!(
-                    "iptables -t mangle -I PREROUTING -i {} -m conntrack --ctstate NEW -m set --match-set {} dst -j MARK --set-mark {}",
-                    iface, name, self.fwmark
+                    "iptables -t mangle -I PREROUTING -i {} -m conntrack --ctstate NEW -m set --match-set {} dst -j MARK --set-xmark {}",
+                    iface,
+                    name,
+                    self.mark_spec()
                 )));
             } else {
                 cmds.push(GatewayCommand::required(&format!(
-                    "iptables -t mangle -I PREROUTING -i {} -m set --match-set {} dst -j MARK --set-mark {}",
-                    iface, name, self.fwmark
+                    "iptables -t mangle -I PREROUTING -i {} -m set --match-set {} dst -j MARK --set-xmark {}",
+                    iface,
+                    name,
+                    self.mark_spec()
                 )));
             }
             if self.lan_dns_hijack {
                 // tcp 先插、udp 后插 → 最终顺序是 udp 在前、tcp 在后（无所谓，两者同 mark）
                 for proto in ["tcp", "udp"] {
                     cmds.push(GatewayCommand::required(&format!(
-                        "iptables -t mangle -I PREROUTING -i {} -p {} --dport 53 -j MARK --set-mark {}",
-                        iface, proto, self.fwmark
+                        "iptables -t mangle -I PREROUTING -i {} -p {} --dport 53 -j MARK --set-xmark {}",
+                        iface,
+                        proto,
+                        self.mark_spec()
                     )));
                 }
             }
             if self.connmark {
                 // 已建立/相关连接恢复它创建时的 mark：本来就直连的保持直连，
                 // 本来就进隧道的继续进隧道 —— 中途学到新地址不会改变既有连接的路由。
+                // 同样用掩码搬位，固件写在同一个 mark 里的其它位不受影响。
                 cmds.push(GatewayCommand::best_effort(&format!(
-                    "iptables -t mangle -I PREROUTING -i {} -m conntrack --ctstate ESTABLISHED,RELATED -j CONNMARK --restore-mark",
-                    iface
+                    "iptables -t mangle -I PREROUTING -i {} -m conntrack --ctstate ESTABLISHED,RELATED -j CONNMARK --restore-mark --nfmask {} --ctmask {}",
+                    iface,
+                    self.mark_mask(),
+                    self.mark_mask()
                 )));
             }
         }
@@ -490,6 +541,15 @@ impl GatewayConfig {
                         "iptables -t nat -D PREROUTING -i {} -p {} --dport 53 -j DNAT --to-destination {}:53",
                         iface, proto, self.dns_sentinel
                     )));
+                    // 当前（掩码）形态 + 旧的无掩码形态都删。**`-D` 是按完整规范
+                    // 匹配的**：`--set-mark 1` 等价于 `--set-xmark 1/0xffffffff`，
+                    // 掩码不同就删不掉，所以升级路径必须两种写法都试。
+                    cmds.push(GatewayCommand::best_effort(&format!(
+                        "iptables -t mangle -D PREROUTING -i {} -p {} --dport 53 -j MARK --set-xmark {}",
+                        iface,
+                        proto,
+                        self.mark_spec()
+                    )));
                     cmds.push(GatewayCommand::best_effort(&format!(
                         "iptables -t mangle -D PREROUTING -i {} -p {} --dport 53 -j MARK --set-mark {}",
                         iface, proto, self.fwmark
@@ -497,15 +557,34 @@ impl GatewayConfig {
                 }
             }
             cmds.push(GatewayCommand::best_effort(&format!(
+                "iptables -t mangle -D PREROUTING -i {} -m set --match-set {} dst -j MARK --set-xmark {}",
+                iface,
+                self.ipset_name,
+                self.mark_spec()
+            )));
+            cmds.push(GatewayCommand::best_effort(&format!(
                 "iptables -t mangle -D PREROUTING -i {} -m set --match-set {} dst -j MARK --set-mark {}",
                 iface, self.ipset_name, self.fwmark
             )));
-            // connmark 版本的规则：**三个形态全删**（当前的两条 + 老版本那条
-            // 串两个 `-j` 的），升级/切换模式时都不能留残渣（残留的 restore-mark
-            // 会让"本来直连"的连接继续被旧 mark 影响）。
+            // connmark 版本的规则：当前（带掩码）两条 + 老版本（无掩码）两条 +
+            // 最早那条串两个 `-j` 的，全都删 —— 升级/切换模式时都不能留残渣
+            // （残留的 restore-mark 会让"本来直连"的连接继续被旧 mark 影响）。
+            cmds.push(GatewayCommand::best_effort(&format!(
+                "iptables -t mangle -D PREROUTING -i {} -m conntrack --ctstate NEW -m set --match-set {} dst -j MARK --set-xmark {}",
+                iface,
+                self.ipset_name,
+                self.mark_spec()
+            )));
             cmds.push(GatewayCommand::best_effort(&format!(
                 "iptables -t mangle -D PREROUTING -i {} -m conntrack --ctstate NEW -m set --match-set {} dst -j MARK --set-mark {}",
                 iface, self.ipset_name, self.fwmark
+            )));
+            cmds.push(GatewayCommand::best_effort(&format!(
+                "iptables -t mangle -D PREROUTING -i {} -m conntrack --ctstate NEW -m set --match-set {} dst -j CONNMARK --save-mark --nfmask {} --ctmask {}",
+                iface,
+                self.ipset_name,
+                self.mark_mask(),
+                self.mark_mask()
             )));
             cmds.push(GatewayCommand::best_effort(&format!(
                 "iptables -t mangle -D PREROUTING -i {} -m conntrack --ctstate NEW -m set --match-set {} dst -j CONNMARK --save-mark",
@@ -514,6 +593,12 @@ impl GatewayConfig {
             cmds.push(GatewayCommand::best_effort(&format!(
                 "iptables -t mangle -D PREROUTING -i {} -m conntrack --ctstate NEW -m set --match-set {} dst -j MARK --set-mark {} -j CONNMARK --save-mark",
                 iface, self.ipset_name, self.fwmark
+            )));
+            cmds.push(GatewayCommand::best_effort(&format!(
+                "iptables -t mangle -D PREROUTING -i {} -m conntrack --ctstate ESTABLISHED,RELATED -j CONNMARK --restore-mark --nfmask {} --ctmask {}",
+                iface,
+                self.mark_mask(),
+                self.mark_mask()
             )));
             cmds.push(GatewayCommand::best_effort(&format!(
                 "iptables -t mangle -D PREROUTING -i {} -m conntrack --ctstate ESTABLISHED,RELATED -j CONNMARK --restore-mark",
@@ -1024,12 +1109,12 @@ mod tests {
         let lines = plan_lines(&GatewayConfig::default());
         assert!(
             lines.iter().any(|l| l
-                == "iptables -t mangle -I PREROUTING -i br0 -m conntrack --ctstate NEW -m set --match-set phantom_proxy dst -j MARK --set-mark 1"),
+                == "iptables -t mangle -I PREROUTING -i br0 -m conntrack --ctstate NEW -m set --match-set phantom_proxy dst -j MARK --set-xmark 0x1/0x1"),
             "whitelist mark rule missing: {lines:#?}"
         );
         assert!(
             lines.iter().any(|l| l
-                == "iptables -t mangle -I PREROUTING -i br0 -m conntrack --ctstate NEW -m set --match-set phantom_proxy dst -j CONNMARK --save-mark"),
+                == "iptables -t mangle -I PREROUTING -i br0 -m conntrack --ctstate NEW -m set --match-set phantom_proxy dst -j CONNMARK --save-mark --nfmask 0x1 --ctmask 0x1"),
             "whitelist save-mark rule missing: {lines:#?}"
         );
         // 一条规则里串两个 `-j` 是 iptables ≥ 1.6 才支持的写法：真机的
@@ -1043,10 +1128,13 @@ mod tests {
         // 只有白名单目标进隧道 —— 逐包标记的老形态必须已经不在了。
         assert!(
             lines.iter().all(|l| l
-                != "iptables -t mangle -I PREROUTING -i br0 -m set --match-set phantom_proxy dst -j MARK --set-mark 1"),
+                != "iptables -t mangle -I PREROUTING -i br0 -m set --match-set phantom_proxy dst -j MARK --set-xmark 0x1/0x1"),
             "per-packet marking is still present: {lines:#?}"
         );
-        assert!(lines.contains(&"ip rule add fwmark 1 lookup 200 priority 9050".to_string()));
+        assert!(
+            lines.contains(&"ip rule add fwmark 0x1/0x1 lookup 200 priority 9050".to_string()),
+            "the fwmark rule must carry a mask: {lines:#?}"
+        );
         // The catch-all that made every packet visit user space must be gone.
         assert!(
             lines.iter().all(|l| !l.contains("ip rule add iif br0 lookup 200")),
@@ -1054,6 +1142,31 @@ mod tests {
         );
         // …and the private-range bypass is unnecessary once selection is by mark.
         assert!(lines.iter().all(|l| !l.contains("lookup main priority 9040")));
+    }
+
+    /// **掩码纪律**：这台固件的 QoS 会往同一个 mark 写自己的位（实测路由器自发流
+    /// `0x80000014`、经我们标记过的流 `0xa861`）。只要有一处漏了掩码，就会长出
+    /// 只在真机上才看得见的故障 —— 首个 SYN 进隧道、后续包走直连：
+    ///   · `ip rule add fwmark 0x1`（无掩码）只在 mark 恰好为 1 时命中，而
+    ///     `--restore-mark` 恢复出来的是固件位 + 我们这一位；
+    ///   · `--set-xmark 0x1/0xffffffff` 会抹掉固件那几位；
+    ///   · `CONNMARK --save-mark`（默认全掩码）同理。
+    /// 所以这里盯的是"每一处都带掩码"，而不是"规则在不在"。
+    #[test]
+    fn every_mark_carries_the_fwmark_mask() {
+        let lines = plan_lines(&GatewayConfig::default());
+        for line in lines.iter().filter(|l| l.contains("MARK")) {
+            assert!(
+                line.contains("0x1/0x1") || line.contains("--nfmask 0x1 --ctmask 0x1"),
+                "mark step without an explicit mask: {line}"
+            );
+        }
+        for line in lines.iter().filter(|l| l.contains("ip rule add fwmark")) {
+            assert!(
+                line.contains("fwmark 0x1/0x1"),
+                "the routing rule must match the masked fwmark bit: {line}"
+            );
+        }
     }
 
     /// 白名单里的地址是**会话中途**才被 DNS 学到的。如果规则匹配每一包，
@@ -1070,7 +1183,7 @@ mod tests {
             .collect();
         let mark = whitelist
             .iter()
-            .find(|l| l.contains("-j MARK --set-mark"))
+            .find(|l| l.contains("-j MARK --set-xmark"))
             .expect("whitelist mark rule missing");
         let save = whitelist
             .iter()
@@ -1101,7 +1214,7 @@ mod tests {
             .expect("save-mark rule missing");
         let mark_at = lines
             .iter()
-            .position(|l| l.contains("-j MARK --set-mark 1") && l.contains("--match-set"))
+            .position(|l| l.contains("-j MARK --set-xmark 0x1/0x1") && l.contains("--match-set"))
             .expect("mark rule missing");
         assert!(
             save_at < mark_at,
@@ -1122,19 +1235,40 @@ mod tests {
             .collect();
         assert!(
             lines.iter().any(|l| l
-                == "iptables -t mangle -D PREROUTING -i br0 -m conntrack --ctstate NEW -m set --match-set phantom_proxy dst -j MARK --set-mark 1"),
+                == "iptables -t mangle -D PREROUTING -i br0 -m conntrack --ctstate NEW -m set --match-set phantom_proxy dst -j MARK --set-xmark 0x1/0x1"),
             "teardown must remove the mark rule: {lines:#?}"
         );
         assert!(
             lines.iter().any(|l| l
-                == "iptables -t mangle -D PREROUTING -i br0 -m conntrack --ctstate NEW -m set --match-set phantom_proxy dst -j CONNMARK --save-mark"),
+                == "iptables -t mangle -D PREROUTING -i br0 -m conntrack --ctstate NEW -m set --match-set phantom_proxy dst -j CONNMARK --save-mark --nfmask 0x1 --ctmask 0x1"),
             "teardown must remove the save-mark rule: {lines:#?}"
+        );
+        // `-D` 是按完整规范匹配的：旧版本（无掩码 / 串两个 `-j`）也得各删一遍，
+        // 否则从旧包升级过来会留下会自动改路由的残渣规则。
+        assert!(
+            lines.iter().any(|l| l
+                == "iptables -t mangle -D PREROUTING -i br0 -m conntrack --ctstate NEW -m set --match-set phantom_proxy dst -j MARK --set-mark 1"),
+            "teardown must also remove the legacy unmasked mark rule: {lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|l| l
+                == "iptables -t mangle -D PREROUTING -i br0 -m conntrack --ctstate NEW -m set --match-set phantom_proxy dst -j CONNMARK --save-mark"),
+            "teardown must also remove the legacy unmasked save-mark rule: {lines:#?}"
         );
         // 老版本（一条规则串两个 `-j`）也要删：升级到新形态后不能留残渣。
         assert!(
             lines.iter().any(|l| l
                 .contains("--match-set phantom_proxy dst -j MARK --set-mark 1 -j CONNMARK --save-mark")),
             "teardown must also remove the legacy combined rule: {lines:#?}"
+        );
+        // 两种 ip rule 形态都要删（掩码是修 bug 的关键，旧形态是升级残留）。
+        assert!(
+            lines.iter().any(|l| l == "ip rule del fwmark 0x1/0x1 lookup 200 priority 9050"),
+            "teardown must remove the masked fwmark rule: {lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|l| l == "ip rule del fwmark 1 lookup 200 priority 9050"),
+            "teardown must also remove the legacy unmasked fwmark rule: {lines:#?}"
         );
     }
 
@@ -1178,7 +1312,7 @@ mod tests {
         let lines = plan_lines(&config);
         assert!(
             lines.iter().any(|l| l
-                == "iptables -t mangle -I PREROUTING -i br0 -m set --match-set phantom_proxy dst -j MARK --set-mark 1"),
+                == "iptables -t mangle -I PREROUTING -i br0 -m set --match-set phantom_proxy dst -j MARK --set-xmark 0x1/0x1"),
             "legacy per-packet rule missing: {lines:#?}"
         );
         assert!(
@@ -1195,7 +1329,7 @@ mod tests {
         for proto in ["udp", "tcp"] {
             assert!(
                 lines.iter().any(|l| l.contains(&format!(
-                    "-i br0 -p {proto} --dport 53 -j MARK --set-mark 1"
+                    "-i br0 -p {proto} --dport 53 -j MARK --set-xmark 0x1/0x1"
                 ))),
                 "DNS mark rule missing for {proto}"
             );
@@ -1233,6 +1367,10 @@ mod tests {
             .map(GatewayCommand::display)
             .collect();
         assert!(teardown.contains(&"ipset destroy phantom_proxy".to_string()));
+        // 掩码形态与旧的无掩码形态各删一次：从旧包升级过来时两条都可能挂着。
+        assert!(teardown
+            .iter()
+            .any(|l| l.starts_with("ip rule del fwmark 0x1/0x1 ")));
         assert!(teardown.iter().any(|l| l.starts_with("ip rule del fwmark 1 ")));
         assert!(teardown
             .iter()
