@@ -429,8 +429,23 @@ impl GatewayConfig {
                 // 的地址一旦在会话中途被 DNS 学到，一条本来走直连的连接会被逐包
                 // 拽进 TUN，而用户态从没见过它的 SYN，只能回 RST
                 // （phantom_tun_unknown_flow_rst_total）。表现就是"看着看着断一下"。
+                //
+                // 这里必须拆成**两条同匹配**的规则，不能写成一条里串两个 `-j`：
+                // 「一条规则多个 target」是 iptables ≥ 1.6 的写法，真机上的
+                // iptables v1.4.12.2 直接拒掉（`multiple -j flags not allowed`）。
+                // 那正是 kernel-split 在这类老固件上**从来没有生效过**的原因 ——
+                // 第一条规则就装不上，整个网关被判不可用，于是静默退回 relay，
+                // "直连走内核快路径"从未发生（真机 `ip rule` 里只剩
+                // `iif br0 lookup 200` 的通配规则，就是它的指纹）。
+                //
+                // `-I` 是前插：先下发 save-mark，最终链里它才落在 MARK 之后。
+                // save-mark 存的是**当前包的 mark**，所以 MARK 必须排在它前面。
                 cmds.push(GatewayCommand::required(&format!(
-                    "iptables -t mangle -I PREROUTING -i {} -m conntrack --ctstate NEW -m set --match-set {} dst -j MARK --set-mark {} -j CONNMARK --save-mark",
+                    "iptables -t mangle -I PREROUTING -i {} -m conntrack --ctstate NEW -m set --match-set {} dst -j CONNMARK --save-mark",
+                    iface, name
+                )));
+                cmds.push(GatewayCommand::required(&format!(
+                    "iptables -t mangle -I PREROUTING -i {} -m conntrack --ctstate NEW -m set --match-set {} dst -j MARK --set-mark {}",
                     iface, name, self.fwmark
                 )));
             } else {
@@ -485,8 +500,17 @@ impl GatewayConfig {
                 "iptables -t mangle -D PREROUTING -i {} -m set --match-set {} dst -j MARK --set-mark {}",
                 iface, self.ipset_name, self.fwmark
             )));
-            // connmark 版本的规则：两个形态都删，升级/切换模式时都不能留残渣
-            // （残留的 restore-mark 会让"本来直连"的连接继续被旧 mark 影响）。
+            // connmark 版本的规则：**三个形态全删**（当前的两条 + 老版本那条
+            // 串两个 `-j` 的），升级/切换模式时都不能留残渣（残留的 restore-mark
+            // 会让"本来直连"的连接继续被旧 mark 影响）。
+            cmds.push(GatewayCommand::best_effort(&format!(
+                "iptables -t mangle -D PREROUTING -i {} -m conntrack --ctstate NEW -m set --match-set {} dst -j MARK --set-mark {}",
+                iface, self.ipset_name, self.fwmark
+            )));
+            cmds.push(GatewayCommand::best_effort(&format!(
+                "iptables -t mangle -D PREROUTING -i {} -m conntrack --ctstate NEW -m set --match-set {} dst -j CONNMARK --save-mark",
+                iface, self.ipset_name
+            )));
             cmds.push(GatewayCommand::best_effort(&format!(
                 "iptables -t mangle -D PREROUTING -i {} -m conntrack --ctstate NEW -m set --match-set {} dst -j MARK --set-mark {} -j CONNMARK --save-mark",
                 iface, self.ipset_name, self.fwmark
@@ -1000,8 +1024,21 @@ mod tests {
         let lines = plan_lines(&GatewayConfig::default());
         assert!(
             lines.iter().any(|l| l
-                == "iptables -t mangle -I PREROUTING -i br0 -m conntrack --ctstate NEW -m set --match-set phantom_proxy dst -j MARK --set-mark 1 -j CONNMARK --save-mark"),
-            "whitelist match rule missing: {lines:#?}"
+                == "iptables -t mangle -I PREROUTING -i br0 -m conntrack --ctstate NEW -m set --match-set phantom_proxy dst -j MARK --set-mark 1"),
+            "whitelist mark rule missing: {lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|l| l
+                == "iptables -t mangle -I PREROUTING -i br0 -m conntrack --ctstate NEW -m set --match-set phantom_proxy dst -j CONNMARK --save-mark"),
+            "whitelist save-mark rule missing: {lines:#?}"
+        );
+        // 一条规则里串两个 `-j` 是 iptables ≥ 1.6 才支持的写法：真机的
+        // iptables v1.4.12.2 会报 `multiple -j flags not allowed`，第一条规则
+        // 就装不上 → 整个 kernel-split 被判不可用 → 静默退回 relay（"直连快路径"
+        // 于是从未生效）。这条断言就是拦住那种写法再回来。
+        assert!(
+            lines.iter().all(|l| l.matches(" -j ").count() <= 1),
+            "no rule may chain multiple `-j` targets (iptables 1.4 rejects it): {lines:#?}"
         );
         // 只有白名单目标进隧道 —— 逐包标记的老形态必须已经不在了。
         assert!(
@@ -1027,22 +1064,48 @@ mod tests {
     #[test]
     fn kernel_split_marks_only_new_connections_and_saves_the_mark() {
         let lines = plan_lines(&GatewayConfig::default());
-        let whitelist = lines
+        let whitelist: Vec<&String> = lines
             .iter()
-            .find(|l| l.contains("--match-set phantom_proxy"))
-            .expect("whitelist rule missing");
+            .filter(|l| l.contains("--match-set phantom_proxy") && l.contains("--ctstate NEW"))
+            .collect();
+        let mark = whitelist
+            .iter()
+            .find(|l| l.contains("-j MARK --set-mark"))
+            .expect("whitelist mark rule missing");
+        let save = whitelist
+            .iter()
+            .find(|l| l.contains("-j CONNMARK --save-mark"))
+            .expect("whitelist save-mark rule missing");
         assert!(
-            whitelist.contains("-m conntrack --ctstate NEW"),
-            "whitelist marking must be limited to new connections: {whitelist}"
+            mark.contains("-m conntrack --ctstate NEW"),
+            "whitelist marking must be limited to new connections: {mark}"
         );
         assert!(
-            whitelist.contains("-j CONNMARK --save-mark"),
-            "the mark must be saved so the flow keeps its path: {whitelist}"
+            save.contains("-m conntrack --ctstate NEW"),
+            "saving the mark must be limited to new connections too: {save}"
+        );
+        // 两个形态是分开的两条规则（老 iptables 不接受一条里串两个 `-j`），
+        // 且必须都在最终链里排在 restore-mark 之前、由 MARK 先行。
+        assert!(
+            !mark.contains("CONNMARK"),
+            "MARK and CONNMARK must not share one rule: {mark}"
         );
         assert!(
             lines.iter().any(|l| l
                 .contains("-m conntrack --ctstate ESTABLISHED,RELATED -j CONNMARK --restore-mark")),
             "established connections must restore their saved mark: {lines:#?}"
+        );
+        let save_at = lines
+            .iter()
+            .position(|l| l.contains("-j CONNMARK --save-mark") && l.contains("--match-set"))
+            .expect("save-mark rule missing");
+        let mark_at = lines
+            .iter()
+            .position(|l| l.contains("-j MARK --set-mark 1") && l.contains("--match-set"))
+            .expect("mark rule missing");
+        assert!(
+            save_at < mark_at,
+            "save-mark must be pushed first so that `-I` leaves MARK ahead of it: {lines:#?}"
         );
     }
 
@@ -1050,6 +1113,31 @@ mod tests {
     /// 的最前面（DNS 规则按端口逐包标记、而 DNS 的 conntrack mark 是 0，
     /// restore 排到它后面会把同一源端口的后续查询重置成直连，域名就学不到了），
     /// 所以在计划里它必须是最后一条。
+    #[test]
+    fn teardown_removes_both_connmark_rules_and_the_legacy_form() {
+        let lines: Vec<String> = GatewayConfig::default()
+            .teardown_plan()
+            .iter()
+            .map(GatewayCommand::display)
+            .collect();
+        assert!(
+            lines.iter().any(|l| l
+                == "iptables -t mangle -D PREROUTING -i br0 -m conntrack --ctstate NEW -m set --match-set phantom_proxy dst -j MARK --set-mark 1"),
+            "teardown must remove the mark rule: {lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|l| l
+                == "iptables -t mangle -D PREROUTING -i br0 -m conntrack --ctstate NEW -m set --match-set phantom_proxy dst -j CONNMARK --save-mark"),
+            "teardown must remove the save-mark rule: {lines:#?}"
+        );
+        // 老版本（一条规则串两个 `-j`）也要删：升级到新形态后不能留残渣。
+        assert!(
+            lines.iter().any(|l| l
+                .contains("--match-set phantom_proxy dst -j MARK --set-mark 1 -j CONNMARK --save-mark")),
+            "teardown must also remove the legacy combined rule: {lines:#?}"
+        );
+    }
+
     #[test]
     fn connmark_restore_is_inserted_last_so_it_is_evaluated_first() {
         let lines = plan_lines(&GatewayConfig::default());
