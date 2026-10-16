@@ -59,7 +59,7 @@
 <script>
 // 前端修订号：页面右上角会显示，用来确认浏览器加载的是哪一版
 // （改了 UI 就 +1，排查「改了没生效」时先看这个数字）
-var PHANTOM_UI_REV = '11';
+var PHANTOM_UI_REV = '12';
 var dbus = {};
 // 「期望」= 服务端已经保存的开关值（不是开关控件当前的值：控件改了但没点提交
 // 属于「尚未生效」）。页面把它和状态文件里的「实际」并排显示，用户才能一眼
@@ -604,6 +604,14 @@ function render_state(st, errText) {
 	} else if (!errText && want === "1" && running && !rules) {
 		mismatch = "隧道在跑，但<b>转发规则不在位</b>：LAN 的流量可能没进隧道（照常直连）。"
 			+ "通常出现在路由器重建 iptables 之后，点一次【提交】或等 nat-start 钩子补回。";
+	} else if (!errText && want === "1" && running && st && st.gw === "relay" && requested_mode() === "kernel-split") {
+		// 「内核分流装不上 → 静默退回 relay」曾经真的发生过：固件的 iptables 1.4.12.2
+		// 拒绝「一条规则里串两个 -j」，第一条标记规则就装不上，于是全部流量（连直连）
+		// 都退回用户态转发 —— 表现是「非 VPN 的网站也慢、CPU 还高」，而页面上一切正常。
+		// 现在这种不一致必须明说。
+		mismatch = "分流没生效：填的是<b>内核分流</b>，实际跑的是<b>兼容模式</b>（全部流量都走用户态转发，"
+			+ "直连也吃 CPU、也享受不到硬件加速）。切到「查看日志」搜 <i>Gateway install failed</i>，"
+			+ "那后面就是被固件拒掉的规则。";
 	} else if (!errText && stale && (proc > 0 || running)) {
 		mismatch = "状态文件超过 20 秒没有更新：采样进程可能已经停了，下面这些数字是旧值。";
 	}
@@ -678,6 +686,13 @@ function gw_label(mode) {
 	if (mode === "kernel-split") { return "内核分流"; }
 	if (mode === "relay") { return "兼容模式"; }
 	return "-";
+}
+
+// 页面上「分流模式」下拉框当前选的值。用来分辨「回退」和「用户本来就选了兼容模式」：
+// 只有前者才需要告警。DOM 还没就绪时返回空串，不会误报。
+function requested_mode() {
+	var el = gid("phantom_gateway_mode");
+	return el ? String(el.value) : "";
 }
 
 // 「上次动作」以前每 5 秒单独轮询 /_api/phantom_last_act —— 那是每轮多一次

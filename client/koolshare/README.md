@@ -422,6 +422,21 @@ ssh -p <SSH端口> admin@<路由器IP> 'for f in all br0 phantom0; do printf "%-
 更没经过加密"的证据）；
 ③ 服务端侧流量只随 tunnel 计数增长。
 
+> **踩过的坑：老固件的 iptables 拒绝「一条规则里串两个 `-j`」，内核分流曾因此全程没生效。**
+> 最初的实现把「打 mark」与「存 connmark」写在同一条规则里
+> （`… -j MARK --set-mark 1 -j CONNMARK --save-mark`），而"一条规则多个 target"是
+> iptables ≥ 1.6 才支持的写法。本机是 **iptables v1.4.12.2**，直接报
+> `multiple -j flags not allowed`：第一条标记规则就装不上 → 整个内核分流被判不可用 →
+> **静默退回兼容模式**，全部流量（连直连）都挤进用户态转发。表现就是"非 VPN 的网站也慢、
+> CPU 还高"，而页面上一切正常。
+> 现场指纹（三条齐全即可确诊）：`ip rule show` 里只剩 `9050: from all iif br0 lookup 200`、
+> `iptables -t mangle -S PREROUTING` 是空的、状态页「生效模式」显示**兼容模式**，
+> 日志里有 `Gateway install failed` + `falling back to user-space relay`。
+> 修法：拆成两条同匹配的规则，且顺序必须是 `-j MARK --set-mark 1` 在前、
+> `-j CONNMARK --save-mark` 在后（save-mark 存的是**当前包的 mark**），
+> 并配了单测禁止再写回一条。页面在「填的是内核分流、实际跑的是兼容模式」时会直接告警。
+> 自查一条命令：`iptables -t mangle -S PREROUTING | grep -c match-set`，生效时应为 2。
+>
 > **踩过的坑：`rp_filter` 会让隧道"看起来把 DNS 弄坏了"。**
 > TUN 注入的回包源地址是公网 IP（比如 8.8.8.8），严格反向路径校验（rp_filter=1）会
 > 认为它该从 WAN 出去而直接丢弃 —— 现象是客户端 DNS 全部超时、网页打不开，
@@ -445,6 +460,20 @@ ssh -p <SSH端口> admin@<路由器IP> 'for f in all br0 phantom0; do printf "%-
 - ≥ 80%：链路健康，想更快只能换服务器
 - 50–80%：可尝试调 TUN MTU、检查 RTT、换 QUIC
 - < 50%：排查路由器 CPU、TUN 写队列峰值、重传、是否走了错误链路
+
+**真机基线（2026-10-16 晚高峰 23:15–23:25，AX86U Pro + 5G WiFi）**：
+
+| 路径 | 实测 | 说明 |
+|---|---|---|
+| 经隧道下载 `dl.google.com`（白名单，路由器本机） | **324 KB/s ≈ 2.6 Mbps** | 服务端上行 3 Mbps 的 ~87%，链路本身是健康的 |
+| 同一 URL 直连（路由器本机，不经隧道） | 72 MB/s ≈ 577 Mbps | 这条线路对 Google CDN 有就近缓存 |
+| 国内站点经路由器（Mac / 5G） | 10.7 MB/s ≈ 86 Mbps | 直连路径正常 |
+| 2.4G 无线重传（同晚采样） | txretrans 峰值 1.7 万/5 分钟、rxcrc 2–3 千 | 空口争用明显；手机若挂在 2.4G，慢在这里 |
+
+结论：**必须走隧道的外网站点，瓶颈是服务端 3 Mbps 上行——改客户端设置救不了**。
+要稳定看 720p（约 2.5 Mbps，且启动需要突发余量）得换一台上行 ≥ 20 Mbps 的服务器。
+"国内站点也慢"要先分清是**被卷进了隧道**（看页面「生效模式」与 `proxy` 计数）
+还是**卡在 2.4G 空口**（看 `phantom_perf.log` 的 `wifi24_txretrans` 增量）。
 
 ### 7.2 测量项
 

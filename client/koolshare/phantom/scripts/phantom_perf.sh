@@ -26,8 +26,11 @@
 #   pool_*   TCP 会话池：created / reused / idle（reused 才是"池子替人省下握手"的判词）
 #   eth*_rx_drop_d / eth*_rx_err_d  以太口 drop/err 的**增量**
 #   link     各以太口协商速率（100Mb 的口会拖慢挂在上面的设备）
+#   rss_kb   phantom 进程的常驻内存（KB）；mem_free_kb 是 MemAvailable。
+#            加这两列是因为真机上出过一次「内核 OOM → panic → 整机重启」，
+#            而重启把 /tmp 里的采样日志一起带走，事后完全没有内存数据可查。
 #
-# 表头只在首次运行时写入（v2：第 2 列 ver=2；旧行仍可解析 —— 分析脚本按表头名取值）。
+# 表头只在首次运行时写入（v3：第 2 列 ver=3；旧行仍可解析 —— 分析脚本按表头名取值）。
 # 日志本身由 phantom_config.sh 的 _trim 顺手裁剪。
 
 module=phantom
@@ -161,6 +164,17 @@ if [ -n "$pid" ]; then
 fi
 [ -n "$fd_used" ] || fd_used=0
 [ -n "$fd_limit" ] || fd_limit=0
+
+# 内存：OOM 会直接把整机打重启（Broadcom 内核 panic_on_oom），所以 phantom 自己的
+# 常驻内存和系统可用内存必须留痕 —— 下次再 OOM 才能回答"是不是它长大的"。
+rss_kb=0; mem_free_kb=0
+if [ -n "$pid" ]; then
+    rss_kb=$(awk '/VmRSS/ {print $2}' /proc/"$pid"/status 2>/dev/null | head -n 1)
+fi
+[ -n "$rss_kb" ] || rss_kb=0
+mem_free_kb=$(awk '/MemAvailable/ {print $2}' /proc/meminfo 2>/dev/null | head -n 1)
+[ -n "$mem_free_kb" ] || mem_free_kb=0
+
 ct=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)
 [ -n "$ct" ] || ct=0
 
@@ -266,11 +280,12 @@ link=$(printf '%s' "$link" | tr -d ' ')
 #   conns → new_conns（本周期新增，差值）+ conns_total（累计）
 #   fc_hw 修好了（以前恒为 0）
 #   新增隧道/会话池/无线/以太口增量列
+# v3 起追加 rss_kb / mem_free_kb（OOM 取证）。
 # 分析脚本请按表头名取值，别按列号 —— 旧行（无 ver 列）仍然可读。
 if [ ! -f "$PERF_LOG" ]; then
-    echo "ts,ver,cpu_pct,new_conns,conns_total,fd,fd_limit,ct,fc_hw,fc_sw,d_up,d_dn,t_up,t_dn,ipset,gw,dns_ms,rtt_ms,loss_pct,wifi,wifi24,wifi5,wifi24_txretrans,wifi24_rxcrc,wifi5_txretrans,wifi5_rxcrc,dup_acks,tcp_dup_bytes,tun_wait_max_ms,txq_peak,tunnel_conn_fail,unknown_rst,stall_drops,pool_created,pool_reused,pool_idle,eth0_rx_drop_d,eth0_rx_err_d,eth2_rx_drop_d,eth2_rx_err_d,link" >>"$PERF_LOG"
+    echo "ts,ver,cpu_pct,new_conns,conns_total,fd,fd_limit,ct,fc_hw,fc_sw,d_up,d_dn,t_up,t_dn,ipset,gw,dns_ms,rtt_ms,loss_pct,wifi,wifi24,wifi5,wifi24_txretrans,wifi24_rxcrc,wifi5_txretrans,wifi5_rxcrc,dup_acks,tcp_dup_bytes,tun_wait_max_ms,txq_peak,tunnel_conn_fail,unknown_rst,stall_drops,pool_created,pool_reused,pool_idle,eth0_rx_drop_d,eth0_rx_err_d,eth2_rx_drop_d,eth2_rx_err_d,link,rss_kb,mem_free_kb" >>"$PERF_LOG"
 fi
-echo "$(date '+%Y-%m-%d %H:%M'),2,${cpu_pct},${new_conns},${conns},${fd_used},${fd_limit},${ct},${fc_hw},${fc_sw},${d_up},${d_dn},${t_up},${t_dn},${ipset},${split},${dns_ms},${rtt},${loss},${wifi},${wifi24},${wifi5},${w24_txr},${w24_rxc},${w5_txr},${w5_rxc},${dup_acks},${tcp_dup},${tun_wait_max},${txq_peak},${conn_fail},${unknown_rst},${stall_drops},${pool_created},${pool_reused},${pool_idle},${e0_drop_d},${e0_err_d},${e2_drop_d},${e2_err_d},${link}" >>"$PERF_LOG" 2>/dev/null
+echo "$(date '+%Y-%m-%d %H:%M'),3,${cpu_pct},${new_conns},${conns},${fd_used},${fd_limit},${ct},${fc_hw},${fc_sw},${d_up},${d_dn},${t_up},${t_dn},${ipset},${split},${dns_ms},${rtt},${loss},${wifi},${wifi24},${wifi5},${w24_txr},${w24_rxc},${w5_txr},${w5_rxc},${dup_acks},${tcp_dup},${tun_wait_max},${txq_peak},${conn_fail},${unknown_rst},${stall_drops},${pool_created},${pool_reused},${pool_idle},${e0_drop_d},${e0_err_d},${e2_drop_d},${e2_err_d},${link},${rss_kb},${mem_free_kb}" >>"$PERF_LOG" 2>/dev/null
 
 # 记住这一轮的原始计数，下一轮求增量
 {

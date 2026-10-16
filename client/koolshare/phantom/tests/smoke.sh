@@ -341,6 +341,18 @@ if grep -q '开关关着也要查' "$ASP"; then
 else
     bad "开关关闭时不查真实状态（残留状态看不见）"
 fi
+
+# 「内核分流装不上 → 静默退回 relay」在真机上是真出现过的：这台固件的
+# iptables v1.4.12.2 拒绝「一条规则里串两个 -j」，第一条标记规则就装不上，
+# 于是全部流量（连直连）都退回用户态转发 —— 而页面当时只把「兼容模式」
+# 当普通指标显示，用户只感觉到"慢"，看不出哪里不对。现在必须明说。
+for _mark in 'function requested_mode' 'requested_mode() === "kernel-split"' '分流没生效'; do
+    if grep -q -- "$_mark" "$ASP"; then
+        ok "页面会报「填了内核分流、实际回退兼容模式」（${_mark}）"
+    else
+        bad "页面缺少「内核分流回退」告警（${_mark}）"
+    fi
+done
 # 探针文件名必须以 Module_ 开头：httpd 只把 /Module_* 路由到 /koolshare/webs，
 # 真机实测 /phantom_ping.asp 恒 404（/Module_xxx.css 则由它的 webs 处理器接管）。
 if grep -q "'/Module_phantom_ping\.asp'" "$ASP" && grep -q 'phantom-ping-ok' "$ASP"; then
@@ -923,12 +935,13 @@ if [ -f "$PERF_S" ]; then
     [ -f "$PERF_LOG" ] && ok "采样文件已生成：$PERF_LOG" || bad "采样文件缺失"
     _hdr=$(head -n 1 "$PERF_LOG" 2>/dev/null)
     case "$_hdr" in
-        ts,ver,*) ok "采样表头是 v2（带版本列，便于兼容旧行）" ;;
-        *) bad "采样表头不是 v2：$_hdr" ;;
+        ts,ver,*) ok "采样表头带版本列（便于兼容旧行）" ;;
+        *) bad "采样表头缺版本列：$_hdr" ;;
     esac
     # v2 必须把「累计连接数被当成活跃连接」这个坑填上，并带上隧道/无线/以太口增量
+    # v3 追加内存两列（真机出过一次内核 OOM → panic → 整机重启，事后无数据可查）
     for _col in new_conns conns_total dup_acks unknown_rst stall_drops pool_reused \
-                wifi24_txretrans wifi5_rxcrc eth0_rx_drop_d; do
+                wifi24_txretrans wifi5_rxcrc eth0_rx_drop_d rss_kb mem_free_kb; do
         printf '%s' "$_hdr" | grep -q ",${_col}," -o 2>/dev/null || printf '%s' "$_hdr" | grep -q ",${_col}$" \
             && ok "采样表头含 $_col" || bad "采样表头缺 $_col"
     done
