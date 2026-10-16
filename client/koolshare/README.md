@@ -437,6 +437,22 @@ ssh -p <SSH端口> admin@<路由器IP> 'for f in all br0 phantom0; do printf "%-
 > 并配了单测禁止再写回一条。页面在「填的是内核分流、实际跑的是兼容模式」时会直接告警。
 > 自查一条命令：`iptables -t mangle -S PREROUTING | grep -c match-set`，生效时应为 2。
 >
+> **踩过的坑：mark 必须带掩码匹配，否则「TCP 连得上、TLS 卡死」。**
+> 固件（Broadcom QoS/Runner）也在往同一个 mark 写自己的位：真机实测路由器自发流是
+> `0x80000014`，经我们标记过的流是 `0xa861`、`0xa421` 这类值 —— 我们的 bit0 被保留、
+> 其它位是固件加的。而第一版路由规则写的是 `ip rule add fwmark 0x1`（**不带掩码**），
+> 只在 mark **恰好等于 1** 时命中：首个 SYN 的包 mark 被规则直接写成 `0x1` 所以进了隧道，
+> 后续包经 `CONNMARK --restore-mark` 恢复成 `0xa861` → **不命中** → 落 `main` 表走直连
+> 被墙。表现极具迷惑性：`nc` 能连上、`curl` 停在 TLS 握手、`phantom_tunnel_bytes_up`
+> 恒 0、`flow_stall_drops` 一直涨（DNS 正常，因为它的规则本来就是逐包标记，不走 connmark）。
+> 修法：全程用掩码表达我们这一位 —— 路由 `fwmark 0x1/0x1`、`--set-xmark 0x1/0x1`、
+> `CONNMARK --nfmask 0x1 --ctmask 0x1`，既修掉失配也不抹掉固件的位。
+> 三条自查：
+> ① `ip rule show | grep lookup` 必须是 `fwmark 0x1/0x1`（没有斜杠就是坏的）；
+> ② `iptables -t mangle -S PREROUTING | grep match-set` 必须是 `--set-xmark 0x1/0x1`；
+> ③ 看 `grep -c UNREPLIED /proc/net/nf_conntrack` 与 `tunnel_bytes`：前者涨、后者恒 0 即中招。
+> **判据小技巧**：我们标记过的流，connmark 一定是**奇数**（bit0 = 1）；路由器自发流是偶数。
+>
 > **踩过的坑：`rp_filter` 会让隧道"看起来把 DNS 弄坏了"。**
 > TUN 注入的回包源地址是公网 IP（比如 8.8.8.8），严格反向路径校验（rp_filter=1）会
 > 认为它该从 WAN 出去而直接丢弃 —— 现象是客户端 DNS 全部超时、网页打不开，
@@ -535,7 +551,8 @@ ts,cpu_pct,conns,fd,fd_limit,ct,fc_hw,fc_sw,d_up,d_dn,t_up,t_dn,ipset,gw,dns_ms,
 - [ ] 三皮肤主色正确
 - [ ] 路由器重启后自动拉起（`S98phantom.sh`）；`nat-start` 后规则被冲掉能自动补回（`N98phantom.sh`）
 - [ ] 卸载：文件、init.d 软链（S/N）、cru 条目、dbus 键、iptables 残留全部清理
-- [ ] **内核分流生效**：`ip rule show` 有 `fwmark 1 lookup 200`、**没有**通配 `iif br0 lookup 200`；`iptables -t mangle -S PREROUTING` 有 3 条 MARK；`ipset list phantom_proxy` 条目数 > 0 且随访问增长
+- [ ] **内核分流生效**：`ip rule show` 有 `fwmark 0x1/0x1 lookup 200`（**必须带掩码**）、**没有**通配 `iif br0 lookup 200`；`iptables -t mangle -S PREROUTING` 有 3 条 `--set-xmark 0x1/0x1`；`ipset list phantom_proxy` 条目数 > 0 且随访问增长
+- [ ] **后续包确实进隧道**（不只是首个 SYN）：LAN 客户端打一个白名单站点时，`iptables -L FORWARD -vn | grep "br0 *phantom0"` 的包数随请求体一起涨；`phantom_tunnel_bytes_up/down` 不为 0
 - [ ] **直连恢复快路径**：8 路并行直连下载聚合 ≥ 基线 3 倍、phantom 每 Mbps CPU 降 ≥ 50%、`/proc/fcache/nflist` 出现 `HW_Hits > 0`
 - [ ] 页面切「兼容模式」后行为与旧版本一致（可一键回退）
 - [ ] 加密 DNS 拦截打开时 YouTube/Google 仍正常；关掉开关后恢复

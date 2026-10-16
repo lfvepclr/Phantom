@@ -550,31 +550,55 @@ cleanup_rules() {
     # 拿不到就按默认 8.8.8.8 试。
     sentinel=$(sed -n 's/^dns = "\([0-9.]*\):53"$/\1/p' "$CONF_FILE" 2>/dev/null | head -n 1)
     [ -n "$sentinel" ] || sentinel="8.8.8.8"
+    # `iptables -D` 是**按完整规范匹配**的：`--set-xmark 0x1/0x1` 与旧写法
+    # `--set-mark 1`（等价于 `0x1/0xffffffff`）掩码不同，删不掉对方。所以每种
+    # 规则都按「带掩码（新）→ 无掩码（旧）」各删一遍，升级路径才不留残渣。
+    # 带掩码是必须的：固件 QoS 会往同一个 mark 写自己的位，不带掩码既会抹掉
+    # 固件那几位，`--restore-mark` 恢复出来的值也不再等于 1（详见 gateway.rs）。
+    #
+    # 文本形态也要对齐：gateway.rs 用 `{:#x}` 输出（`0x1/0x1`），老版本用的是
+    # 十进制 `--set-mark 1`。写成十进制会跟新规则的文本对不上、删不掉。
+    fw_dec="${PHANTOM_FWMARK:-1}"
+    mark_mask=$(printf '0x%x' "$fw_dec" 2>/dev/null)
+    [ -n "$mark_mask" ] || mark_mask="0x1"
+    mark_spec="${mark_mask}/${mark_mask}"
+    del_mangle() {
+        while iptables -t mangle -D PREROUTING "$@" 2>/dev/null; do :; done
+    }
     for iface in $lan_if; do
         while iptables -D FORWARD -i "$iface" -o "$tun_name" -j ACCEPT 2>/dev/null; do :; done
         while iptables -D FORWARD -i "$tun_name" -o "$iface" -j ACCEPT 2>/dev/null; do :; done
         for proto in udp tcp; do
             while iptables -t nat -D PREROUTING -i "$iface" -p "$proto" --dport 53 \
                 -j DNAT --to-destination "${sentinel}:53" 2>/dev/null; do :; done
+            del_mangle -i "$iface" -p "$proto" --dport 53 -j MARK --set-xmark "$mark_spec"
+            del_mangle -i "$iface" -p "$proto" --dport 53 -j MARK --set-mark "$fw_dec"
         done
         # kernel-split 的内核侧对象：mangle 标记规则、fwmark 路由规则、ipset。
         # 进程正常退出时由它自己回滚；被 SIGKILL / OOM 时不会，全部在这里兜底。
-        for proto in udp tcp; do
-            while iptables -t mangle -D PREROUTING -i "$iface" -p "$proto" --dport 53 \
-                -j MARK --set-mark "${PHANTOM_FWMARK:-1}" 2>/dev/null; do :; done
-        done
-        while iptables -t mangle -D PREROUTING -i "$iface" -m set \
-            --match-set "${PHANTOM_IPSET:-phantom_proxy}" dst \
-            -j MARK --set-mark "${PHANTOM_FWMARK:-1}" 2>/dev/null; do :; done
+        ipset_name="${PHANTOM_IPSET:-phantom_proxy}"
+        del_mangle -i "$iface" -m set --match-set "$ipset_name" dst -j MARK --set-xmark "$mark_spec"
+        del_mangle -i "$iface" -m set --match-set "$ipset_name" dst -j MARK --set-mark "$fw_dec"
         # connmark 形态（只标记新连接）的规则同样要兜底清掉：
         # 残留的 restore-mark 会让"本来直连"的连接继续被旧 mark 影响路由。
-        while iptables -t mangle -D PREROUTING -i "$iface" -m conntrack --ctstate NEW \
-            -m set --match-set "${PHANTOM_IPSET:-phantom_proxy}" dst \
-            -j MARK --set-mark "${PHANTOM_FWMARK:-1}" -j CONNMARK --save-mark 2>/dev/null; do :; done
-        while iptables -t mangle -D PREROUTING -i "$iface" -m conntrack \
-            --ctstate ESTABLISHED,RELATED -j CONNMARK --restore-mark 2>/dev/null; do :; done
+        del_mangle -i "$iface" -m conntrack --ctstate NEW -m set --match-set "$ipset_name" dst \
+            -j MARK --set-xmark "$mark_spec"
+        del_mangle -i "$iface" -m conntrack --ctstate NEW -m set --match-set "$ipset_name" dst \
+            -j MARK --set-mark "$fw_dec"
+        del_mangle -i "$iface" -m conntrack --ctstate NEW -m set --match-set "$ipset_name" dst \
+            -j CONNMARK --save-mark --nfmask "$mark_mask" --ctmask "$mark_mask"
+        del_mangle -i "$iface" -m conntrack --ctstate NEW -m set --match-set "$ipset_name" dst \
+            -j CONNMARK --save-mark
+        # 最早那版把 MARK 与 CONNMARK 串在一条规则里（老 iptables 根本装不上）
+        del_mangle -i "$iface" -m conntrack --ctstate NEW -m set --match-set "$ipset_name" dst \
+            -j MARK --set-mark "$fw_dec" -j CONNMARK --save-mark
+        del_mangle -i "$iface" -m conntrack --ctstate ESTABLISHED,RELATED \
+            -j CONNMARK --restore-mark --nfmask "$mark_mask" --ctmask "$mark_mask"
+        del_mangle -i "$iface" -m conntrack --ctstate ESTABLISHED,RELATED -j CONNMARK --restore-mark
     done
-    while ip rule del fwmark "${PHANTOM_FWMARK:-1}" lookup "$table" 2>/dev/null; do :; done
+    # 掩码形态（当前）与无掩码形态（旧包）都清。
+    while ip rule del fwmark "$mark_spec" lookup "$table" 2>/dev/null; do :; done
+    while ip rule del fwmark "$fw_dec" lookup "$table" 2>/dev/null; do :; done
     ipset destroy "${PHANTOM_IPSET:-phantom_proxy}" 2>/dev/null
     return 0
 }
@@ -827,7 +851,16 @@ rules_installed() {
     tun_name=$(get_cfg tun_name); [ -n "$tun_name" ] || tun_name="phantom0"
     dns_hijack=$(get_cfg dns_hijack); [ -n "$dns_hijack" ] || dns_hijack="1"
 
-    ip rule show 2>/dev/null | grep -qE "lookup[[:space:]]+${table}([[:space:]]|$)" || return 1
+    # 内核分流靠这一条带掩码的规则（`fwmark 0x1/0x1 lookup 200`）。**只判"规则在不在"
+    # 是不够的**：无掩码的旧形态满足"在"，语义上却只剩首个 SYN 进隧道（真机上表现为
+    # 「TCP 连得上、TLS 卡死」）。所以这里连形态一起判，不匹配就让 nat 钩子换新规则。
+    rule_line=$(ip rule show 2>/dev/null | grep -E "lookup[[:space:]]+${table}([[:space:]]|$)" | head -n 1)
+    [ -n "$rule_line" ] || return 1
+    case "$rule_line" in
+        *fwmark*/*) : ;;
+        *fwmark*) return 1 ;;   # 无掩码：语义已坏，按"规则不在位"处理
+        *) : ;;                 # 兼容模式的通配 iif 规则：不是本模式的规则，放过
+    esac
     for iface in $lan_if; do
         iptables -S FORWARD 2>/dev/null | grep -q -- "-i ${iface} -o ${tun_name} " || return 1
         iptables -S FORWARD 2>/dev/null | grep -q -- "-i ${tun_name} -o ${iface} " || return 1

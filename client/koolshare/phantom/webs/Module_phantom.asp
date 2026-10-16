@@ -59,7 +59,7 @@
 <script>
 // 前端修订号：页面右上角会显示，用来确认浏览器加载的是哪一版
 // （改了 UI 就 +1，排查「改了没生效」时先看这个数字）
-var PHANTOM_UI_REV = '12';
+var PHANTOM_UI_REV = '13';
 var dbus = {};
 // 「期望」= 服务端已经保存的开关值（不是开关控件当前的值：控件改了但没点提交
 // 属于「尚未生效」）。页面把它和状态文件里的「实际」并排显示，用户才能一眼
@@ -1323,7 +1323,8 @@ function reload_Soft_Center() {
 															<option value="kernel-split">内核分流（推荐：只有白名单进隧道，直连走硬件快路径）</option>
 															<option value="relay">兼容模式（全部进隧道，用户态判定，较慢）</option>
 														</select>
-														<div class="phantom-hint">内核分流靠 ipset + fwmark 在内核里就把直连流量摘出去，硬件 NAT 加速才用得上；少数「自己解析域名（DoH）或写死 IP」的被墙应用需要兼容模式才能兜住。</div>
+														<div class="phantom-hint">内核分流靠 ipset + fwmark 在内核里就把直连流量摘出去，硬件 NAT 加速才用得上；少数「自己解析域名（DoH）或写死 IP」的被墙应用需要兼容模式才能兜住。<br>
+														标记位是<b>带掩码</b>匹配的（<span style="font-family:monospace">fwmark 0x1/0x1</span>）：固件 QoS 也往同一个 mark 写自己的位，不带掩码会退化成「只有首个 SYN 进隧道、后续包走直连」。运维页的「一键体检」会把规则形态和解读一起列出来。</div>
 													</td>
 												</tr>
 												<tr>

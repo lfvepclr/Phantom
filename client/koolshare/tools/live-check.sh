@@ -184,11 +184,19 @@ else
     proc_state="stopped"
 fi
 echo "进程实际        : $proc_state"
-if ip rule show 2>/dev/null | grep -qE "lookup[[:space:]]+200([[:space:]]|$)"; then
-    rules_state="规则在位"
-else
+# ⚠️ 这段远程脚本被外面的 `OUT=$(ssh …)` 捕获：**不能写 case**（`1)` 会提前闭合
+# 命令替换），只能用 if/elif。同理别在这里写不成对的括号。
+_rule_l=$(ip rule show 2>/dev/null | grep -E "lookup[[:space:]]+200([[:space:]]|$)" | head -n 1)
+if [ -z "$_rule_l" ]; then
     rules_state="无规则"
+elif echo "$_rule_l" | grep -q "fwmark 0x1/0x1"; then
+    rules_state="规则在位（带掩码 fwmark 0x1/0x1）"
+elif echo "$_rule_l" | grep -q "fwmark"; then
+    rules_state="⚠️ 规则在位但没有掩码：会退化成「只有首个 SYN 进隧道」（见 README 的坑）"
+else
+    rules_state="规则在位（兼容模式通配 iif）"
 fi
+echo "规则全文        : $(echo "$_rule_l" | sed 's/^[0-9]*:[[:space:]]*//')"
 echo "规则实际        : $rules_state"
 # 注意：这段远程脚本整体被外面的 `OUT=$(ssh …)` 捕获，bash 会按**括号配对**扫描
 # 命令替换的内容 —— 所以这里不能出现不成对的 `)`（`case 1)` 就会提前闭合命令替换，

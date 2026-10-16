@@ -101,14 +101,32 @@ echo_date "清理内核分流对象..."
 uninstall_lan=""
 [ "$KS_MODE" = "1" ] && uninstall_lan=$("$DBUS" get ${module}_lan_if 2>/dev/null)
 [ -n "$uninstall_lan" ] || uninstall_lan="br0"
+# `iptables -D` 按完整规范匹配：带掩码的 `--set-xmark 0x1/0x1`（当前）与无掩码的
+# `--set-mark 1`（旧包）掩码不同，必须各删一遍才不留残渣。
+del_mangle() {
+    while iptables -t mangle -D PREROUTING "$@" 2>/dev/null; do :; done
+}
 for iface in $uninstall_lan; do
     for proto in udp tcp; do
-        while iptables -t mangle -D PREROUTING -i "$iface" -p "$proto" --dport 53 \
-            -j MARK --set-mark 1 2>/dev/null; do :; done
+        del_mangle -i "$iface" -p "$proto" --dport 53 -j MARK --set-xmark 0x1/0x1
+        del_mangle -i "$iface" -p "$proto" --dport 53 -j MARK --set-mark 1
         while iptables -D FORWARD -i "$iface" -p "$proto" --dport 853 -j REJECT 2>/dev/null; do :; done
     done
-    while iptables -t mangle -D PREROUTING -i "$iface" -m set --match-set phantom_proxy dst \
-        -j MARK --set-mark 1 2>/dev/null; do :; done
+    del_mangle -i "$iface" -m set --match-set phantom_proxy dst -j MARK --set-xmark 0x1/0x1
+    del_mangle -i "$iface" -m set --match-set phantom_proxy dst -j MARK --set-mark 1
+    del_mangle -i "$iface" -m conntrack --ctstate NEW -m set --match-set phantom_proxy dst \
+        -j MARK --set-xmark 0x1/0x1
+    del_mangle -i "$iface" -m conntrack --ctstate NEW -m set --match-set phantom_proxy dst \
+        -j MARK --set-mark 1
+    del_mangle -i "$iface" -m conntrack --ctstate NEW -m set --match-set phantom_proxy dst \
+        -j CONNMARK --save-mark --nfmask 0x1 --ctmask 0x1
+    del_mangle -i "$iface" -m conntrack --ctstate NEW -m set --match-set phantom_proxy dst \
+        -j CONNMARK --save-mark
+    del_mangle -i "$iface" -m conntrack --ctstate NEW -m set --match-set phantom_proxy dst \
+        -j MARK --set-mark 1 -j CONNMARK --save-mark
+    del_mangle -i "$iface" -m conntrack --ctstate ESTABLISHED,RELATED \
+        -j CONNMARK --restore-mark --nfmask 0x1 --ctmask 0x1
+    del_mangle -i "$iface" -m conntrack --ctstate ESTABLISHED,RELATED -j CONNMARK --restore-mark
     for ip in 1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 9.9.9.9 149.112.112.112 \
               208.67.222.222 208.67.220.220 94.140.14.14 94.140.15.15 \
               185.228.168.9 185.228.169.9 76.76.2.0 76.76.10.0; do
@@ -116,6 +134,7 @@ for iface in $uninstall_lan; do
             -j REJECT --reject-with tcp-reset 2>/dev/null; do :; done
     done
 done
+while ip rule del fwmark 0x1/0x1 lookup 200 2>/dev/null; do :; done
 while ip rule del fwmark 1 lookup 200 2>/dev/null; do :; done
 ipset destroy phantom_proxy 2>/dev/null
 

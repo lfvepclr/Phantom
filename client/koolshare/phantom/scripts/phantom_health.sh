@@ -106,18 +106,33 @@ gw_mode=$(get_cfg gateway_mode); [ -n "$gw_mode" ] || gw_mode="kernel-split"
 say ""
 say "二、分流实况"
 say "  模式：$gw_mode   LAN：$lan_if   TUN：$tun_name   路由表：$table"
-if ip rule show 2>/dev/null | grep -qE "lookup[[:space:]]+${table}([[:space:]]|$)"; then
-    say "  $OK 路由规则在位（fwmark → table $table）"
-else
+# 只报"规则在不在"是不够的：这条规则**带不带掩码**决定了「只有首个 SYN 进隧道、
+# 后续包走直连」这个真机上出现过的故障（固件 QoS 会往同一个 mark 写自己的位，
+# 无掩码匹配只在 mark 恰好为 1 时命中）。所以这里连形态一起报。
+rule_line=$(ip rule show 2>/dev/null | grep "lookup ${table}" | head -n 1)
+if [ -z "$rule_line" ]; then
     say "  $BAD 路由规则缺失：LAN 流量不会进隧道（点提交或等 nat-start 钩子补回）"
+else
+    fw_token=$(printf '%s' "$rule_line" | sed -n 's/.*fwmark \([^ ]*\).*/\1/p')
+    rule_show=$(printf '%s' "$rule_line" | sed 's/^[0-9]*:[[:space:]]*//')
+    case "$fw_token" in
+        */*) say "  $OK 路由规则在位：$rule_show" ;;
+        '') say "  $WARN 路由规则在位但没有 fwmark 匹配（兼容模式的通配 iif 规则）：$rule_show" ;;
+        *) say "  $BAD 路由规则**缺少掩码**（fwmark $fw_token）：固件 QoS 的位会让匹配失效 —— 「首个 SYN 进隧道、后续包走直连」。装新包即可修复" ;;
+    esac
 fi
 fwd_ok=0
 iptables -S FORWARD 2>/dev/null | grep -q -- "-i ${lan_if} -o ${tun_name} " && \
 iptables -S FORWARD 2>/dev/null | grep -q -- "-i ${tun_name} -o ${lan_if} " && fwd_ok=1
 [ "$fwd_ok" = "1" ] && say "  $OK 转发规则在位（FORWARD 双向 ACCEPT）" \
     || say "  $BAD 转发规则缺失：LAN↔TUN 的流量会被默认策略丢掉"
-if iptables -t mangle -S PREROUTING 2>/dev/null | grep -q -- "--match-set"; then
+mangle_s=$(iptables -t mangle -S PREROUTING 2>/dev/null)
+if printf '%s' "$mangle_s" | grep -q -- "--match-set"; then
     say "  $OK 白名单标记规则在位（ipset → MARK）"
+    # 同一类"规则在、语义不对"的坑：`--set-mark` 是全掩码，会抹掉固件的 QoS 位。
+    if printf '%s' "$mangle_s" | grep -- "--match-set" | grep -qv -- "--set-xmark"; then
+        say "  $WARN 标记用的是无掩码写法（--set-mark）：会覆盖固件 QoS 的 mark 位，且与 connmark 恢复值不匹配；装新包即可修复"
+    fi
 else
     say "  $BAD 白名单标记规则缺失（kernel-split 的核心规则）"
 fi

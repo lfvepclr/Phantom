@@ -169,7 +169,15 @@ section "分流模式与内核对象"
 echo "ipset    : $(ipset list -n 2>/dev/null | tr '\n' ' ')"
 echo "ipset 条目: $(ipset list phantom_proxy 2>/dev/null | grep -c '^[0-9]')"
 echo "mangle   : $(iptables -t mangle -S PREROUTING 2>/dev/null | grep -c MARK) 条 MARK 规则"
-echo "fwmark   : $(ip rule show 2>/dev/null | grep -c 'fwmark') 条"
+# 形态比条数重要：无掩码的 `fwmark 0x1` 只在 mark 恰好为 1 时命中，而固件 QoS
+# 会往同一个 mark 加自己的位 —— 那正是「TCP 连得上、TLS 卡死」那次故障的成因。
+_fw_rule=$(ip rule show 2>/dev/null | grep 'fwmark' | head -n 1)
+case "$_fw_rule" in
+    '') echo "fwmark   : 无（兼容模式或隧道未运行）" ;;
+    *fwmark*/*) echo "fwmark   : ${_fw_rule#*: }  (带掩码 ✓)" ;;
+    *) echo "fwmark   : ${_fw_rule#*: }  (⚠ 无掩码：会退化成「只有首个 SYN 进隧道」)" ;;
+esac
+echo "标记写法 : $(iptables -t mangle -S PREROUTING 2>/dev/null | grep -- '--match-set' | head -n 1 | sed 's/^-A PREROUTING //')"
 if [ -f /proc/fcache/nflist ]; then
     awk '/HW_TotHits/ {next} /^ *[0-9]+ / {t++; if ($0 !~ /4294967295/) hw++} END {printf "flowcache: 硬件加速 %d / 共 %d 条流\n", hw+0, t+0}' /proc/fcache/nflist 2>/dev/null
 fi

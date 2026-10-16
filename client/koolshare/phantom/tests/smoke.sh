@@ -353,6 +353,26 @@ for _mark in 'function requested_mode' 'requested_mode() === "kernel-split"' '�
         bad "页面缺少「内核分流回退」告警（${_mark}）"
     fi
 done
+
+# 掩码形态是修「只有首个 SYN 进隧道」那个真机 bug 的关键，四处都得有：
+# 页面提示、体检脚本的判据、以及两个清理路径（stop / 卸载）的删除语句。
+if grep -q 'fwmark 0x1/0x1' "$ASP"; then
+    ok "页面写明了掩码形态（fwmark 0x1/0x1）"
+else
+    bad "页面没有说明掩码形态（用户会把无掩码的旧形态当正常）"
+fi
+if grep -q '缺少掩码' "${PLUGIN_SRC}/scripts/phantom_health.sh" 2>/dev/null; then
+    ok "一键体检会报「路由规则缺少掩码」"
+else
+    bad "一键体检不看掩码形态（这类失配只靠「规则在不在」查不出来）"
+fi
+for _f in "${PLUGIN_SRC}/scripts/phantom_config.sh" "${PLUGIN_SRC}/uninstall.sh"; do
+    if grep -q -- '--set-xmark' "$_f" 2>/dev/null; then
+        ok "$(basename "$_f") 会清掉掩码形态的标记规则"
+    else
+        bad "$(basename "$_f") 不清掩码形态的标记规则（--set-xmark 与 --set-mark 是两条不同规则）"
+    fi
+done
 # 探针文件名必须以 Module_ 开头：httpd 只把 /Module_* 路由到 /koolshare/webs，
 # 真机实测 /phantom_ping.asp 恒 404（/Module_xxx.css 则由它的 webs 处理器接管）。
 if grep -q "'/Module_phantom_ping\.asp'" "$ASP" && grep -q 'phantom-ping-ok' "$ASP"; then
@@ -780,6 +800,37 @@ grep -q "/_resp/666666\$" "$API_ACK" 2>/dev/null \
     && ok "未知 action 也先回包" || bad "未知 action 未回包"
 [ "$rc_bad" != "0" ] && ok "未知 action 非零退出" || bad "未知 action 应当非零退出"
 
+step "fwmark 掩码形态（真机「只有首个 SYN 进隧道」那个 bug 的防回归）"
+# 当前形态是带掩码的：`ip rule fwmark 0x1/0x1`、`--set-xmark 0x1/0x1`、
+# `CONNMARK --nfmask/--ctmask 0x1`。原因是固件 QoS 会往同一个 mark 写自己的位，
+# 无掩码的 `fwmark 0x1` 只在 mark 恰好为 1 时命中 —— 那会让只有首个 SYN 进隧道、
+# 后续包走直连（真机上表现为「TCP 连得上、TLS 卡死」）。
+# 这里把「新形态 + 旧形态」同时塞进 mock 再跑 stop：`iptables -D` / `ip rule del`
+# 是按完整规范匹配的，漏掉任何一种都会留下会自动改路由的残渣。
+: >"$MOCK_IP_FILE"
+: >"$MOCK_IPTABLES_FILE"
+echo "rule fwmark 0x1/0x1 lookup 200 priority 9050" >>"$MOCK_IP_FILE"
+echo "rule fwmark 1 lookup 200 priority 9050" >>"$MOCK_IP_FILE"
+echo "mangle-PREROUTING -i br0 -p udp --dport 53 -j MARK --set-xmark 0x1/0x1" >>"$MOCK_IPTABLES_FILE"
+echo "mangle-PREROUTING -i br0 -p udp --dport 53 -j MARK --set-mark 1" >>"$MOCK_IPTABLES_FILE"
+echo "mangle-PREROUTING -i br0 -m set --match-set phantom_proxy dst -j MARK --set-xmark 0x1/0x1" >>"$MOCK_IPTABLES_FILE"
+echo "mangle-PREROUTING -i br0 -m conntrack --ctstate NEW -m set --match-set phantom_proxy dst -j MARK --set-xmark 0x1/0x1" >>"$MOCK_IPTABLES_FILE"
+echo "mangle-PREROUTING -i br0 -m conntrack --ctstate NEW -m set --match-set phantom_proxy dst -j CONNMARK --save-mark --nfmask 0x1 --ctmask 0x1" >>"$MOCK_IPTABLES_FILE"
+echo "mangle-PREROUTING -i br0 -m conntrack --ctstate NEW -m set --match-set phantom_proxy dst -j MARK --set-mark 1 -j CONNMARK --save-mark" >>"$MOCK_IPTABLES_FILE"
+echo "mangle-PREROUTING -i br0 -m conntrack --ctstate ESTABLISHED,RELATED -j CONNMARK --restore-mark --nfmask 0x1 --ctmask 0x1" >>"$MOCK_IPTABLES_FILE"
+echo "mangle-PREROUTING -i br0 -m conntrack --ctstate ESTABLISHED,RELATED -j CONNMARK --restore-mark" >>"$MOCK_IPTABLES_FILE"
+"$SH" "$CONF_SH" stop >/dev/null 2>&1
+if grep -q "fwmark" "$MOCK_IP_FILE" 2>/dev/null; then
+    bad "stop 后仍残留 fwmark 规则（带掩码与旧形态都要清）：$(tr '\n' ';' <"$MOCK_IP_FILE")"
+else
+    ok "stop 清掉了带掩码与旧形态的 fwmark 规则"
+fi
+if grep -q "match-set" "$MOCK_IPTABLES_FILE" 2>/dev/null; then
+    bad "stop 后仍残留白名单标记规则（含旧形态）：$(grep match-set "$MOCK_IPTABLES_FILE" | tr '\n' ';')"
+else
+    ok "stop 清掉了掩码形态与旧形态的 mangle 标记规则"
+fi
+
 step "start_nat：只在转发规则丢失时重启"
 setcfg enable 1
 "$SH" "$CONF_SH" restart >/dev/null 2>&1
@@ -1028,7 +1079,27 @@ if [ -n "${PHANTOM_SMOKE_KEEP:-}" ]; then
     cp -rf "$(dirname "$INST_DIR")" "${ROOT}-keep" 2>/dev/null
     echo "  (已保留 ${ROOT}-keep)"
 fi
+# 卸载同样要能清掉「新形态 + 旧形态」的内核对象：从旧包升级过来的机器上，
+# 两条 ip rule、四种 mangle 规则可能同时在。
+: >"$MOCK_IP_FILE"
+: >"$MOCK_IPTABLES_FILE"
+echo "rule fwmark 0x1/0x1 lookup 200 priority 9050" >>"$MOCK_IP_FILE"
+echo "rule fwmark 1 lookup 200 priority 9050" >>"$MOCK_IP_FILE"
+echo "mangle-PREROUTING -i br0 -m set --match-set phantom_proxy dst -j MARK --set-xmark 0x1/0x1" >>"$MOCK_IPTABLES_FILE"
+echo "mangle-PREROUTING -i br0 -m set --match-set phantom_proxy dst -j MARK --set-mark 1" >>"$MOCK_IPTABLES_FILE"
+echo "mangle-PREROUTING -i br0 -m conntrack --ctstate NEW -m set --match-set phantom_proxy dst -j CONNMARK --save-mark --nfmask 0x1 --ctmask 0x1" >>"$MOCK_IPTABLES_FILE"
+echo "mangle-PREROUTING -i br0 -m conntrack --ctstate ESTABLISHED,RELATED -j CONNMARK --restore-mark --nfmask 0x1 --ctmask 0x1" >>"$MOCK_IPTABLES_FILE"
 "$SH" "$UNINSTALL_T" >/dev/null 2>&1
+if grep -q "fwmark" "$MOCK_IP_FILE" 2>/dev/null; then
+    bad "卸载后 fwmark 规则仍残留：$(tr '\n' ';' <"$MOCK_IP_FILE")"
+else
+    ok "卸载清掉了带掩码与旧形态的 fwmark 规则"
+fi
+if grep -q "match-set" "$MOCK_IPTABLES_FILE" 2>/dev/null; then
+    bad "卸载后白名单标记规则仍残留：$(grep match-set "$MOCK_IPTABLES_FILE" | tr '\n' ';')"
+else
+    ok "卸载清掉了标记规则（含 --set-xmark 与旧 --set-mark 两种）"
+fi
 [ -f "$CONF_SH" ] && bad "卸载后 config.sh 仍存在" || ok "config.sh 已删除"
 [ -f "$INST_DIR/bin/phantom" ] && bad "卸载后二进制仍存在" || ok "二进制已删除"
 [ -f "$INST_DIR/webs/Module_phantom.asp" ] && bad "卸载后 ASP 仍存在" || ok "ASP 已删除"
