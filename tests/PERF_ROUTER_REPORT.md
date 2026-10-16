@@ -83,6 +83,8 @@
 | 2026-09-13 | 控制面修复：软件中心 POST 契约（`$1=id`/回包 `/_resp`）、状态日志走 `/tmp/upload` + `/_temp/`、新增 `N98phantom.sh` nat-start 兜底 | 点提交「卡住 → 后台执行失败」，状态/日志页读不到 | 提交毫秒级返回、状态与日志正常、LAN 走隧道 | 控制面修复，不涉及数据面 |
 | 2026-09-13 | 测速改用带 SOCKS 的 `curl-fancyss` + 修正吞吐百分比单位（kbps vs KB/s） | 测速 000 全失败；复测打印「达到 786%」 | 359–380 KB/s，达上限 96–103% | 固件自带 curl 是 `--disable-proxy` 编译 |
 | 2026-10-04 | **内核分流**（ipset+fwmark，`--gateway-mode kernel-split`）+ rp_filter 直写 `/proc/sys` + 日志默认 warn + fd 上限 16384 | LAN 直连 4 路并行 **14.2 MB/s（114 Mbps）**，phantom CPU **27–31%** | LAN 直连 4 路并行 **48–50 MB/s（≈390 Mbps）**，同等负载下 phantom CPU **0.0–0.1%** | 直连从用户态 relay 移回内核路径：**聚合 3.4×，插件 CPU ≈ 1/300**；同机本机内核路径基线 420 Mbps，已基本持平 |
+| 2026-10-16 | 内核分流**真的装上**：老固件的 iptables 1.4.12.2 拒绝「一条规则串两个 `-j`」，第一条标记规则就装不上 → 静默退回 relay；拆成两条同匹配规则后 kernel-split 首次生效 | 直连仍走用户态 relay：Mac（5G）经路由器下国内镜像 **10.7 MB/s（86 Mbps）** | 同路径同目标 **26.3 MB/s（210 Mbps）**，`ip rule` 只剩 `fwmark 0x1 lookup 200`、`ipset` 162 条 | 直连快路径回到内核：**2.5×**；「非 VPN 也慢」的成因（全屋流量进用户态）随之消失 |
+| 2026-10-17 | 修 fwmark **缺掩码**：固件 QoS 会往同一个 mark 写自己的位，`ip rule fwmark 0x1`（无掩码）只在 mark 恰为 1 时命中 → 首个 SYN 进隧道、后续包走直连（TCP 连得上、TLS 卡死、`tunnel_bytes` 恒 0）。改为 `fwmark 0x1/0x1` + `--set-xmark 0x1/0x1` + `CONNMARK --nfmask/--ctmask 0x1` | 白名单站点从 LAN 完全打不开（`tunnel_bytes_up` 恒 0、`flow_stall_drops` 持续增长） | 见下方第 4.2 节的判别实验（40 KB 请求的 `br0→phantom0` 包计数从 5 涨到 30+）；隧道吞吐仍受服务端 3 Mbps 上行限制 | 这类「规则在、语义坏」的故障只能靠**包计数与 `tunnel_bytes` 的增长关系**判活，不能只看规则存在性 |
 
 ### 4.1 内核分流 A/B 明细（2026-10-04，RT-AX86U Pro）
 
@@ -101,6 +103,28 @@
 > 是公网 IP，严格的 rp_filter=1 会把它当伪造包丢掉。改成直写
 > `/proc/sys/net/ipv4/conf/{phantom0,all}/rp_filter`（`all=2` 松散模式，内核按
 > `max(all, iface)` 判定）后立刻恢复。启动后会回读校验并 WARN。
+
+### 4.2 「规则在、语义坏」的判别实验（2026-10-17）
+
+内核分流生效后出现了一个只看规则存在性**永远查不出来**的故障：`ip rule`、`mangle`、`ipset`
+样样在位，LAN 却完全打不开白名单站点。三步定位法（都可只读复现）：
+
+| 步骤 | 命令 | 故障时的读数 |
+|---|---|---|
+| ① 端口层到底通不通 | Mac：`nc -v -w 6 <白名单IP> 443` | **succeeded**（TCP 握手成功 —— 说明首个 SYN 进了隧道） |
+| ② 应用数据有没有进 TUN | 路由器：`iptables -L FORWARD -vn \| grep "br0 *phantom0"`，同时让 Mac 发 40 KB 明文 POST | 只涨 **5**（全是 SYN 重传；应用数据 0 包） |
+| ③ 隧道侧有没有流量 | 路由器：`curl -s 127.0.0.1:9150/metrics \| grep tunnel_bytes` | `tunnel_bytes_up/down` **恒 0**，`flow_stall_drops` 持续增长 |
+
+根因判据（决定性）：看 connmark 的**奇偶**
+
+```sh
+grep -E "mark=[0-9]+ iqprio" /proc/net/nf_conntrack | grep "src=192.168" \
+  | awk '{for(i=1;i<=NF;i++) if ($i ~ /^mark=/) print $i}' | sort | uniq -c | sort -rn
+# 我们标记过的流 = 奇数（bit0）；路由器自发流 = 偶数（0x80000014，固件 QoS 类）
+```
+
+奇数说明我们的 bit0 活着、固件的位是另加的 —— 于是**无掩码的 `ip rule fwmark 0x1` 必然失配**。
+修复后同样的三步法全部转绿（40 KB 请求的包计数涨 30+、`tunnel_bytes` 开始走数）。
 
 ## 5. 方法说明
 

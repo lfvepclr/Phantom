@@ -338,7 +338,7 @@ LAN 客户端 ──转发──▶ ip rule iif br0 ─▶ table 200 ─▶ defa
 
 | 模式 | 规则 | 数据流 | 直连流量 |
 |---|---|---|---|
-| `kernel-split`（默认） | ipset `phantom_proxy` + `iptables -t mangle … MARK` + `ip rule fwmark 0x1`；另单独标记 53 端口进隧道。标记**只作用于新建连接**（`--ctstate NEW` + `CONNMARK --save-mark`），已建立连接靠 `CONNMARK --restore-mark` 走回它创建时的路 | 命中白名单/53 的**新连接**才进 `phantom0` | **不进 TUN**，留在 `main` 表，走内核（Broadcom 上还有 Runner/Flow Cache 硬件加速） |
+| `kernel-split`（默认） | ipset `phantom_proxy` + `iptables -t mangle … MARK` + `ip rule fwmark 0x1/0x1`；另单独标记 53 端口进隧道。标记与路由**一律带掩码**（`--set-xmark 0x1/0x1`、`CONNMARK --nfmask/--ctmask 0x1`、`fwmark 0x1/0x1`），因为固件 QoS 会往同一个 mark 写自己的位，无掩码匹配会只剩首个 SYN 进隧道。标记**只作用于新建连接**（`--ctstate NEW` + `CONNMARK --save-mark`），已建立连接靠 `CONNMARK --restore-mark` 走回它创建时的路 | 命中白名单/53 的**新连接**才进 `phantom0` | **不进 TUN**，留在 `main` 表，走内核（Broadcom 上还有 Runner/Flow Cache 硬件加速） |
 | `relay`（兼容） | `ip rule iif br0 lookup 200` | 全部 LAN 转发流量进 `phantom0`，逐连接在用户态判定 | 也进 TUN，由 `tcp_direct_relay_task` 明文转发 |
 
 为什么默认 kernel-split：实测同一台 RT-AX86U Pro，本机内核路径 8 路并行 420 Mbps，

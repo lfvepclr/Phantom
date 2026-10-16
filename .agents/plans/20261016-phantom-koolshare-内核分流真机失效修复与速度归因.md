@@ -139,7 +139,58 @@ system-wide panic_on_oom is enabled`（victim `avahi-daemon`，机型 RTAX86U_PR
    关闭开关后进程 / ip rule / iptables / ipset 全部回退。
 5. 采样日志出现 `rss_kb` / `mem_free_kb` 两列。
 
-## 五、后续（未做，需要决定）
+## 五、第二轮真机验收（装包后）：内核分流生效，但 fwmark 缺掩码把隧道 TCP 打瘸
+
+### 5.1 好消息：内核分流这次真的生效了
+
+装包后 `ip rule show` 只剩 `9050: from all fwmark 0x1 lookup 200`（通配 `iif br0` 已消失）、
+`iptables -t mangle -S PREROUTING` 的五条规则顺序与设计一致、`ipset phantom_proxy` 162 条、
+状态文件 `"gw":"kernel-split","ipset":162`。收益实测：**Mac 经路由器下国内镜像 86 → 210 Mbps（2.5×）**。
+
+### 5.2 坏消息：走隧道的 TCP 全废（首个 SYN 进隧道、后续包走直连）
+
+现象：`nc 216.239.32.5 443` 能连上（TCP 握手成功），`curl` 停在 TLS 握手超时；
+`phantom_tunnel_bytes_up/down` 恒 0、`flow_stall_drops` 从 15 一路涨到 480+；DNS（UDP）完全正常。
+
+判别实验（决定性）：让 Mac 发一个 40 KB 明文 POST 到白名单 IP，
+`FORWARD br0→phantom0` 的包计数只涨 **5**（全是 SYN 重传），应用数据一个都没进 TUN。
+
+### 5.3 根因：mark 的「位」与「掩码」
+
+| 流 | connmark | 结论 |
+|---|---|---|
+| 路由器自发（从不经我们标记） | `2147483668` = `0x80000014`（偶） | 固件 QoS 写的是**高位** |
+| 经我们标记过的流 | `0xa861` / `0xa421` / …（**全奇**） | bit0 是我们的、被保留；其它位是固件的 |
+
+固件用**掩码写**自己的位，所以我们的 bit0 活着；但路由规则写成了
+`ip rule add fwmark 0x1`（**不带掩码**），只在 mark **恰好等于 1** 时命中：
+
+- 首个 SYN：包 mark 被规则直接置成 `0x1` → 命中 → 进 TUN ✓（所以 `nc` 能连上）
+- 后续包：`CONNMARK --restore-mark` 恢复出 `0xa861` → **不命中** → 落 `main` 表直连被墙 ✗
+
+DNS 之所以正常，是因为它的规则**逐包**置位、不经过 connmark。
+
+### 5.4 修法（本提交）
+
+全程用掩码表达我们这一位，与固件那几位共存：
+
+- 路由：`ip rule add fwmark 0x1/0x1 lookup 200`（安装时先尽力删掉旧的无掩码规则）
+- 置位：`-j MARK --set-xmark 0x1/0x1`（只置位不清位，不抹掉固件的位）
+- conntrack：`CONNMARK --save-mark/--restore-mark --nfmask 0x1 --ctmask 0x1`
+- teardown / 插件 stop / 卸载：**新旧两种文本形态都删**（`-D` 按完整规范匹配，掩码不同删不掉）
+- 体检 / 诊断 / live-check：报「规则全文 + 带不带掩码」，而不是只报「规则在不在」
+
+真机探针确认 `ip rule add fwmark 0x1/0x1 lookup 200 priority 9501` 可用（add/del 均 rc=0）。
+冒烟从 194 条断言提到 **202 条全绿**（新增掩码形态的 stop/卸载清理断言与页面提示断言）。
+
+### 5.5 本轮新增的已知限制
+
+- 若某固件把 bit0 也挪作他用，掩码匹配会误命中（表现为该流被拉进 TUN 后回 RST）；
+  届时加固手段是给规则再加 `iif br0`（本轮不做）。
+- 「规则在、语义坏」这类故障靠"看规则存在性"永远发现不了 —— 判活要看**包计数与
+  `tunnel_bytes` 的增长关系**（判据已写进 README 验收清单）。
+
+## 六、后续（未做，需要决定）
 
 - **真正的 720p**：服务端上行 ≥ 20 Mbps。当前 3 Mbps 是硬上限。
 - **可实验**：本线路对 Google CDN 直连实测 577 Mbps —— 若把 `googlevideo` 类 CDN 做成
